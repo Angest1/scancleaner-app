@@ -1,0 +1,1201 @@
+{
+  "schemaVersion": 1,
+  "blacklistNever": {
+    "exactNames": [".git", "local.properties"],
+    "globPatterns": [".env", ".env.*", "*.jks", "*.keystore"],
+    "dbDirNames": ["pgdata", "mysql", "mariadb", "mongodb", "sqlite", "postgres", "postgresql"],
+    "sourceExtensions": [
+      "rs",
+      "ts",
+      "tsx",
+      "js",
+      "jsx",
+      "mjs",
+      "cjs",
+      "py",
+      "php",
+      "java",
+      "kt",
+      "kts",
+      "cs",
+      "fs",
+      "vb",
+      "go",
+      "c",
+      "cpp",
+      "cc",
+      "h",
+      "hpp",
+      "swift",
+      "dart",
+      "rb",
+      "sql",
+      "md",
+      "vue",
+      "svelte",
+      "html",
+      "css",
+      "scss"
+    ],
+    "forbidDockerVolumes": true
+  },
+  "rules": [
+    {
+      "id": "node-npm-cache",
+      "nombre": "Caché global de npm",
+      "categoria": "Node",
+      "tipo": "cache-global",
+      "ubicacion": {
+        "cliQuery": ["npm", "config", "get", "cache"],
+        "envFallback": ["%LOCALAPPDATA%\\npm-cache"]
+      },
+      "deteccion": {
+        "requiredMarkers": [],
+        "requireGitIgnoredIfRepo": false,
+        "requireProjectAgeDays": false
+      },
+      "nivel": "seguro",
+      "metodo": {
+        "tipo": "comando-oficial",
+        "comando": ["npm", "cache", "clean", "--force"],
+        "fallbackBorradoSiSinCli": true,
+        "allowRecycleBinOption": false
+      },
+      "precondiciones": {
+        "blockingProcesses": ["node.exe"],
+        "preCommands": [],
+        "requiresAdmin": false
+      },
+      "comoRegenerar": "Se regenera automáticamente en el próximo `npm install`."
+    },
+    {
+      "id": "node-pnpm-store",
+      "nombre": "Store global de pnpm",
+      "categoria": "Node",
+      "tipo": "cache-global",
+      "ubicacion": {
+        "cliQuery": ["pnpm", "store", "path"],
+        "envFallback": ["%LOCALAPPDATA%\\pnpm\\store"]
+      },
+      "deteccion": {
+        "requiredMarkers": [],
+        "requireGitIgnoredIfRepo": false,
+        "requireProjectAgeDays": false
+      },
+      "nivel": "seguro",
+      "metodo": {
+        "tipo": "comando-oficial",
+        "comando": ["pnpm", "store", "prune"],
+        "fallbackBorradoSiSinCli": true,
+        "allowRecycleBinOption": false
+      },
+      "precondiciones": {
+        "blockingProcesses": ["node.exe"],
+        "preCommands": [],
+        "requiresAdmin": false
+      },
+      "comoRegenerar": "Solo elimina paquetes no referenciados; `pnpm install` vuelve a descargar lo necesario."
+    },
+    {
+      "id": "node-yarn-cache",
+      "nombre": "Caché global de Yarn",
+      "categoria": "Node",
+      "tipo": "cache-global",
+      "ubicacion": {
+        "cliQuery": ["yarn", "cache", "dir"],
+        "envFallback": ["%LOCALAPPDATA%\\Yarn\\Cache"]
+      },
+      "deteccion": {
+        "requiredMarkers": [],
+        "requireGitIgnoredIfRepo": false,
+        "requireProjectAgeDays": false
+      },
+      "nivel": "seguro",
+      "metodo": {
+        "tipo": "comando-oficial",
+        "comando": ["yarn", "cache", "clean"],
+        "fallbackBorradoSiSinCli": true,
+        "allowRecycleBinOption": false
+      },
+      "precondiciones": {
+        "blockingProcesses": ["node.exe"],
+        "preCommands": [],
+        "requiresAdmin": false
+      },
+      "comoRegenerar": "Se regenera automáticamente en el próximo `yarn install`."
+    },
+    {
+      "id": "node-bun-cache",
+      "nombre": "Caché global de Bun",
+      "categoria": "Node",
+      "tipo": "cache-global",
+      "ubicacion": {
+        "cliQuery": ["bun", "pm", "cache"],
+        "envFallback": ["%USERPROFILE%\\.bun\\install\\cache"]
+      },
+      "deteccion": {
+        "requiredMarkers": [],
+        "requireGitIgnoredIfRepo": false,
+        "requireProjectAgeDays": false
+      },
+      "nivel": "seguro",
+      "metodo": {
+        "tipo": "comando-oficial",
+        "comando": ["bun", "pm", "cache", "rm"],
+        "fallbackBorradoSiSinCli": true,
+        "allowRecycleBinOption": false
+      },
+      "precondiciones": {
+        "blockingProcesses": ["bun.exe"],
+        "preCommands": [],
+        "requiresAdmin": false
+      },
+      "comoRegenerar": "Se regenera automáticamente en el próximo `bun install`."
+    },
+    {
+      "id": "node-gyp-cache",
+      "nombre": "Caché de node-gyp",
+      "categoria": "Node",
+      "tipo": "cache-global",
+      "ubicacion": {
+        "envFallback": ["%LOCALAPPDATA%\\node-gyp\\Cache"]
+      },
+      "deteccion": {
+        "requiredMarkers": [],
+        "requireGitIgnoredIfRepo": false,
+        "requireProjectAgeDays": false
+      },
+      "nivel": "seguro",
+      "metodo": {
+        "tipo": "borrado-permanente",
+        "allowRecycleBinOption": true
+      },
+      "precondiciones": {
+        "blockingProcesses": ["node.exe"],
+        "preCommands": [],
+        "requiresAdmin": false
+      },
+      "comoRegenerar": "Se vuelve a descargar al compilar módulos nativos de Node."
+    },
+    {
+      "id": "node-electron-cache",
+      "nombre": "Caché de binarios de Electron",
+      "categoria": "Node",
+      "tipo": "cache-global",
+      "ubicacion": {
+        "envFallback": ["%LOCALAPPDATA%\\electron\\Cache"]
+      },
+      "deteccion": {
+        "requiredMarkers": [],
+        "requireGitIgnoredIfRepo": false,
+        "requireProjectAgeDays": false
+      },
+      "nivel": "seguro",
+      "metodo": {
+        "tipo": "borrado-permanente",
+        "allowRecycleBinOption": true
+      },
+      "precondiciones": {
+        "blockingProcesses": ["electron.exe", "node.exe"],
+        "preCommands": [],
+        "requiresAdmin": false
+      },
+      "comoRegenerar": "Se vuelve a descargar al instalar proyectos con Electron."
+    },
+    {
+      "id": "py-pip-cache",
+      "nombre": "Caché global de pip",
+      "categoria": "Python",
+      "tipo": "cache-global",
+      "ubicacion": {
+        "cliQuery": ["pip", "cache", "dir"],
+        "envFallback": ["%LOCALAPPDATA%\\pip\\Cache"]
+      },
+      "deteccion": {
+        "requiredMarkers": [],
+        "requireGitIgnoredIfRepo": false,
+        "requireProjectAgeDays": false
+      },
+      "nivel": "seguro",
+      "metodo": {
+        "tipo": "comando-oficial",
+        "comando": ["pip", "cache", "purge"],
+        "fallbackBorradoSiSinCli": true,
+        "allowRecycleBinOption": false
+      },
+      "precondiciones": {
+        "blockingProcesses": ["python.exe"],
+        "preCommands": [],
+        "requiresAdmin": false
+      },
+      "comoRegenerar": "Se regenera automáticamente al ejecutar `pip install`."
+    },
+    {
+      "id": "py-uv-cache",
+      "nombre": "Caché global de uv",
+      "categoria": "Python",
+      "tipo": "cache-global",
+      "ubicacion": {
+        "cliQuery": ["uv", "cache", "dir"],
+        "envFallback": ["%LOCALAPPDATA%\\uv\\cache"]
+      },
+      "deteccion": {
+        "requiredMarkers": [],
+        "requireGitIgnoredIfRepo": false,
+        "requireProjectAgeDays": false
+      },
+      "nivel": "seguro",
+      "metodo": {
+        "tipo": "comando-oficial",
+        "comando": ["uv", "cache", "clean"],
+        "fallbackBorradoSiSinCli": true,
+        "allowRecycleBinOption": false
+      },
+      "precondiciones": {
+        "blockingProcesses": ["uv.exe", "python.exe"],
+        "preCommands": [],
+        "requiresAdmin": false
+      },
+      "comoRegenerar": "Se regenera al ejecutar `uv sync` o `uv pip install`."
+    },
+    {
+      "id": "py-poetry-cache",
+      "nombre": "Caché global de Poetry",
+      "categoria": "Python",
+      "tipo": "cache-global",
+      "ubicacion": {
+        "cliQuery": ["poetry", "config", "cache-dir"],
+        "envFallback": ["%LOCALAPPDATA%\\pypoetry\\Cache"]
+      },
+      "deteccion": {
+        "requiredMarkers": [],
+        "requireGitIgnoredIfRepo": false,
+        "requireProjectAgeDays": false
+      },
+      "nivel": "seguro",
+      "metodo": {
+        "tipo": "comando-oficial",
+        "comando": ["poetry", "cache", "clear", "--all", ".", "-n"],
+        "fallbackBorradoSiSinCli": true,
+        "allowRecycleBinOption": false
+      },
+      "precondiciones": {
+        "blockingProcesses": ["python.exe"],
+        "preCommands": [],
+        "requiresAdmin": false
+      },
+      "comoRegenerar": "Se regenera al ejecutar `poetry install`."
+    },
+    {
+      "id": "php-composer-cache",
+      "nombre": "Caché global de Composer",
+      "categoria": "PHP",
+      "tipo": "cache-global",
+      "ubicacion": {
+        "cliQuery": ["composer", "config", "cache-dir"],
+        "envFallback": ["%LOCALAPPDATA%\\Composer"]
+      },
+      "deteccion": {
+        "requiredMarkers": [],
+        "requireGitIgnoredIfRepo": false,
+        "requireProjectAgeDays": false
+      },
+      "nivel": "seguro",
+      "metodo": {
+        "tipo": "comando-oficial",
+        "comando": ["composer", "clear-cache"],
+        "fallbackBorradoSiSinCli": true,
+        "allowRecycleBinOption": false
+      },
+      "precondiciones": {
+        "blockingProcesses": ["php.exe"],
+        "preCommands": [],
+        "requiresAdmin": false
+      },
+      "comoRegenerar": "Se regenera automáticamente con `composer install`."
+    },
+    {
+      "id": "android-gradle-caches",
+      "nombre": "Cachés globales de Gradle",
+      "categoria": "Android",
+      "tipo": "cache-global",
+      "ubicacion": {
+        "envFallback": ["%USERPROFILE%\\.gradle\\caches"]
+      },
+      "deteccion": {
+        "requiredMarkers": [],
+        "requireGitIgnoredIfRepo": false,
+        "requireProjectAgeDays": false
+      },
+      "nivel": "seguro",
+      "metodo": {
+        "tipo": "borrado-permanente",
+        "allowRecycleBinOption": true
+      },
+      "precondiciones": {
+        "blockingProcesses": ["studio64.exe"],
+        "preCommands": [["gradle", "--stop"]],
+        "requiresAdmin": false
+      },
+      "comoRegenerar": "Gradle vuelve a descargar dependencias en el próximo build o Sync."
+    },
+    {
+      "id": "android-gradle-daemon-logs",
+      "nombre": "Logs del daemon de Gradle",
+      "categoria": "Android",
+      "tipo": "cache-global",
+      "ubicacion": {
+        "envFallback": ["%USERPROFILE%\\.gradle\\daemon"],
+        "specialDetector": "gradle_daemon_logs"
+      },
+      "deteccion": {
+        "requiredMarkers": [],
+        "requireGitIgnoredIfRepo": false,
+        "requireProjectAgeDays": false
+      },
+      "nivel": "seguro",
+      "metodo": {
+        "tipo": "borrado-permanente",
+        "allowRecycleBinOption": true
+      },
+      "precondiciones": {
+        "blockingProcesses": ["studio64.exe"],
+        "preCommands": [["gradle", "--stop"]],
+        "requiresAdmin": false
+      },
+      "comoRegenerar": "Gradle crea nuevos logs al arrancar el daemon."
+    },
+    {
+      "id": "android-gradle-wrapper-dists",
+      "nombre": "Distribuciones antiguas de Gradle Wrapper",
+      "categoria": "Android",
+      "tipo": "cache-global",
+      "ubicacion": {
+        "envFallback": ["%USERPROFILE%\\.gradle\\wrapper\\dists"],
+        "specialDetector": "gradle_old_dists"
+      },
+      "deteccion": {
+        "requiredMarkers": [],
+        "requireGitIgnoredIfRepo": false,
+        "requireProjectAgeDays": false
+      },
+      "nivel": "seguro",
+      "metodo": {
+        "tipo": "borrado-permanente",
+        "allowRecycleBinOption": true
+      },
+      "precondiciones": {
+        "blockingProcesses": ["studio64.exe"],
+        "preCommands": [["gradle", "--stop"]],
+        "requiresAdmin": false
+      },
+      "comoRegenerar": "Se conserva la versión más reciente; `./gradlew` descarga cualquier otra si la necesita."
+    },
+    {
+      "id": "java-maven-repo",
+      "nombre": "Repositorio local de Maven (~/.m2/repository)",
+      "categoria": "Android",
+      "tipo": "cache-global",
+      "ubicacion": {
+        "envFallback": ["%USERPROFILE%\\.m2\\repository"]
+      },
+      "deteccion": {
+        "requiredMarkers": [],
+        "requireGitIgnoredIfRepo": false,
+        "requireProjectAgeDays": false
+      },
+      "nivel": "revisar",
+      "metodo": {
+        "tipo": "borrado-permanente",
+        "allowRecycleBinOption": true
+      },
+      "precondiciones": {
+        "blockingProcesses": ["studio64.exe", "idea64.exe"],
+        "preCommands": [],
+        "requiresAdmin": false
+      },
+      "comoRegenerar": "Maven/Gradle vuelve a descargar artefactos en el próximo build."
+    },
+    {
+      "id": "dotnet-nuget-cache",
+      "nombre": "Cachés globales de NuGet (.NET)",
+      "categoria": "Sistema",
+      "tipo": "cache-global",
+      "ubicacion": {
+        "envFallback": ["%USERPROFILE%\\.nuget\\packages"]
+      },
+      "deteccion": {
+        "requiredMarkers": [],
+        "requireGitIgnoredIfRepo": false,
+        "requireProjectAgeDays": false
+      },
+      "nivel": "seguro",
+      "metodo": {
+        "tipo": "comando-oficial",
+        "comando": ["dotnet", "nuget", "locals", "all", "--clear"],
+        "fallbackBorradoSiSinCli": true,
+        "allowRecycleBinOption": false
+      },
+      "precondiciones": {
+        "blockingProcesses": ["dotnet.exe", "devenv.exe"],
+        "preCommands": [],
+        "requiresAdmin": false
+      },
+      "comoRegenerar": "Se regenera con `dotnet restore`."
+    },
+    {
+      "id": "test-playwright",
+      "nombre": "Navegadores de Playwright",
+      "categoria": "Testing",
+      "tipo": "cache-global",
+      "ubicacion": {
+        "envFallback": ["%PLAYWRIGHT_BROWSERS_PATH%", "%LOCALAPPDATA%\\ms-playwright"]
+      },
+      "deteccion": {
+        "requiredMarkers": [],
+        "requireGitIgnoredIfRepo": false,
+        "requireProjectAgeDays": false
+      },
+      "nivel": "seguro",
+      "metodo": {
+        "tipo": "borrado-permanente",
+        "allowRecycleBinOption": true
+      },
+      "precondiciones": {
+        "blockingProcesses": ["node.exe"],
+        "preCommands": [],
+        "requiresAdmin": false
+      },
+      "comoRegenerar": "Ejecuta `npx playwright install` para volver a descargar los navegadores."
+    },
+    {
+      "id": "test-cypress",
+      "nombre": "Caché de binarios de Cypress",
+      "categoria": "Testing",
+      "tipo": "cache-global",
+      "ubicacion": {
+        "envFallback": ["%CYPRESS_CACHE_FOLDER%", "%LOCALAPPDATA%\\Cypress\\Cache"]
+      },
+      "deteccion": {
+        "requiredMarkers": [],
+        "requireGitIgnoredIfRepo": false,
+        "requireProjectAgeDays": false
+      },
+      "nivel": "seguro",
+      "metodo": {
+        "tipo": "borrado-permanente",
+        "allowRecycleBinOption": true
+      },
+      "precondiciones": {
+        "blockingProcesses": ["Cypress.exe", "node.exe"],
+        "preCommands": [],
+        "requiresAdmin": false
+      },
+      "comoRegenerar": "Ejecuta `npx cypress install`."
+    },
+    {
+      "id": "test-puppeteer",
+      "nombre": "Caché de navegadores de Puppeteer",
+      "categoria": "Testing",
+      "tipo": "cache-global",
+      "ubicacion": {
+        "envFallback": ["%PUPPETEER_CACHE_DIR%", "%USERPROFILE%\\.cache\\puppeteer"]
+      },
+      "deteccion": {
+        "requiredMarkers": [],
+        "requireGitIgnoredIfRepo": false,
+        "requireProjectAgeDays": false
+      },
+      "nivel": "seguro",
+      "metodo": {
+        "tipo": "borrado-permanente",
+        "allowRecycleBinOption": true
+      },
+      "precondiciones": {
+        "blockingProcesses": ["node.exe"],
+        "preCommands": [],
+        "requiresAdmin": false
+      },
+      "comoRegenerar": "Se vuelve a descargar al ejecutar `npm install` o `npx puppeteer browsers install`."
+    },
+    {
+      "id": "ide-vscode-caches",
+      "nombre": "Cachés y logs de VS Code",
+      "categoria": "IDE",
+      "tipo": "cache-global",
+      "ubicacion": {
+        "envFallback": [
+          "%APPDATA%\\Code\\Cache",
+          "%APPDATA%\\Code\\CachedData",
+          "%APPDATA%\\Code\\CachedExtensionVSIXs",
+          "%APPDATA%\\Code\\logs"
+        ]
+      },
+      "deteccion": {
+        "requiredMarkers": [],
+        "requireGitIgnoredIfRepo": false,
+        "requireProjectAgeDays": false
+      },
+      "nivel": "seguro",
+      "metodo": {
+        "tipo": "borrado-permanente",
+        "allowRecycleBinOption": true
+      },
+      "precondiciones": {
+        "blockingProcesses": ["Code.exe"],
+        "preCommands": [],
+        "requiresAdmin": false
+      },
+      "comoRegenerar": "VS Code recrea sus cachés y logs automáticamente al iniciar."
+    },
+    {
+      "id": "ide-vscode-orphan-ws",
+      "nombre": "workspaceStorage huérfanos de VS Code",
+      "categoria": "IDE",
+      "tipo": "cache-global",
+      "ubicacion": {
+        "envFallback": ["%APPDATA%\\Code\\User\\workspaceStorage"],
+        "specialDetector": "vscode_orphan_ws"
+      },
+      "deteccion": {
+        "requiredMarkers": [],
+        "requireGitIgnoredIfRepo": false,
+        "requireProjectAgeDays": false
+      },
+      "nivel": "seguro",
+      "metodo": {
+        "tipo": "borrado-permanente",
+        "allowRecycleBinOption": true
+      },
+      "precondiciones": {
+        "blockingProcesses": ["Code.exe"],
+        "preCommands": [],
+        "requiresAdmin": false
+      },
+      "comoRegenerar": "Pertenecen a carpetas de proyectos que ya no existen en disco."
+    },
+    {
+      "id": "ide-vscode-old-exts",
+      "nombre": "Versiones antiguas duplicadas de extensiones VS Code",
+      "categoria": "IDE",
+      "tipo": "cache-global",
+      "ubicacion": {
+        "envFallback": ["%USERPROFILE%\\.vscode\\extensions"],
+        "specialDetector": "vscode_old_exts"
+      },
+      "deteccion": {
+        "requiredMarkers": [],
+        "requireGitIgnoredIfRepo": false,
+        "requireProjectAgeDays": false
+      },
+      "nivel": "seguro",
+      "metodo": {
+        "tipo": "borrado-permanente",
+        "allowRecycleBinOption": true
+      },
+      "precondiciones": {
+        "blockingProcesses": ["Code.exe"],
+        "preCommands": [],
+        "requiresAdmin": false
+      },
+      "comoRegenerar": "Se conserva la versión más reciente de cada extensión; VS Code puede reinstalar cualquiera."
+    },
+    {
+      "id": "ide-android-studio-cache",
+      "nombre": "Cachés y logs de Android Studio / JetBrains",
+      "categoria": "IDE",
+      "tipo": "cache-global",
+      "ubicacion": {
+        "envFallback": ["%LOCALAPPDATA%\\Google", "%LOCALAPPDATA%\\JetBrains"],
+        "specialDetector": "jetbrains_caches"
+      },
+      "deteccion": {
+        "requiredMarkers": [],
+        "requireGitIgnoredIfRepo": false,
+        "requireProjectAgeDays": false
+      },
+      "nivel": "seguro",
+      "metodo": {
+        "tipo": "borrado-permanente",
+        "allowRecycleBinOption": true
+      },
+      "precondiciones": {
+        "blockingProcesses": [
+          "studio64.exe",
+          "idea64.exe",
+          "webstorm64.exe",
+          "phpstorm64.exe",
+          "pycharm64.exe"
+        ],
+        "preCommands": [],
+        "requiresAdmin": false
+      },
+      "comoRegenerar": "El IDE reindexa los proyectos automáticamente al abrirlos."
+    },
+    {
+      "id": "ide-android-studio-old-ver",
+      "nombre": "Carpetas de versiones antiguas de Android Studio / JetBrains",
+      "categoria": "IDE",
+      "tipo": "cache-global",
+      "ubicacion": {
+        "envFallback": ["%LOCALAPPDATA%\\Google", "%LOCALAPPDATA%\\JetBrains"],
+        "specialDetector": "android_studio_old"
+      },
+      "deteccion": {
+        "requiredMarkers": [],
+        "requireGitIgnoredIfRepo": false,
+        "requireProjectAgeDays": false
+      },
+      "nivel": "revisar",
+      "metodo": {
+        "tipo": "borrado-permanente",
+        "allowRecycleBinOption": true
+      },
+      "precondiciones": {
+        "blockingProcesses": [
+          "studio64.exe",
+          "idea64.exe",
+          "webstorm64.exe",
+          "phpstorm64.exe",
+          "pycharm64.exe"
+        ],
+        "preCommands": [],
+        "requiresAdmin": false
+      },
+      "comoRegenerar": "Versiones anteriores a la instalada actualmente; si vuelves a instalar una versión vieja recreará su carpeta."
+    },
+    {
+      "id": "android-sdk-unused",
+      "nombre": "Componentes antiguos de Android SDK (vía sdkmanager)",
+      "categoria": "Android",
+      "tipo": "cache-global",
+      "ubicacion": {
+        "envFallback": ["%ANDROID_HOME%", "%ANDROID_SDK_ROOT%", "%LOCALAPPDATA%\\Android\\Sdk"],
+        "specialDetector": "android_sdk_unused"
+      },
+      "deteccion": {
+        "requiredMarkers": [],
+        "requireGitIgnoredIfRepo": false,
+        "requireProjectAgeDays": false
+      },
+      "nivel": "revisar",
+      "metodo": {
+        "tipo": "comando-oficial",
+        "comando": ["sdkmanager", "--uninstall"],
+        "fallbackBorradoSiSinCli": false,
+        "allowRecycleBinOption": false
+      },
+      "precondiciones": {
+        "blockingProcesses": ["studio64.exe", "emulator.exe", "qemu-system-x86_64.exe"],
+        "preCommands": [],
+        "requiresAdmin": false
+      },
+      "comoRegenerar": "Reinstalable desde Android Studio SDK Manager o `sdkmanager --install`."
+    },
+    {
+      "id": "android-avds",
+      "nombre": "Emuladores Android (AVD)",
+      "categoria": "Android",
+      "tipo": "cache-global",
+      "ubicacion": {
+        "envFallback": ["%USERPROFILE%\\.android\\avd"],
+        "specialDetector": "android_avds"
+      },
+      "deteccion": {
+        "requiredMarkers": [],
+        "requireGitIgnoredIfRepo": false,
+        "requireProjectAgeDays": false
+      },
+      "nivel": "revisar",
+      "metodo": {
+        "tipo": "borrado-permanente",
+        "allowRecycleBinOption": true
+      },
+      "precondiciones": {
+        "blockingProcesses": ["emulator.exe", "qemu-system-x86_64.exe", "studio64.exe"],
+        "preCommands": [],
+        "requiresAdmin": false
+      },
+      "comoRegenerar": "Recrear desde Device Manager en Android Studio."
+    },
+    {
+      "id": "docker-builder-prune",
+      "nombre": "Caché de build de Docker (builder prune)",
+      "categoria": "Docker",
+      "tipo": "cache-global",
+      "ubicacion": {
+        "envFallback": [],
+        "specialDetector": "docker_builder"
+      },
+      "deteccion": {
+        "requiredMarkers": [],
+        "requireGitIgnoredIfRepo": false,
+        "requireProjectAgeDays": false
+      },
+      "nivel": "revisar",
+      "metodo": {
+        "tipo": "comando-oficial",
+        "comando": ["docker", "builder", "prune", "-f"],
+        "fallbackBorradoSiSinCli": false,
+        "allowRecycleBinOption": false
+      },
+      "precondiciones": {
+        "blockingProcesses": [],
+        "preCommands": [],
+        "requiresAdmin": false
+      },
+      "comoRegenerar": "Las capas de caché se reconstruyen en el próximo `docker build`."
+    },
+    {
+      "id": "docker-dangling-images",
+      "nombre": "Imágenes dangling de Docker (<none>)",
+      "categoria": "Docker",
+      "tipo": "cache-global",
+      "ubicacion": {
+        "envFallback": [],
+        "specialDetector": "docker_dangling_images"
+      },
+      "deteccion": {
+        "requiredMarkers": [],
+        "requireGitIgnoredIfRepo": false,
+        "requireProjectAgeDays": false
+      },
+      "nivel": "revisar",
+      "metodo": {
+        "tipo": "comando-oficial",
+        "comando": ["docker", "image", "prune", "-f"],
+        "fallbackBorradoSiSinCli": false,
+        "allowRecycleBinOption": false
+      },
+      "precondiciones": {
+        "blockingProcesses": [],
+        "preCommands": [],
+        "requiresAdmin": false
+      },
+      "comoRegenerar": "Solo elimina capas sin etiqueta; `docker pull` / `docker build` recupera imágenes."
+    },
+    {
+      "id": "docker-stopped-containers",
+      "nombre": "Contenedores detenidos de Docker",
+      "categoria": "Docker",
+      "tipo": "cache-global",
+      "ubicacion": {
+        "envFallback": [],
+        "specialDetector": "docker_stopped_containers"
+      },
+      "deteccion": {
+        "requiredMarkers": [],
+        "requireGitIgnoredIfRepo": false,
+        "requireProjectAgeDays": false
+      },
+      "nivel": "revisar",
+      "metodo": {
+        "tipo": "comando-oficial",
+        "comando": ["docker", "container", "prune", "-f"],
+        "fallbackBorradoSiSinCli": false,
+        "allowRecycleBinOption": false
+      },
+      "precondiciones": {
+        "blockingProcesses": [],
+        "preCommands": [],
+        "requiresAdmin": false
+      },
+      "comoRegenerar": "Recrear con `docker compose up` o `docker run` (los volúmenes nunca se tocan)."
+    },
+    {
+      "id": "sys-user-temp",
+      "nombre": "Temporales del usuario (%TEMP%)",
+      "categoria": "Sistema",
+      "tipo": "sistema",
+      "ubicacion": {
+        "envFallback": ["%TEMP%"],
+        "specialDetector": "dir_contents"
+      },
+      "deteccion": {
+        "requiredMarkers": [],
+        "requireGitIgnoredIfRepo": false,
+        "requireProjectAgeDays": false
+      },
+      "nivel": "seguro",
+      "metodo": {
+        "tipo": "borrado-permanente",
+        "allowRecycleBinOption": true
+      },
+      "precondiciones": {
+        "blockingProcesses": [],
+        "preCommands": [],
+        "requiresAdmin": false
+      },
+      "comoRegenerar": "Archivos temporales creados por aplicaciones y compiladores."
+    },
+    {
+      "id": "sys-win-temp",
+      "nombre": "Temporales del sistema (C:\\Windows\\Temp)",
+      "categoria": "Sistema",
+      "tipo": "sistema",
+      "ubicacion": {
+        "envFallback": ["%SystemRoot%\\Temp"],
+        "specialDetector": "dir_contents"
+      },
+      "deteccion": {
+        "requiredMarkers": [],
+        "requireGitIgnoredIfRepo": false,
+        "requireProjectAgeDays": false
+      },
+      "nivel": "seguro",
+      "metodo": {
+        "tipo": "borrado-permanente",
+        "allowRecycleBinOption": true
+      },
+      "precondiciones": {
+        "blockingProcesses": [],
+        "preCommands": [],
+        "requiresAdmin": true
+      },
+      "comoRegenerar": "Temporales del sistema; requiere permisos de administrador."
+    },
+    {
+      "id": "sys-crash-dumps",
+      "nombre": "Volcados de fallos (CrashDumps)",
+      "categoria": "Sistema",
+      "tipo": "sistema",
+      "ubicacion": {
+        "envFallback": ["%LOCALAPPDATA%\\CrashDumps"],
+        "specialDetector": "dir_contents"
+      },
+      "deteccion": {
+        "requiredMarkers": [],
+        "requireGitIgnoredIfRepo": false,
+        "requireProjectAgeDays": false
+      },
+      "nivel": "seguro",
+      "metodo": {
+        "tipo": "borrado-permanente",
+        "allowRecycleBinOption": true
+      },
+      "precondiciones": {
+        "blockingProcesses": [],
+        "preCommands": [],
+        "requiresAdmin": false
+      },
+      "comoRegenerar": "Reportes de diagnóstico generados únicamente tras un fallo de aplicación."
+    },
+    {
+      "id": "sys-wer-user",
+      "nombre": "Reportes WER del usuario",
+      "categoria": "Sistema",
+      "tipo": "sistema",
+      "ubicacion": {
+        "envFallback": ["%LOCALAPPDATA%\\Microsoft\\Windows\\WER"],
+        "specialDetector": "dir_contents"
+      },
+      "deteccion": {
+        "requiredMarkers": [],
+        "requireGitIgnoredIfRepo": false,
+        "requireProjectAgeDays": false
+      },
+      "nivel": "seguro",
+      "metodo": {
+        "tipo": "borrado-permanente",
+        "allowRecycleBinOption": true
+      },
+      "precondiciones": {
+        "blockingProcesses": [],
+        "preCommands": [],
+        "requiresAdmin": false
+      },
+      "comoRegenerar": "Reportes de Windows Error Reporting; no afectan al sistema."
+    },
+    {
+      "id": "sys-wer-programdata",
+      "nombre": "Reportes WER del sistema (ProgramData)",
+      "categoria": "Sistema",
+      "tipo": "sistema",
+      "ubicacion": {
+        "envFallback": [
+          "%ProgramData%\\Microsoft\\Windows\\WER\\ReportArchive",
+          "%ProgramData%\\Microsoft\\Windows\\WER\\ReportQueue",
+          "%ProgramData%\\Microsoft\\Windows\\WER\\Temp"
+        ],
+        "specialDetector": "dir_contents"
+      },
+      "deteccion": {
+        "requiredMarkers": [],
+        "requireGitIgnoredIfRepo": false,
+        "requireProjectAgeDays": false
+      },
+      "nivel": "seguro",
+      "metodo": {
+        "tipo": "borrado-permanente",
+        "allowRecycleBinOption": true
+      },
+      "precondiciones": {
+        "blockingProcesses": [],
+        "preCommands": [],
+        "requiresAdmin": true
+      },
+      "comoRegenerar": "Reportes de Windows Error Reporting del sistema."
+    },
+    {
+      "id": "sys-recycle-bin",
+      "nombre": "Papelera de reciclaje",
+      "categoria": "Sistema",
+      "tipo": "sistema",
+      "ubicacion": {
+        "envFallback": [],
+        "specialDetector": "recycle_bin"
+      },
+      "deteccion": {
+        "requiredMarkers": [],
+        "requireGitIgnoredIfRepo": false,
+        "requireProjectAgeDays": false
+      },
+      "nivel": "seguro",
+      "metodo": {
+        "tipo": "comando-oficial",
+        "comando": ["SHEmptyRecycleBinW"],
+        "fallbackBorradoSiSinCli": false,
+        "allowRecycleBinOption": false
+      },
+      "precondiciones": {
+        "blockingProcesses": [],
+        "preCommands": [],
+        "requiresAdmin": false
+      },
+      "comoRegenerar": "Vacía definitivamente los archivos que ya enviaste a la Papelera."
+    },
+    {
+      "id": "sys-dism-cleanup",
+      "nombre": "Limpieza de componentes de Windows Update (DISM)",
+      "categoria": "Sistema",
+      "tipo": "sistema",
+      "ubicacion": {
+        "envFallback": [],
+        "specialDetector": "dism_cleanup"
+      },
+      "deteccion": {
+        "requiredMarkers": [],
+        "requireGitIgnoredIfRepo": false,
+        "requireProjectAgeDays": false
+      },
+      "nivel": "revisar",
+      "metodo": {
+        "tipo": "comando-oficial",
+        "comando": ["DISM.exe", "/Online", "/Cleanup-Image", "/StartComponentCleanup"],
+        "fallbackBorradoSiSinCli": false,
+        "allowRecycleBinOption": false
+      },
+      "precondiciones": {
+        "blockingProcesses": [],
+        "preCommands": [],
+        "requiresAdmin": true
+      },
+      "comoRegenerar": "Limpia versiones obsoletas del almacén WinSxS de forma oficial (puede tardar varios minutos)."
+    },
+    {
+      "id": "proj-node-modules",
+      "nombre": "Dependencias Node (node_modules)",
+      "categoria": "Node",
+      "tipo": "artefacto-proyecto",
+      "ubicacion": {
+        "folderPatterns": ["node_modules"]
+      },
+      "deteccion": {
+        "requiredMarkers": ["package.json"],
+        "requireGitIgnoredIfRepo": true,
+        "requireProjectAgeDays": true
+      },
+      "nivel": "revisar",
+      "metodo": {
+        "tipo": "borrado-permanente",
+        "allowRecycleBinOption": true
+      },
+      "precondiciones": {
+        "blockingProcesses": ["node.exe"],
+        "preCommands": [],
+        "requiresAdmin": false
+      },
+      "comoRegenerar": "Ejecuta `npm install`, `pnpm install` o `yarn` en la raíz del proyecto."
+    },
+    {
+      "id": "proj-web-builds",
+      "nombre": "Artefactos de build/test web (.next, .nuxt, .turbo, .vite, dist, coverage)",
+      "categoria": "Node",
+      "tipo": "artefacto-proyecto",
+      "ubicacion": {
+        "folderPatterns": [".next", ".nuxt", ".turbo", ".vite", ".parcel-cache", "dist", "coverage"]
+      },
+      "deteccion": {
+        "requiredMarkers": ["package.json"],
+        "requireGitIgnoredIfRepo": true,
+        "requireProjectAgeDays": true
+      },
+      "nivel": "revisar",
+      "metodo": {
+        "tipo": "borrado-permanente",
+        "allowRecycleBinOption": true
+      },
+      "precondiciones": {
+        "blockingProcesses": ["node.exe"],
+        "preCommands": [],
+        "requiresAdmin": false
+      },
+      "comoRegenerar": "Ejecuta `npm run build` o `npm test` en el proyecto."
+    },
+    {
+      "id": "proj-php-vendor",
+      "nombre": "Dependencias PHP (vendor)",
+      "categoria": "PHP",
+      "tipo": "artefacto-proyecto",
+      "ubicacion": {
+        "folderPatterns": ["vendor"]
+      },
+      "deteccion": {
+        "requiredMarkers": ["composer.json"],
+        "requireGitIgnoredIfRepo": true,
+        "requireProjectAgeDays": true
+      },
+      "nivel": "revisar",
+      "metodo": {
+        "tipo": "borrado-permanente",
+        "allowRecycleBinOption": true
+      },
+      "precondiciones": {
+        "blockingProcesses": ["php.exe"],
+        "preCommands": [],
+        "requiresAdmin": false
+      },
+      "comoRegenerar": "Ejecuta `composer install` en la raíz del proyecto."
+    },
+    {
+      "id": "proj-py-venv",
+      "nombre": "Entorno virtual Python (.venv / venv)",
+      "categoria": "Python",
+      "tipo": "artefacto-proyecto",
+      "ubicacion": {
+        "folderPatterns": [".venv", "venv"]
+      },
+      "deteccion": {
+        "requiredMarkers": ["pyproject.toml", "requirements.txt", "setup.py", "Pipfile"],
+        "requireGitIgnoredIfRepo": true,
+        "requireProjectAgeDays": true
+      },
+      "nivel": "revisar",
+      "metodo": {
+        "tipo": "borrado-permanente",
+        "allowRecycleBinOption": true
+      },
+      "precondiciones": {
+        "blockingProcesses": ["python.exe"],
+        "preCommands": [],
+        "requiresAdmin": false
+      },
+      "comoRegenerar": "Ejecuta `python -m venv .venv` y reinstala dependencias (`pip install -r requirements.txt` / `uv sync`)."
+    },
+    {
+      "id": "proj-py-caches",
+      "nombre": "Cachés de Python (__pycache__, .pytest_cache, .mypy_cache)",
+      "categoria": "Python",
+      "tipo": "artefacto-proyecto",
+      "ubicacion": {
+        "folderPatterns": ["__pycache__", ".pytest_cache", ".mypy_cache"]
+      },
+      "deteccion": {
+        "requiredMarkers": ["pyproject.toml", "requirements.txt", "setup.py", "*.py"],
+        "requireGitIgnoredIfRepo": true,
+        "requireProjectAgeDays": true
+      },
+      "nivel": "revisar",
+      "metodo": {
+        "tipo": "borrado-permanente",
+        "allowRecycleBinOption": true
+      },
+      "precondiciones": {
+        "blockingProcesses": ["python.exe"],
+        "preCommands": [],
+        "requiresAdmin": false
+      },
+      "comoRegenerar": "Se regenera automáticamente al ejecutar Python, pytest o mypy."
+    },
+    {
+      "id": "proj-android-build",
+      "nombre": "Artefactos de build Android (build, app/build, .gradle, .cxx)",
+      "categoria": "Android",
+      "tipo": "artefacto-proyecto",
+      "ubicacion": {
+        "folderPatterns": ["build", "app\\build", ".gradle", ".cxx"]
+      },
+      "deteccion": {
+        "requiredMarkers": [
+          "build.gradle",
+          "build.gradle.kts",
+          "settings.gradle",
+          "settings.gradle.kts"
+        ],
+        "requireGitIgnoredIfRepo": true,
+        "requireProjectAgeDays": true
+      },
+      "nivel": "revisar",
+      "metodo": {
+        "tipo": "borrado-permanente",
+        "allowRecycleBinOption": true
+      },
+      "precondiciones": {
+        "blockingProcesses": ["studio64.exe"],
+        "preCommands": [],
+        "requiresAdmin": false
+      },
+      "comoRegenerar": "Ejecuta `./gradlew assembleDebug` o Sync en Android Studio."
+    },
+    {
+      "id": "proj-dotnet-bin-obj",
+      "nombre": "Artefactos .NET (bin / obj)",
+      "categoria": "Sistema",
+      "tipo": "artefacto-proyecto",
+      "ubicacion": {
+        "folderPatterns": ["bin", "obj"]
+      },
+      "deteccion": {
+        "requiredMarkers": ["*.csproj", "*.fsproj", "*.vbproj"],
+        "requireGitIgnoredIfRepo": true,
+        "requireProjectAgeDays": true
+      },
+      "nivel": "revisar",
+      "metodo": {
+        "tipo": "borrado-permanente",
+        "allowRecycleBinOption": true
+      },
+      "precondiciones": {
+        "blockingProcesses": ["dotnet.exe", "devenv.exe"],
+        "preCommands": [],
+        "requiresAdmin": false
+      },
+      "comoRegenerar": "Ejecuta `dotnet build` en el proyecto."
+    },
+    {
+      "id": "proj-rust-maven-target",
+      "nombre": "Artefactos Rust / Maven (target)",
+      "categoria": "Sistema",
+      "tipo": "artefacto-proyecto",
+      "ubicacion": {
+        "folderPatterns": ["target"]
+      },
+      "deteccion": {
+        "requiredMarkers": ["Cargo.toml", "pom.xml"],
+        "requireGitIgnoredIfRepo": true,
+        "requireProjectAgeDays": true
+      },
+      "nivel": "revisar",
+      "metodo": {
+        "tipo": "borrado-permanente",
+        "allowRecycleBinOption": true
+      },
+      "precondiciones": {
+        "blockingProcesses": ["cargo.exe", "rustc.exe"],
+        "preCommands": [],
+        "requiresAdmin": false
+      },
+      "comoRegenerar": "Ejecuta `cargo build` o `mvn compile`."
+    }
+  ]
+}

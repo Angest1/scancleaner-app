@@ -216,6 +216,26 @@ pub fn validate_target_path(path: &Path) -> Result<(), GuardrailViolation> {
         }
     }
 
+    // Enforce centralized protected-paths blacklist (critical + user rules, precedence,
+    // 8.3 normalization, junction/symlink resolution, and containment checks).
+    let prot = crate::protection::is_protected_default(path);
+    if prot.protected {
+        let entry_tag = prot
+            .entry
+            .as_ref()
+            .map(|e| format!(" [{}]", e.id))
+            .unwrap_or_default();
+        return Err(GuardrailViolation {
+            path: path.to_path_buf(),
+            reason: format!(
+                "{}{}",
+                prot.reason
+                    .unwrap_or_else(|| "Ruta protegida por lista negra.".to_string()),
+                entry_tag
+            ),
+        });
+    }
+
     Ok(())
 }
 

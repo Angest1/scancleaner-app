@@ -202,7 +202,7 @@ pub fn build_cleanup_plan(req: PreviewCleanupRequest) -> CleanupPlan {
     }
 }
 
-fn delete_to_recycle_bin_sta(paths: &[PathBuf]) -> Vec<Result<(), String>> {
+pub(crate) fn delete_to_recycle_bin_sta(paths: &[PathBuf]) -> Vec<Result<(), String>> {
     let paths_owned = paths.to_vec();
     std::thread::spawn(move || {
         let init_hr = unsafe { CoInitializeEx(None, COINIT_APARTMENTTHREADED) };
@@ -285,7 +285,7 @@ fn recycle_single_item(file_op: &IFileOperation, path: &Path) -> Result<(), Stri
     Ok(())
 }
 
-fn remove_permanently_safe(path: &Path) -> Result<(), String> {
+pub(crate) fn remove_permanently_safe(path: &Path) -> Result<(), String> {
     if !path.exists() {
         return Ok(());
     }
@@ -351,6 +351,9 @@ pub fn execute_cleanup_plan(
                 mode: "empty_recycle_bin".to_string(),
                 status: status.to_string(),
                 detail: detail.clone(),
+                rule_id: None,
+                estimated_bytes: None,
+                command: None,
             },
         );
         return Ok(CleanupResult {
@@ -383,6 +386,22 @@ pub fn execute_cleanup_plan(
         };
         if let Err(v) = check {
             skipped_count += 1;
+            let _ = append_cleanup_log(
+                &log_dir,
+                &CleanupLogEntry {
+                    timestamp: Utc::now().to_rfc3339(),
+                    plan_id: plan.plan_id.clone(),
+                    path: item.path.clone(),
+                    category: item.category.clone(),
+                    bytes: 0,
+                    mode: format!("{:?}", plan.mode).to_ascii_lowercase(),
+                    status: "blocked".to_string(),
+                    detail: Some(v.reason.clone()),
+                    rule_id: None,
+                    estimated_bytes: Some(item.bytes),
+                    command: None,
+                },
+            );
             outcomes.push(CleanupItemOutcome {
                 path: item.path.clone(),
                 bytes: 0,
@@ -425,6 +444,9 @@ pub fn execute_cleanup_plan(
                     mode: "recycle_bin".to_string(),
                     status: status.to_string(),
                     detail: detail.clone(),
+                    rule_id: None,
+                    estimated_bytes: None,
+                    command: None,
                 },
             );
             outcomes.push(CleanupItemOutcome {
@@ -459,6 +481,9 @@ pub fn execute_cleanup_plan(
                     mode: "permanent".to_string(),
                     status: status.to_string(),
                     detail: detail.clone(),
+                    rule_id: None,
+                    estimated_bytes: None,
+                    command: None,
                 },
             );
             outcomes.push(CleanupItemOutcome {

@@ -70,6 +70,8 @@ export interface TreemapNodeDto {
   originCat: string;
   percentage: number;
   isOtherBucket: boolean;
+  isProtected: boolean;
+  protectionReason: string | null;
 }
 
 export interface TreemapViewDto {
@@ -91,6 +93,8 @@ export interface TopEntryDto {
   lastWriteTs: number;
   typeCat: string;
   originCat: string;
+  isProtected: boolean;
+  protectionReason: string | null;
 }
 
 export interface CategoryBucket {
@@ -209,7 +213,183 @@ export interface CleanupLogEntry {
   mode: string;
   status: string;
   detail: string | null;
+  ruleId?: string | null;
+  estimatedBytes?: number | null;
+  command?: string | null;
 }
+
+export type DevRuleCategory =
+  | "Node"
+  | "PHP"
+  | "Python"
+  | "Android"
+  | "Docker"
+  | "IDE"
+  | "Sistema"
+  | "Testing";
+
+export type DevRuleKind = "cache-global" | "artefacto-proyecto" | "sistema";
+export type DevSafetyLevel = "seguro" | "revisar" | "nunca";
+export type DevCleanMethod = "comando-oficial" | "borrado-permanente" | "papelera";
+
+export interface DevCleanerConfig {
+  projectRoots: string[];
+  minProjectAgeDays: number;
+  disabledRuleIds: string[];
+}
+
+export interface DevCandidate {
+  id: string;
+  ruleId: string;
+  nombre: string;
+  categoria: DevRuleCategory;
+  tipo: DevRuleKind;
+  nivel: DevSafetyLevel;
+  path: string;
+  extraPaths: string[];
+  deleteDirContentsOnly: boolean;
+  projectName: string | null;
+  projectRoot: string | null;
+  projectAgeDays: number | null;
+  noGitRepo: boolean;
+  sizeBytes: number;
+  itemCount: number;
+  lastModifiedTs: number;
+  method: DevCleanMethod;
+  command: string[] | null;
+  preCommands: string[][];
+  allowRecycleBinOption: boolean;
+  requiresAdmin: boolean;
+  blockingProcessesRunning: string[];
+  blockingProcessesSpec: string[];
+  warning: string | null;
+  blockedReason: string | null;
+  comoRegenerar: string;
+  preselected: boolean;
+}
+
+export interface DockerWslInfo {
+  dockerAvailable: boolean;
+  daemonRunning: boolean;
+  vhdxNotice: string;
+  compactInstructions: string[];
+}
+
+export interface DevScanReport {
+  isElevated: boolean;
+  totalRecoverableBytes: number;
+  safeRecoverableBytes: number;
+  reviewRecoverableBytes: number;
+  runningDevProcesses: string[];
+  configuredRoots: string[];
+  minProjectAgeDays: number;
+  dockerWslInfo: DockerWslInfo;
+  candidates: DevCandidate[];
+  warnings: string[];
+}
+
+export interface DevPreviewItemInput {
+  candidate: DevCandidate;
+  useRecycleBin: boolean;
+}
+
+export interface DevPlannedItem {
+  id: string;
+  ruleId: string;
+  nombre: string;
+  categoria: DevRuleCategory;
+  nivel: DevSafetyLevel;
+  path: string;
+  extraPaths: string[];
+  deleteDirContentsOnly: boolean;
+  estimatedBytes: number;
+  effectiveMethod: DevCleanMethod;
+  command: string[] | null;
+  preCommands: string[][];
+  blockingProcessesSpec: string[];
+  requiresAdmin: boolean;
+  comoRegenerar: string;
+}
+
+export interface DevBlockedItem {
+  id: string;
+  nombre: string;
+  path: string;
+  reason: string;
+}
+
+export interface DevCleanupPlan {
+  planId: string;
+  items: DevPlannedItem[];
+  blockedItems: DevBlockedItem[];
+  totalEstimatedBytes: number;
+  warnings: string[];
+}
+
+export interface DevExecutionOutcome {
+  id: string;
+  ruleId: string;
+  nombre: string;
+  path: string;
+  methodLabel: string;
+  estimatedBytes: number;
+  freedBytes: number;
+  status: string;
+  detail: string | null;
+}
+
+export interface DevCleanupResult {
+  planId: string;
+  totalEstimatedBytes: number;
+  totalFreedBytes: number;
+  succeededCount: number;
+  failedCount: number;
+  skippedCount: number;
+  outcomes: DevExecutionOutcome[];
+}
+
+export type ProtectionType = "archivo" | "carpeta-recursiva" | "glob";
+export type ProtectionOrigin = "crítica" | "usuario";
+
+export interface ProtectedEntry {
+  id: string;
+  patron: string;
+  tipo: ProtectionType;
+  origen: ProtectionOrigin;
+  motivo: string;
+  todasLasUnidades: boolean;
+}
+
+export interface ProtectionResult {
+  protected: boolean;
+  entry: ProtectedEntry | null;
+  reason: string | null;
+}
+
+export interface SystemFileEntry {
+  id: string;
+  name: string;
+  path: string;
+  sizeBytes: number;
+  explanation: string;
+  canAdjust: boolean;
+  adjustKind: "pagefile" | "hiberfil" | "none";
+}
+
+export interface HibernationStatus {
+  available: boolean;
+  label: string;
+  detail: string | null;
+}
+
+export interface SystemFilesReport {
+  files: SystemFileEntry[];
+  totalBytes: number;
+  hibernation: HibernationStatus;
+  virtualMemoryInstruction: string;
+}
+
+export type PowercfgAction = "reduced" | "off" | "on";
 
 export const api = {
   getStartupContext: () => invoke<StartupContext>("get_startup_context"),
@@ -249,4 +429,43 @@ export const api = {
   diffSnapshots: (olderId: number, newerId: number) =>
     invoke<SnapshotDiff>("cmd_diff_snapshots", { olderId, newerId }),
   listCleanupLogs: (limit = 200) => invoke<CleanupLogEntry[]>("cmd_list_cleanup_logs", { limit }),
+  devGetConfig: () => invoke<DevCleanerConfig>("cmd_dev_get_config"),
+  devSaveConfig: (config: DevCleanerConfig) =>
+    invoke<DevCleanerConfig>("cmd_dev_save_config", { config }),
+  devPickProjectRoot: () => invoke<string | null>("cmd_dev_pick_project_root"),
+  devScan: (config?: DevCleanerConfig) =>
+    invoke<DevScanReport>("cmd_dev_scan", { config: config ?? null }),
+  devPreview: (items: DevPreviewItemInput[]) =>
+    invoke<DevCleanupPlan>("cmd_dev_preview", { request: { items } }),
+  devExecute: (planId: string) => invoke<DevCleanupResult>("cmd_dev_execute", { planId }),
+  protectionList: () => invoke<ProtectedEntry[]>("cmd_protection_list"),
+  protectionAdd: (
+    patron: string,
+    tipo: ProtectionType,
+    motivo: string,
+    todasLasUnidades: boolean,
+  ) =>
+    invoke<ProtectedEntry[]>("cmd_protection_add", {
+      patron,
+      tipo,
+      motivo,
+      todasLasUnidades,
+    }),
+  protectionRemove: (id: string) => invoke<ProtectedEntry[]>("cmd_protection_remove", { id }),
+  protectionCheck: (path: string) => invoke<ProtectionResult>("cmd_protection_check", { path }),
+  protectionPreviewMatches: (patron: string, tipo: ProtectionType, todasLasUnidades: boolean) =>
+    invoke<number>("cmd_protection_preview_matches", {
+      patron,
+      tipo,
+      todasLasUnidades,
+    }),
+  pickFile: () => invoke<string | null>("cmd_pick_file"),
+  systemFilesReport: (driveRoot: string | null) =>
+    invoke<SystemFilesReport>("cmd_system_files_report", { driveRoot }),
+  openVirtualMemory: () => invoke<string>("cmd_open_virtual_memory"),
+  openPowerOptions: () => invoke<void>("cmd_open_power_options"),
+  runPowercfgElevated: (action: PowercfgAction) =>
+    invoke<string>("cmd_run_powercfg_elevated", { action }),
+  listDiagnosticLogs: (limit = 300) => invoke<string[]>("cmd_list_diagnostic_logs", { limit }),
+  openLogsFolder: () => invoke<void>("cmd_open_logs_folder"),
 };

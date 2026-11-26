@@ -2,6 +2,7 @@ import { AlertTriangle, RefreshCw, ShieldAlert } from "lucide-react";
 import { useEffect, useState } from "react";
 import { BreadcrumbBar } from "../components/BreadcrumbBar";
 import { CategoryCharts } from "../components/CategoryCharts";
+import { SystemFilesPanel } from "../components/SystemFilesPanel";
 import { TopEntriesTable } from "../components/TopEntriesTable";
 import { TreemapCanvas } from "../components/TreemapCanvas";
 import { formatBytes, formatDurationMs } from "../lib/format";
@@ -35,9 +36,10 @@ export function ExplorerView({
   const [topEntries, setTopEntries] = useState<TopEntryDto[]>([]);
   const [breakdown, setBreakdown] = useState<CategoryBreakdown | null>(null);
   const [colorBy, setColorBy] = useState<"type" | "origin">("type");
-  const [tab, setTab] = useState<"ranking" | "categories">("ranking");
+  const [tab, setTab] = useState<"ranking" | "categories" | "system">("ranking");
   const [deniedPaths, setDeniedPaths] = useState<string[]>([]);
   const [showDenied, setShowDenied] = useState(false);
+  const [protectionRevision, setProtectionRevision] = useState(0);
 
   useEffect(() => {
     if (!scanSummary) return;
@@ -54,6 +56,7 @@ export function ExplorerView({
 
   useEffect(() => {
     if (!scanSummary) return;
+    void protectionRevision;
     api
       .getTreemapChildren(nodeId, 140)
       .then(setTreemap)
@@ -62,7 +65,7 @@ export function ExplorerView({
       .getTopEntries(nodeId, rankingKind, 100)
       .then(setTopEntries)
       .catch(() => {});
-  }, [scanSummary, nodeId, rankingKind]);
+  }, [scanSummary, nodeId, rankingKind, protectionRevision]);
 
   if (!scanSummary) {
     return (
@@ -84,6 +87,18 @@ export function ExplorerView({
     api
       .reloadRules()
       .then(setBreakdown)
+      .catch((err) => alert(String(err)));
+  };
+
+  const handleProtectPath = (fullPath: string, isDir: boolean) => {
+    api
+      .protectionAdd(
+        fullPath,
+        isDir ? "carpeta-recursiva" : "archivo",
+        "Protegida desde el Explorador.",
+        false,
+      )
+      .then(() => setProtectionRevision((v) => v + 1))
       .catch((err) => alert(String(err)));
   };
 
@@ -212,6 +227,7 @@ export function ExplorerView({
           onDrillDown={(id) => setNodeId(id)}
           onOpenExplorer={handleOpenExplorer}
           onSendToCleanup={(n: TreemapNodeDto) => onQueueCleanup(n.fullPath, n.originCat)}
+          onProtectPath={(n: TreemapNodeDto) => handleProtectPath(n.fullPath, n.kind === "dir")}
         />
       </div>
 
@@ -239,6 +255,13 @@ export function ExplorerView({
               onClick={() => setTab("categories")}
             >
               Categorías
+            </button>
+            <button
+              type="button"
+              className={`btn ${tab === "system" ? "btn-primary" : ""}`}
+              onClick={() => setTab("system")}
+            >
+              Sistema (no eliminable)
             </button>
           </div>
 
@@ -283,9 +306,12 @@ export function ExplorerView({
             onDrillDown={(id) => setNodeId(id)}
             onOpenExplorer={handleOpenExplorer}
             onSendToCleanup={(entry) => onQueueCleanup(entry.fullPath, entry.originCat)}
+            onProtectPath={(entry) => handleProtectPath(entry.fullPath, rankingKind === "dirs")}
           />
-        ) : (
+        ) : tab === "categories" ? (
           <CategoryCharts breakdown={breakdown} />
+        ) : (
+          <SystemFilesPanel driveRoot={scanSummary.rootPath} />
         )}
       </div>
     </div>

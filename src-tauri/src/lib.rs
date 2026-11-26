@@ -2,10 +2,14 @@ pub mod apps;
 pub mod categorizer;
 pub mod cleaner;
 pub mod commands;
+pub mod dev_cleaner;
+pub mod diagnostics;
 pub mod elevation;
+pub mod protection;
 pub mod scanner;
 pub mod state;
 pub mod storage;
+pub mod system_files;
 
 #[cfg(all(test, target_os = "windows", target_env = "gnu"))]
 #[link(name = "testmanifest", kind = "static", modifiers = "+whole-archive")]
@@ -127,6 +131,13 @@ fn build_main_window(app: &tauri::App, data_dir: PathBuf) -> tauri::Result<()> {
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
+    diagnostics::install_panic_hook();
+    diagnostics::log_info(&format!(
+        "ScanCleaner starting (pid={}, elevated={})",
+        std::process::id(),
+        is_elevated()
+    ));
+
     let startup = parse_startup_args();
     let Some(_instance_guard) = acquire_single_instance_or_focus(startup.relaunch) else {
         return;
@@ -184,6 +195,24 @@ pub fn run() {
             commands::cmd_list_snapshots,
             commands::cmd_diff_snapshots,
             commands::cmd_list_cleanup_logs,
+            commands::cmd_dev_get_config,
+            commands::cmd_dev_save_config,
+            commands::cmd_dev_pick_project_root,
+            commands::cmd_dev_scan,
+            commands::cmd_dev_preview,
+            commands::cmd_dev_execute,
+            commands::cmd_protection_list,
+            commands::cmd_protection_add,
+            commands::cmd_protection_remove,
+            commands::cmd_protection_check,
+            commands::cmd_protection_preview_matches,
+            commands::cmd_pick_file,
+            commands::cmd_system_files_report,
+            commands::cmd_open_virtual_memory,
+            commands::cmd_open_power_options,
+            commands::cmd_run_powercfg_elevated,
+            commands::cmd_list_diagnostic_logs,
+            commands::cmd_open_logs_folder,
         ])
         .build(tauri::generate_context!())
         .expect("error while building ScanCleaner");

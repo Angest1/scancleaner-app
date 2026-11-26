@@ -62,6 +62,12 @@ pub struct CleanupLogEntry {
     pub mode: String,
     pub status: String,
     pub detail: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rule_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub estimated_bytes: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub command: Option<String>,
 }
 
 pub fn app_data_dir() -> PathBuf {

@@ -1,4 +1,12 @@
-import { AppWindow, FolderTree, HardDrive, History, Sparkles } from "lucide-react";
+import {
+  AppWindow,
+  Code2,
+  FolderTree,
+  HardDrive,
+  History,
+  ShieldCheck,
+  Sparkles,
+} from "lucide-react";
 import { useCallback, useEffect, useState } from "react";
 import { CleanupModal } from "./components/CleanupModal";
 import { ElevationBanner } from "./components/ElevationBanner";
@@ -15,11 +23,13 @@ import {
 } from "./lib/ipc";
 import { AppsView } from "./pages/AppsView";
 import { CleanerView } from "./pages/CleanerView";
+import { DevCleanerView } from "./pages/DevCleanerView";
 import { DrivesView } from "./pages/DrivesView";
 import { ExplorerView } from "./pages/ExplorerView";
 import { HistoryView } from "./pages/HistoryView";
+import { ProtectedPathsView } from "./pages/ProtectedPathsView";
 
-type NavPage = "drives" | "explorer" | "apps" | "cleaner" | "history";
+type NavPage = "drives" | "explorer" | "apps" | "cleaner" | "dev_cleaner" | "protected" | "history";
 
 export function App() {
   const [page, setPage] = useState<NavPage>("drives");
@@ -116,6 +126,8 @@ export function App() {
     { id: "explorer", label: "Explorador", icon: FolderTree },
     { id: "apps", label: "Aplicaciones", icon: AppWindow },
     { id: "cleaner", label: "Limpieza segura", icon: Sparkles },
+    { id: "dev_cleaner", label: "Limpieza Dev", icon: Code2 },
+    { id: "protected", label: "Rutas protegidas", icon: ShieldCheck },
     { id: "history", label: "Historial y logs", icon: History },
   ];
 
@@ -200,6 +212,15 @@ export function App() {
               onStartPreview={openCleanupPreview}
             />
           )}
+
+          {page === "dev_cleaner" && (
+            <DevCleanerView
+              isElevated={startup?.elevation.isElevated ?? false}
+              onRelaunchAdmin={handleRelaunchAdmin}
+            />
+          )}
+
+          {page === "protected" && <ProtectedPathsView />}
 
           {page === "history" && <HistoryView />}
         </main>

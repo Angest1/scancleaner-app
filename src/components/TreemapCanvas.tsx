@@ -1,4 +1,4 @@
-import { FolderOpen, Trash2 } from "lucide-react";
+import { FolderOpen, Lock, ShieldPlus, Trash2 } from "lucide-react";
 import { useEffect, useMemo, useRef, useState } from "react";
 import { colorForCategory, formatBytes } from "../lib/format";
 import type { TreemapNodeDto } from "../lib/ipc";
@@ -10,6 +10,7 @@ interface TreemapCanvasProps {
   onDrillDown: (nodeId: number) => void;
   onOpenExplorer: (path: string) => void;
   onSendToCleanup: (node: TreemapNodeDto) => void;
+  onProtectPath: (node: TreemapNodeDto) => void;
 }
 
 interface PositionedNode extends TreemapNodeDto {
@@ -23,6 +24,7 @@ export function TreemapCanvas({
   onDrillDown,
   onOpenExplorer,
   onSendToCleanup,
+  onProtectPath,
 }: TreemapCanvasProps) {
   const containerRef = useRef<HTMLDivElement>(null);
   const canvasRef = useRef<HTMLCanvasElement>(null);
@@ -114,8 +116,9 @@ export function TreemapCanvas({
 
         ctx.fillStyle = "#f8fafc";
         ctx.font = "600 12px Inter, Segoe UI, sans-serif";
+        const lockPrefix = r.item.isProtected ? "🔒 " : "";
         const titlePrefix = r.item.kind === "dir" ? "📁 " : "";
-        ctx.fillText(`${titlePrefix}${r.item.name}`, rx + 6, ry + 17);
+        ctx.fillText(`${lockPrefix}${titlePrefix}${r.item.name}`, rx + 6, ry + 17);
 
         if (rh > 42) {
           ctx.fillStyle = "rgba(241, 245, 249, 0.85)";
@@ -206,6 +209,11 @@ export function TreemapCanvas({
               ? `${hovered.rect.item.fileCount.toLocaleString()} archivos · Clic para entrar`
               : "Archivo · Clic derecho para acciones"}
           </div>
+          {hovered.rect.item.isProtected && (
+            <div style={{ fontSize: 11.5, color: "#fcd34d", marginTop: 4 }}>
+              🔒 Protegida: {hovered.rect.item.protectionReason ?? "En lista negra"}
+            </div>
+          )}
         </div>
       )}
 
@@ -230,14 +238,43 @@ export function TreemapCanvas({
           </button>
           <button
             type="button"
+            disabled={contextMenu.node.isProtected}
+            title={
+              contextMenu.node.isProtected
+                ? (contextMenu.node.protectionReason ?? "Ruta protegida")
+                : "Enviar a Limpieza segura"
+            }
+            style={{
+              opacity: contextMenu.node.isProtected ? 0.5 : 1,
+              cursor: contextMenu.node.isProtected ? "not-allowed" : "pointer",
+            }}
             onClick={() => {
+              if (contextMenu.node.isProtected) return;
               onSendToCleanup(contextMenu.node);
               setContextMenu(null);
             }}
           >
-            <Trash2 size={14} color="#fca5a5" />
-            Enviar a Limpieza segura
+            {contextMenu.node.isProtected ? (
+              <Lock size={14} color="#f59e0b" />
+            ) : (
+              <Trash2 size={14} color="#fca5a5" />
+            )}
+            {contextMenu.node.isProtected
+              ? "Eliminación bloqueada (Protegida)"
+              : "Enviar a Limpieza segura"}
           </button>
+          {!contextMenu.node.isProtected && (
+            <button
+              type="button"
+              onClick={() => {
+                onProtectPath(contextMenu.node);
+                setContextMenu(null);
+              }}
+            >
+              <ShieldPlus size={14} color="#38bdf8" />
+              Proteger esta ruta
+            </button>
+          )}
         </div>
       )}
     </div>

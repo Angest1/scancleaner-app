@@ -1,5 +1,5 @@
 import { useVirtualizer } from "@tanstack/react-virtual";
-import { File, Folder, FolderOpen, Trash2 } from "lucide-react";
+import { File, Folder, FolderOpen, Lock, ShieldPlus, Trash2 } from "lucide-react";
 import { useRef } from "react";
 import { formatBytes, formatUnixTs } from "../lib/format";
 import type { TopEntryDto } from "../lib/ipc";
@@ -10,6 +10,7 @@ interface TopEntriesTableProps {
   onDrillDown: (nodeId: number) => void;
   onOpenExplorer: (path: string) => void;
   onSendToCleanup: (entry: TopEntryDto) => void;
+  onProtectPath: (entry: TopEntryDto) => void;
 }
 
 export function TopEntriesTable({
@@ -18,6 +19,7 @@ export function TopEntriesTable({
   onDrillDown,
   onOpenExplorer,
   onSendToCleanup,
+  onProtectPath,
 }: TopEntriesTableProps) {
   const parentRef = useRef<HTMLDivElement>(null);
   const virtualizer = useVirtualizer({
@@ -86,8 +88,34 @@ export function TopEntriesTable({
                   <div
                     style={{ overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}
                   >
-                    <div style={{ fontWeight: 500, overflow: "hidden", textOverflow: "ellipsis" }}>
-                      {item.name}
+                    <div
+                      style={{
+                        fontWeight: 500,
+                        overflow: "hidden",
+                        textOverflow: "ellipsis",
+                        display: "flex",
+                        alignItems: "center",
+                        gap: 6,
+                      }}
+                    >
+                      <span style={{ overflow: "hidden", textOverflow: "ellipsis" }}>
+                        {item.name}
+                      </span>
+                      {item.isProtected && (
+                        <span
+                          className="badge badge-warning"
+                          title={item.protectionReason ?? "Ruta protegida"}
+                          style={{
+                            display: "inline-flex",
+                            alignItems: "center",
+                            gap: 3,
+                            flexShrink: 0,
+                          }}
+                        >
+                          <Lock size={10} />
+                          Protegida
+                        </span>
+                      )}
                     </div>
                     <div
                       style={{
@@ -120,14 +148,36 @@ export function TopEntriesTable({
                   >
                     <FolderOpen size={13} />
                   </button>
+                  {!item.isProtected && (
+                    <button
+                      type="button"
+                      className="btn"
+                      style={{ padding: "4px 8px" }}
+                      onClick={() => onProtectPath(item)}
+                      title="Proteger esta ruta"
+                    >
+                      <ShieldPlus size={13} color="#38bdf8" />
+                    </button>
+                  )}
                   <button
                     type="button"
                     className="btn btn-danger"
-                    style={{ padding: "4px 8px" }}
-                    onClick={() => onSendToCleanup(item)}
-                    title="Enviar a Limpieza (Dry-run)"
+                    style={{
+                      padding: "4px 8px",
+                      opacity: item.isProtected ? 0.45 : 1,
+                      cursor: item.isProtected ? "not-allowed" : "pointer",
+                    }}
+                    disabled={item.isProtected}
+                    onClick={() => {
+                      if (!item.isProtected) onSendToCleanup(item);
+                    }}
+                    title={
+                      item.isProtected
+                        ? (item.protectionReason ?? "Ruta protegida por lista negra")
+                        : "Enviar a Limpieza (Dry-run)"
+                    }
                   >
-                    <Trash2 size={13} />
+                    {item.isProtected ? <Lock size={13} /> : <Trash2 size={13} />}
                   </button>
                 </div>
               </div>

@@ -1,15 +1,21 @@
-import { GitCompare, History, ScrollText } from "lucide-react";
-import { useEffect, useState } from "react";
+import { Bug, FolderOpen, GitCompare, History, RefreshCw, ScrollText } from "lucide-react";
+import { useCallback, useEffect, useState } from "react";
 import { formatBytes, formatDurationMs, formatSignedBytes } from "../lib/format";
 import { type CleanupLogEntry, type ScanSnapshot, type SnapshotDiff, api } from "../lib/ipc";
 
 export function HistoryView() {
-  const [tab, setTab] = useState<"snapshots" | "logs">("snapshots");
+  const [tab, setTab] = useState<"snapshots" | "logs" | "diagnostics">("snapshots");
   const [snapshots, setSnapshots] = useState<ScanSnapshot[]>([]);
   const [logs, setLogs] = useState<CleanupLogEntry[]>([]);
+  const [diagLogs, setDiagLogs] = useState<string[]>([]);
   const [olderId, setOlderId] = useState<number | null>(null);
   const [newerId, setNewerId] = useState<number | null>(null);
   const [diff, setDiff] = useState<SnapshotDiff | null>(null);
+
+  const refreshLogs = useCallback(() => {
+    api.listCleanupLogs(200).then(setLogs);
+    api.listDiagnosticLogs(300).then(setDiagLogs);
+  }, []);
 
   useEffect(() => {
     api.listSnapshots(null).then((list) => {
@@ -19,8 +25,8 @@ export function HistoryView() {
         setOlderId(list[1].id);
       }
     });
-    api.listCleanupLogs(200).then(setLogs);
-  }, []);
+    refreshLogs();
+  }, [refreshLogs]);
 
   const handleCompare = () => {
     if (!olderId || !newerId || olderId === newerId) return;
@@ -48,7 +54,7 @@ export function HistoryView() {
           </p>
         </div>
 
-        <div style={{ display: "flex", gap: 8 }}>
+        <div style={{ display: "flex", gap: 8, flexWrap: "wrap" }}>
           <button
             type="button"
             className={`btn ${tab === "snapshots" ? "btn-primary" : ""}`}
@@ -64,6 +70,23 @@ export function HistoryView() {
           >
             <ScrollText size={14} />
             Logs de limpieza ({logs.length})
+          </button>
+          <button
+            type="button"
+            className={`btn ${tab === "diagnostics" ? "btn-primary" : ""}`}
+            onClick={() => setTab("diagnostics")}
+          >
+            <Bug size={14} />
+            Diagnóstico / Crashes ({diagLogs.length})
+          </button>
+          <button
+            type="button"
+            className="btn"
+            onClick={() => api.openLogsFolder().catch((e) => alert(String(e)))}
+            title="Abrir %APPDATA%\ScanCleaner\logs"
+          >
+            <FolderOpen size={14} />
+            Abrir carpeta
           </button>
         </div>
       </div>
@@ -184,7 +207,7 @@ export function HistoryView() {
             )}
           </div>
         </>
-      ) : (
+      ) : tab === "logs" ? (
         <div className="card" style={{ padding: 0, overflow: "hidden" }}>
           <div
             className="table-header"
@@ -235,6 +258,57 @@ export function HistoryView() {
                 </div>
               </div>
             ))
+          )}
+        </div>
+      ) : (
+        <div className="card" style={{ display: "flex", flexDirection: "column", gap: 10 }}>
+          <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center" }}>
+            <span style={{ fontSize: 13, color: "var(--text-secondary)" }}>
+              Registra inicio, tiempos de escaneo, operaciones lentas (&gt;500 ms) y panics/crashes
+              con stacktrace en <code>%APPDATA%\ScanCleaner\logs\</code>.
+            </span>
+            <button type="button" className="btn" onClick={refreshLogs}>
+              <RefreshCw size={13} />
+              Actualizar
+            </button>
+          </div>
+          {diagLogs.length === 0 ? (
+            <div style={{ padding: 20, textAlign: "center", color: "var(--text-muted)" }}>
+              No hay registros de diagnóstico todavía.
+            </div>
+          ) : (
+            <div
+              className="mono"
+              style={{
+                maxHeight: 420,
+                overflow: "auto",
+                background: "#0f172a",
+                borderRadius: 6,
+                padding: 10,
+                fontSize: 11.5,
+                display: "flex",
+                flexDirection: "column",
+                gap: 4,
+              }}
+            >
+              {diagLogs.map((line, idx) => (
+                <div
+                  key={`${idx}-${line.slice(0, 24)}`}
+                  style={{
+                    color:
+                      line.includes("[CRASH]") || line.includes("[ERROR]")
+                        ? "#fca5a5"
+                        : line.includes("[WARN]")
+                          ? "#fcd34d"
+                          : "var(--text-secondary)",
+                    whiteSpace: "pre-wrap",
+                    wordBreak: "break-word",
+                  }}
+                >
+                  {line}
+                </div>
+              ))}
+            </div>
           )}
         </div>
       )}

@@ -15,12 +15,29 @@ use crate::cleaner::detectors::{discover_cleanup_candidates, CleanupCandidatesRe
 use crate::cleaner::executor::{
     build_cleanup_plan, execute_cleanup_plan, CleanupPlan, CleanupResult, PreviewCleanupRequest,
 };
+use crate::dev_cleaner::executor::{build_dev_cleanup_plan, execute_dev_cleanup_plan};
+use crate::dev_cleaner::folder_picker::{pick_file_native, pick_folder_native};
+use crate::dev_cleaner::process::SystemCommandRunner;
+use crate::dev_cleaner::scan_dev_cleanup;
+use crate::dev_cleaner::schema::{
+    DevCleanerConfig, DevCleanupPlan, DevCleanupResult, DevPreviewRequest, DevRulesCatalog,
+    DevScanReport,
+};
+use crate::diagnostics::{log_info, log_timing, read_diagnostic_logs};
 use crate::elevation::{current_elevation_status, relaunch_as_admin, ElevationStatus};
+use crate::protection::{
+    is_protected_default, user_protection_config_path, ProtectedEntry, ProtectionEngine,
+    ProtectionOrigin, ProtectionResult, ProtectionType,
+};
 use crate::scanner::drives::{list_drives, DriveInfo};
 use crate::scanner::model::{NodeId, NodeKind, ScanProgress, ScanSummary};
 use crate::scanner::scan_directory;
 use crate::state::AppState;
 use crate::storage::{logs_dir, read_cleanup_logs, CleanupLogEntry, ScanSnapshot, SnapshotDiff};
+use crate::system_files::{
+    inspect_system_files, open_power_options, open_virtual_memory_dialog, run_powercfg_elevated,
+    PowercfgAction, SystemFilesReport, WinSystemProcessLauncher,
+};
 
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -51,6 +68,8 @@ pub struct TreemapNodeDto {
     pub origin_cat: String,
     pub percentage: f64,
     pub is_other_bucket: bool,
+    pub is_protected: bool,
+    pub protection_reason: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -76,6 +95,8 @@ pub struct TopEntryDto {
     pub last_write_ts: i64,
     pub type_cat: String,
     pub origin_cat: String,
+    pub is_protected: bool,
+    pub protection_reason: Option<String>,
 }
 
 #[tauri::command]
@@ -107,6 +128,8 @@ pub async fn cmd_start_scan(
         *guard = Some(cancel_flag.clone());
     }
 
+    let t0 = std::time::Instant::now();
+    log_info(&format!("cmd_start_scan begin: {root_path}"));
     let root = PathBuf::from(&root_path);
     let tree_res = tauri::async_runtime::spawn_blocking(move || {
         let mut tree = scan_directory(root, cancel_flag, |prog| {
@@ -120,6 +143,14 @@ pub async fn cmd_start_scan(
     .map_err(|e| format!("Error ejecutando el escaneo: {e}"))?;
 
     let (tree, breakdown) = tree_res;
+    log_timing(
+        "cmd_start_scan",
+        t0.elapsed().as_millis(),
+        &format!(
+            "root={root_path} files={} dirs={} cancelled={}",
+            tree.stats.total_files, tree.stats.total_dirs, tree.stats.cancelled
+        ),
+    );
 
     let mut snapshot_id = None;
     if !tree.stats.cancelled {
@@ -206,6 +237,7 @@ pub fn cmd_get_treemap_children(
     });
 
     let mut children = Vec::new();
+    let prot_engine = ProtectionEngine::load_default();
     let mut other_bytes = 0u64;
     let mut other_logical = 0u64;
     let mut other_files = 0u32;
@@ -217,10 +249,12 @@ pub fn cmd_get_treemap_children(
             continue;
         }
         if pos < limit {
+            let full_pb = tree.reconstruct_path(cid);
+            let prot = prot_engine.is_protected_for_ui(&full_pb);
             children.push(TreemapNodeDto {
                 node_id: Some(cid),
                 name: tree.node_name(cid).to_string(),
-                full_path: tree.reconstruct_path(cid).to_string_lossy().into_owned(),
+                full_path: full_pb.to_string_lossy().into_owned(),
                 kind: format!("{:?}", cnode.kind).to_ascii_lowercase(),
                 allocated_bytes: cnode.allocated_size,
                 logical_bytes: cnode.logical_size,
@@ -229,6 +263,8 @@ pub fn cmd_get_treemap_children(
                 origin_cat: format!("{:?}", cnode.origin_cat).to_ascii_lowercase(),
                 percentage: (cnode.allocated_size as f64 / total_alloc as f64) * 100.0,
                 is_other_bucket: false,
+                is_protected: prot.protected,
+                protection_reason: prot.reason,
             });
         } else {
             other_bytes = other_bytes.saturating_add(cnode.allocated_size);
@@ -254,6 +290,8 @@ pub fn cmd_get_treemap_children(
             origin_cat: "userother".to_string(),
             percentage: (other_bytes as f64 / total_alloc as f64) * 100.0,
             is_other_bucket: true,
+            is_protected: false,
+            protection_reason: None,
         });
     }
 
@@ -310,20 +348,25 @@ pub fn cmd_get_top_entries(
     });
     matches.truncate(max_rows);
 
+    let prot_engine = ProtectionEngine::load_default();
     Ok(matches
         .into_iter()
         .map(|nid| {
             let n = &tree.nodes[nid as usize];
+            let full_pb = tree.reconstruct_path(nid);
+            let prot = prot_engine.is_protected_for_ui(&full_pb);
             TopEntryDto {
                 node_id: nid,
                 name: tree.node_name(nid).to_string(),
-                full_path: tree.reconstruct_path(nid).to_string_lossy().into_owned(),
+                full_path: full_pb.to_string_lossy().into_owned(),
                 allocated_bytes: n.allocated_size,
                 logical_bytes: n.logical_size,
                 file_count: n.file_count,
                 last_write_ts: n.last_write_ts,
                 type_cat: format!("{:?}", n.type_cat).to_ascii_lowercase(),
                 origin_cat: format!("{:?}", n.origin_cat).to_ascii_lowercase(),
+                is_protected: prot.protected,
+                protection_reason: prot.reason,
             }
         })
         .collect())
@@ -490,4 +533,197 @@ pub fn cmd_diff_snapshots(
 #[tauri::command]
 pub fn cmd_list_cleanup_logs(limit: Option<usize>) -> Vec<CleanupLogEntry> {
     read_cleanup_logs(&logs_dir(), limit.unwrap_or(200))
+}
+
+#[tauri::command]
+pub fn cmd_dev_get_config() -> DevCleanerConfig {
+    DevCleanerConfig::load()
+}
+
+#[tauri::command]
+pub fn cmd_dev_save_config(config: DevCleanerConfig) -> Result<DevCleanerConfig, String> {
+    config.save()?;
+    Ok(config)
+}
+
+#[tauri::command]
+pub async fn cmd_dev_pick_project_root() -> Result<Option<String>, String> {
+    tauri::async_runtime::spawn_blocking(pick_folder_native)
+        .await
+        .map_err(|e| format!("Error abriendo selector de carpetas: {e}"))?
+}
+
+#[tauri::command]
+pub async fn cmd_dev_scan(config: Option<DevCleanerConfig>) -> Result<DevScanReport, String> {
+    let cfg = config.unwrap_or_else(DevCleanerConfig::load);
+    tauri::async_runtime::spawn_blocking(move || scan_dev_cleanup(&cfg))
+        .await
+        .map_err(|e| format!("Error ejecutando escaneo Dev: {e}"))?
+}
+
+#[tauri::command]
+pub async fn cmd_dev_preview(
+    request: DevPreviewRequest,
+    state: State<'_, AppState>,
+) -> Result<DevCleanupPlan, String> {
+    let plan = tauri::async_runtime::spawn_blocking(move || -> Result<DevCleanupPlan, String> {
+        let catalog = DevRulesCatalog::load_embedded()?;
+        let runner = SystemCommandRunner;
+        Ok(build_dev_cleanup_plan(request, &catalog, &runner))
+    })
+    .await
+    .map_err(|e| format!("Error generando dry-run Dev: {e}"))??;
+
+    let mut guard = state.pending_dev_plans.lock().map_err(|e| e.to_string())?;
+    guard.insert(plan.plan_id.clone(), plan.clone());
+    Ok(plan)
+}
+
+#[tauri::command]
+pub async fn cmd_dev_execute(
+    plan_id: String,
+    state: State<'_, AppState>,
+) -> Result<DevCleanupResult, String> {
+    let plan = {
+        let mut guard = state.pending_dev_plans.lock().map_err(|e| e.to_string())?;
+        guard
+            .remove(&plan_id)
+            .ok_or_else(|| "El plan de Limpieza Dev expiró o ya fue ejecutado.".to_string())?
+    };
+
+    tauri::async_runtime::spawn_blocking(move || -> Result<DevCleanupResult, String> {
+        let catalog = DevRulesCatalog::load_embedded()?;
+        let runner = SystemCommandRunner;
+        Ok(execute_dev_cleanup_plan(
+            &plan, &catalog, &runner, None, None,
+        ))
+    })
+    .await
+    .map_err(|e| format!("Error ejecutando Limpieza Dev: {e}"))?
+}
+
+#[tauri::command]
+pub fn cmd_protection_list() -> Vec<ProtectedEntry> {
+    ProtectionEngine::load_default().all_entries()
+}
+
+#[tauri::command]
+pub fn cmd_protection_add(
+    patron: String,
+    tipo: ProtectionType,
+    motivo: String,
+    todas_las_unidades: bool,
+) -> Result<Vec<ProtectedEntry>, String> {
+    let trimmed = patron.trim();
+    if trimmed.is_empty() {
+        return Err("El patrón o ruta no puede estar vacío.".to_string());
+    }
+    let mut engine = ProtectionEngine::load_default();
+    let entry = ProtectedEntry {
+        id: format!("user-{}", uuid::Uuid::new_v4()),
+        patron: trimmed.to_string(),
+        tipo,
+        origen: ProtectionOrigin::Usuario,
+        motivo: if motivo.trim().is_empty() {
+            "Protegida manualmente por el usuario.".to_string()
+        } else {
+            motivo.trim().to_string()
+        },
+        todas_las_unidades,
+    };
+    engine.user_entries.push(entry);
+    engine.save_user_entries(&user_protection_config_path())?;
+    Ok(engine.all_entries())
+}
+
+#[tauri::command]
+pub fn cmd_protection_remove(id: String) -> Result<Vec<ProtectedEntry>, String> {
+    let mut engine = ProtectionEngine::load_default();
+    if engine.critical_entries.iter().any(|e| e.id == id) {
+        return Err("Las entradas críticas de fábrica no se pueden eliminar.".to_string());
+    }
+    let before = engine.user_entries.len();
+    engine.user_entries.retain(|e| e.id != id);
+    if engine.user_entries.len() == before {
+        return Err("Entrada de usuario no encontrada.".to_string());
+    }
+    engine.save_user_entries(&user_protection_config_path())?;
+    Ok(engine.all_entries())
+}
+
+#[tauri::command]
+pub fn cmd_protection_check(path: String) -> ProtectionResult {
+    is_protected_default(std::path::Path::new(&path))
+}
+
+#[tauri::command]
+pub fn cmd_protection_preview_matches(
+    patron: String,
+    tipo: ProtectionType,
+    todas_las_unidades: bool,
+    state: State<'_, AppState>,
+) -> Result<usize, String> {
+    let trimmed = patron.trim();
+    if trimmed.is_empty() {
+        return Ok(0);
+    }
+    let guard = state.active_tree.lock().map_err(|e| e.to_string())?;
+    let Some(tree) = guard.as_ref() else {
+        return Ok(0);
+    };
+    let candidate = ProtectedEntry {
+        id: "preview".to_string(),
+        patron: trimmed.to_string(),
+        tipo,
+        origen: ProtectionOrigin::Usuario,
+        motivo: String::new(),
+        todas_las_unidades,
+    };
+    Ok(ProtectionEngine::preview_matches_in_tree(tree, &candidate))
+}
+
+#[tauri::command]
+pub async fn cmd_pick_file() -> Result<Option<String>, String> {
+    tauri::async_runtime::spawn_blocking(pick_file_native)
+        .await
+        .map_err(|e| format!("Error abriendo selector de archivos: {e}"))?
+}
+
+#[tauri::command]
+pub fn cmd_system_files_report(drive_root: Option<String>) -> SystemFilesReport {
+    inspect_system_files(drive_root.as_deref())
+}
+
+#[tauri::command]
+pub fn cmd_open_virtual_memory() -> Result<String, String> {
+    let sys_root = std::env::var("SystemRoot")
+        .map(PathBuf::from)
+        .unwrap_or_else(|_| PathBuf::from(r"C:\Windows"));
+    open_virtual_memory_dialog(&sys_root, &WinSystemProcessLauncher)
+}
+
+#[tauri::command]
+pub fn cmd_open_power_options() -> Result<(), String> {
+    open_power_options(&WinSystemProcessLauncher)
+}
+
+#[tauri::command]
+pub fn cmd_run_powercfg_elevated(action: PowercfgAction) -> Result<String, String> {
+    run_powercfg_elevated(action, &WinSystemProcessLauncher)
+}
+
+#[tauri::command]
+pub fn cmd_list_diagnostic_logs(limit: Option<usize>) -> Vec<String> {
+    read_diagnostic_logs(limit.unwrap_or(300))
+}
+
+#[tauri::command]
+pub fn cmd_open_logs_folder() -> Result<(), String> {
+    let dir = logs_dir();
+    let _ = std::fs::create_dir_all(&dir);
+    Command::new("explorer.exe")
+        .arg(&dir)
+        .spawn()
+        .map_err(|e| format!("No se pudo abrir la carpeta de logs: {e}"))?;
+    Ok(())
 }
