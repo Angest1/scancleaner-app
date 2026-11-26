@@ -1,14 +1,41 @@
 import { useVirtualizer } from "@tanstack/react-virtual";
-import { ExternalLink, RefreshCw, Search, Trash2 } from "lucide-react";
+import {
+  AppWindow,
+  ExternalLink,
+  MoreHorizontal,
+  RefreshCw,
+  Search,
+  Trash2,
+  X,
+} from "lucide-react";
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { Badge } from "../components/ui/Badge";
+import { Button } from "../components/ui/Button";
+import { Card } from "../components/ui/Card";
+import { DetailDrawer, DetailField } from "../components/ui/DetailDrawer";
+import { AlertBanner, EmptyState, Skeleton } from "../components/ui/Feedback";
+import { PathDisplay } from "../components/ui/PathDisplay";
+import { SegmentedControl } from "../components/ui/SegmentedControl";
+import {
+  DensityToggle,
+  type SortDir,
+  SortHeaderButton,
+  type TableDensity,
+} from "../components/ui/TableToolbar";
 import { formatBytes } from "../lib/format";
 import { type InstalledApp, api } from "../lib/ipc";
+
+type SortKey = "name" | "source" | "size";
 
 export function AppsView() {
   const [apps, setApps] = useState<InstalledApp[]>([]);
   const [loading, setLoading] = useState(false);
   const [search, setSearch] = useState("");
   const [filter, setFilter] = useState<"all" | "win32" | "store_msix">("all");
+  const [sortKey, setSortKey] = useState<SortKey>("size");
+  const [sortDir, setSortDir] = useState<SortDir>("desc");
+  const [density, setDensity] = useState<TableDensity>("comfortable");
+  const [inspected, setInspected] = useState<InstalledApp | null>(null);
   const [statusMsg, setStatusMsg] = useState<string | null>(null);
   const parentRef = useRef<HTMLDivElement>(null);
 
@@ -25,19 +52,36 @@ export function AppsView() {
     loadApps();
   }, [loadApps]);
 
+  const handleSort = (key: SortKey) => {
+    if (sortKey === key) {
+      setSortDir((d) => (d === "asc" ? "desc" : "asc"));
+    } else {
+      setSortKey(key);
+      setSortDir(key === "size" ? "desc" : "asc");
+    }
+  };
+
   const filtered = useMemo(() => {
     const q = search.trim().toLowerCase();
-    return apps.filter((a) => {
+    const list = apps.filter((a) => {
       if (filter !== "all" && a.source !== filter) return false;
       if (!q) return true;
       return a.name.toLowerCase().includes(q) || a.publisher.toLowerCase().includes(q);
     });
-  }, [apps, search, filter]);
+    const mult = sortDir === "asc" ? 1 : -1;
+    return list.sort((a, b) => {
+      if (sortKey === "name") return a.name.localeCompare(b.name) * mult;
+      if (sortKey === "source") return a.source.localeCompare(b.source) * mult;
+      return (a.sizeBytes - b.sizeBytes) * mult;
+    });
+  }, [apps, search, filter, sortKey, sortDir]);
+
+  const rowHeight = density === "compact" ? 44 : 58;
 
   const virtualizer = useVirtualizer({
     count: filtered.length,
     getScrollElement: () => parentRef.current,
-    estimateSize: () => 56,
+    estimateSize: () => rowHeight,
     overscan: 8,
   });
 
@@ -49,187 +93,281 @@ export function AppsView() {
   };
 
   return (
-    <div style={{ display: "flex", flexDirection: "column", gap: 16 }}>
-      <div
-        style={{
-          display: "flex",
-          justifyContent: "space-between",
-          alignItems: "center",
-          flexWrap: "wrap",
-          gap: 12,
-        }}
-      >
+    <div className="flex flex-col gap-4">
+      <div className="flex items-start justify-between flex-wrap gap-3">
         <div>
-          <h2 style={{ margin: 0, fontSize: 20 }}>Aplicaciones instaladas</h2>
-          <p style={{ margin: "4px 0 0", color: "var(--text-secondary)", fontSize: 13 }}>
+          <h1 className="m-0 text-[18px] font-semibold tracking-[-0.02em] text-fg-primary">
+            Aplicaciones instaladas
+          </h1>
+          <p className="m-0 mt-1 text-[13px] text-fg-secondary text-pretty">
             Inventario combinado Win32 (Registro) y Microsoft Store / MSIX. La desinstalación usa
             siempre el flujo nativo de Windows.
           </p>
         </div>
 
-        <div style={{ display: "flex", gap: 8 }}>
-          <button
-            type="button"
-            className="btn"
+        <div className="flex items-center gap-2 flex-wrap">
+          <Button
             onClick={() => api.openWindowsAppsSettings().catch((e) => setStatusMsg(String(e)))}
           >
-            <ExternalLink size={14} />
+            <ExternalLink size={13} />
             Configuración de Windows
-          </button>
-          <button type="button" className="btn btn-primary" onClick={loadApps} disabled={loading}>
-            <RefreshCw size={14} />
-            {loading ? "Cargando..." : "Actualizar"}
-          </button>
+          </Button>
+          <Button variant="primary" onClick={loadApps} disabled={loading}>
+            <RefreshCw size={13} className={loading ? "animate-spin" : ""} />
+            {loading ? "Cargando…" : "Actualizar"}
+          </Button>
         </div>
       </div>
 
-      {statusMsg && (
-        <div
-          className="card"
-          style={{ padding: "10px 14px", borderColor: "rgba(56, 189, 248, 0.45)", fontSize: 13 }}
-        >
-          {statusMsg}
-        </div>
-      )}
+      {statusMsg && <AlertBanner tone="info">{statusMsg}</AlertBanner>}
 
-      <div
-        className="card"
-        style={{
-          display: "flex",
-          justifyContent: "space-between",
-          alignItems: "center",
-          flexWrap: "wrap",
-          gap: 10,
-        }}
-      >
-        <div style={{ display: "flex", alignItems: "center", gap: 8, flex: "1 1 260px" }}>
-          <Search size={15} color="#64748b" />
+      <Card className="flex items-center justify-between flex-wrap gap-3 py-3">
+        <div className="relative flex-1 min-w-[200px] max-w-[360px]">
+          <Search
+            size={14}
+            className="absolute left-2.5 top-1/2 -translate-y-1/2 text-fg-muted pointer-events-none"
+          />
           <input
-            className="input"
-            style={{ width: "100%", maxWidth: 360 }}
-            placeholder="Buscar aplicación o editor..."
+            type="text"
+            name="app-search"
+            autoComplete="off"
+            spellCheck={false}
+            aria-label="Buscar aplicación o editor"
+            className="w-full h-8 pl-8 pr-8 rounded-[8px] bg-canvas border border-border-default text-[12.5px] text-fg-primary placeholder:text-fg-muted focus:border-accent focus-visible:ring-2 focus-visible:ring-accent/30 transition-colors"
+            placeholder="Buscar aplicación o editor…"
             value={search}
             onChange={(e) => setSearch(e.target.value)}
           />
+          {search && (
+            <button
+              type="button"
+              onClick={() => setSearch("")}
+              aria-label="Limpiar búsqueda"
+              className="absolute right-2 top-1/2 -translate-y-1/2 text-fg-muted hover:text-fg-primary bg-transparent border-0 p-0.5 cursor-pointer"
+            >
+              <X size={13} />
+            </button>
+          )}
         </div>
 
-        <div style={{ display: "flex", gap: 6 }}>
-          <button
-            type="button"
-            className={`btn ${filter === "all" ? "btn-primary" : ""}`}
-            onClick={() => setFilter("all")}
-          >
-            Todas ({apps.length})
-          </button>
-          <button
-            type="button"
-            className={`btn ${filter === "win32" ? "btn-primary" : ""}`}
-            onClick={() => setFilter("win32")}
-          >
-            Win32
-          </button>
-          <button
-            type="button"
-            className={`btn ${filter === "store_msix" ? "btn-primary" : ""}`}
-            onClick={() => setFilter("store_msix")}
-          >
-            Store / MSIX
-          </button>
+        <div className="flex items-center gap-2 flex-wrap">
+          <SegmentedControl
+            ariaLabel="Filtrar por origen"
+            value={filter}
+            onChange={setFilter}
+            options={[
+              { value: "all", label: "Todas", count: apps.length },
+              { value: "win32", label: "Win32" },
+              { value: "store_msix", label: "Store / MSIX" },
+            ]}
+          />
+          <DensityToggle density={density} onChange={setDensity} />
         </div>
-      </div>
+      </Card>
 
-      <div className="card" style={{ padding: 0, overflow: "hidden" }}>
-        <div className="table-header" style={{ gridTemplateColumns: "1fr 110px 145px 150px" }}>
-          <span>Aplicación</span>
-          <span>Origen</span>
-          <span style={{ textAlign: "right" }}>Tamaño</span>
-          <span style={{ textAlign: "right" }}>Desinstalación</span>
-        </div>
+      {loading && apps.length === 0 ? (
+        <Card className="flex flex-col gap-2.5">
+          {[0, 1, 2, 3, 4, 5].map((i) => (
+            <Skeleton key={i} className="h-11 w-full" />
+          ))}
+        </Card>
+      ) : filtered.length === 0 ? (
+        <EmptyState
+          icon={<AppWindow size={18} />}
+          title="Sin aplicaciones coincidentes"
+          description="Ajusta el término de búsqueda o cambia el filtro de origen para ver más resultados."
+          action={
+            search || filter !== "all" ? (
+              <Button
+                onClick={() => {
+                  setSearch("");
+                  setFilter("all");
+                }}
+              >
+                Restablecer filtros
+              </Button>
+            ) : undefined
+          }
+        />
+      ) : (
+        <Card padded={false} className="overflow-hidden">
+          <div ref={parentRef} className="h-[480px] overflow-y-auto overflow-x-hidden">
+            {/* Sticky priority-responsive header (zero horizontal scroll) */}
+            <div className="sticky top-0 z-10 grid grid-cols-[minmax(0,1fr)_90px_40px] md:grid-cols-[minmax(0,1fr)_84px_124px_142px] items-center gap-2 px-3.5 py-2.5 border-b border-border-default bg-shell backdrop-blur-md">
+              <SortHeaderButton
+                label="Aplicación"
+                active={sortKey === "name"}
+                dir={sortDir}
+                onClick={() => handleSort("name")}
+              />
+              <div className="hidden md:flex">
+                <SortHeaderButton
+                  label="Origen"
+                  active={sortKey === "source"}
+                  dir={sortDir}
+                  onClick={() => handleSort("source")}
+                />
+              </div>
+              <SortHeaderButton
+                label="Tamaño"
+                active={sortKey === "size"}
+                dir={sortDir}
+                align="right"
+                onClick={() => handleSort("size")}
+              />
+              <span className="text-right text-[11.5px] font-medium text-fg-muted">
+                <span className="hidden md:inline">Acciones</span>
+              </span>
+            </div>
 
-        <div ref={parentRef} style={{ height: 460, overflow: "auto" }}>
-          <div style={{ height: `${virtualizer.getTotalSize()}px`, position: "relative" }}>
-            {virtualizer.getVirtualItems().map((vRow) => {
-              const app = filtered[vRow.index];
-              return (
-                <div
-                  key={app.id}
-                  className="table-row"
-                  style={{
-                    position: "absolute",
-                    top: 0,
-                    left: 0,
-                    width: "100%",
-                    height: `${vRow.size}px`,
-                    transform: `translateY(${vRow.start}px)`,
-                    gridTemplateColumns: "1fr 110px 145px 150px",
-                  }}
-                >
-                  <div style={{ overflow: "hidden", paddingRight: 10 }}>
-                    <div
-                      style={{
-                        fontWeight: 600,
-                        overflow: "hidden",
-                        textOverflow: "ellipsis",
-                        whiteSpace: "nowrap",
-                      }}
-                    >
-                      {app.name}{" "}
-                      {app.version ? (
-                        <span style={{ color: "var(--text-muted)", fontWeight: 400 }}>
-                          v{app.version}
-                        </span>
-                      ) : null}
-                    </div>
-                    <div
-                      style={{
-                        fontSize: 11.5,
-                        color: "var(--text-muted)",
-                        overflow: "hidden",
-                        textOverflow: "ellipsis",
-                        whiteSpace: "nowrap",
-                      }}
-                    >
-                      {app.publisher || "Editor desconocido"}
-                      {app.installLocation ? ` · ${app.installLocation}` : ""}
-                    </div>
-                  </div>
-
-                  <div>
-                    <span className={`badge ${app.source === "store_msix" ? "badge-info" : ""}`}>
-                      {app.source === "store_msix" ? "MSIX" : "Win32"}
-                    </span>
-                  </div>
-
-                  <div style={{ textAlign: "right" }}>
-                    <div className="mono" style={{ fontWeight: 600 }}>
-                      {app.sizeSource === "unknown" ? "N/D" : formatBytes(app.sizeBytes)}
-                    </div>
-                    <div style={{ fontSize: 11, color: "var(--text-muted)" }}>
-                      {app.sizeSource === "measured"
-                        ? "Medido en disco"
-                        : app.sizeSource === "estimated"
-                          ? "Estimado"
-                          : "Acceso restringido"}
-                    </div>
-                  </div>
-
-                  <div style={{ display: "flex", justifyContent: "flex-end" }}>
+            <div style={{ height: `${virtualizer.getTotalSize()}px`, position: "relative" }}>
+              {virtualizer.getVirtualItems().map((vRow) => {
+                const app = filtered[vRow.index];
+                return (
+                  <div
+                    key={app.id}
+                    className="group grid grid-cols-[minmax(0,1fr)_90px_40px] md:grid-cols-[minmax(0,1fr)_84px_124px_142px] items-center gap-2 px-3.5 border-b border-border-subtle hover:bg-elevated/65 transition-colors duration-140"
+                    style={{
+                      position: "absolute",
+                      top: 0,
+                      left: 0,
+                      width: "100%",
+                      height: `${rowHeight}px`,
+                      transform: `translateY(${vRow.start}px)`,
+                    }}
+                  >
                     <button
                       type="button"
-                      className="btn btn-danger"
-                      style={{ padding: "5px 10px" }}
-                      onClick={() => handleUninstall(app)}
+                      onClick={() => setInspected(app)}
+                      className="min-w-0 text-left bg-transparent border-0 p-0 cursor-pointer"
                     >
-                      <Trash2 size={13} />
-                      Desinstalar
+                      <div className="font-medium text-[13px] text-fg-primary group-hover:text-accent transition-colors truncate">
+                        {app.name}{" "}
+                        {app.version ? (
+                          <span className="mono text-[11.5px] text-fg-muted font-normal">
+                            v{app.version}
+                          </span>
+                        ) : null}
+                      </div>
+                      {density === "comfortable" && (
+                        <div className="flex items-center gap-1.5 text-[11.5px] text-fg-muted truncate">
+                          <span className="md:hidden">
+                            {app.source === "store_msix" ? "MSIX" : "Win32"} ·
+                          </span>
+                          <span className="truncate">{app.publisher || "Editor desconocido"}</span>
+                        </div>
+                      )}
                     </button>
+
+                    <div className="hidden md:block">
+                      <Badge tone={app.source === "store_msix" ? "accent" : "neutral"}>
+                        {app.source === "store_msix" ? "MSIX" : "Win32"}
+                      </Badge>
+                    </div>
+
+                    <div className="text-right">
+                      <div className="mono font-medium text-[12.5px] text-fg-primary">
+                        {app.sizeSource === "unknown" ? "N/D" : formatBytes(app.sizeBytes)}
+                      </div>
+                      {density === "comfortable" && (
+                        <div className="text-[11px] text-fg-muted">
+                          {app.sizeSource === "measured"
+                            ? "Medido"
+                            : app.sizeSource === "estimated"
+                              ? "Estimado"
+                              : "Restringido"}
+                        </div>
+                      )}
+                    </div>
+
+                    <div className="flex justify-end items-center gap-1">
+                      <div className="hidden md:flex opacity-0 group-hover:opacity-100 group-focus-within:opacity-100 transition-opacity duration-140">
+                        <Button variant="danger" size="sm" onClick={() => handleUninstall(app)}>
+                          <Trash2 size={12} />
+                          Desinstalar
+                        </Button>
+                      </div>
+                      <Button
+                        variant="ghost"
+                        size="icon"
+                        onClick={() => setInspected(app)}
+                        title="Ver detalles de la aplicación"
+                        aria-label={`Detalles de ${app.name}`}
+                      >
+                        <MoreHorizontal size={14} />
+                      </Button>
+                    </div>
                   </div>
-                </div>
-              );
-            })}
+                );
+              })}
+            </div>
           </div>
-        </div>
-      </div>
+        </Card>
+      )}
+
+      {inspected && (
+        <DetailDrawer
+          title={inspected.name}
+          subtitle={inspected.publisher || "Editor desconocido"}
+          badge={
+            <Badge tone={inspected.source === "store_msix" ? "accent" : "neutral"}>
+              {inspected.source === "store_msix" ? "Store / MSIX" : "Win32"}
+            </Badge>
+          }
+          onClose={() => setInspected(null)}
+          footer={
+            <>
+              <Button onClick={() => setInspected(null)}>Cerrar</Button>
+              <Button
+                variant="danger"
+                onClick={() => {
+                  handleUninstall(inspected);
+                  setInspected(null);
+                }}
+              >
+                <Trash2 size={13} />
+                Desinstalar (nativo)
+              </Button>
+            </>
+          }
+        >
+          <DetailField label="Tamaño">
+            <span className="mono text-[18px] font-semibold text-accent">
+              {inspected.sizeSource === "unknown"
+                ? "No disponible"
+                : formatBytes(inspected.sizeBytes)}
+            </span>
+            <span className="ml-2 text-[12px] text-fg-muted">
+              (
+              {inspected.sizeSource === "measured"
+                ? "Medido en disco"
+                : inspected.sizeSource === "estimated"
+                  ? "Estimado por Registro"
+                  : "Acceso restringido"}
+              )
+            </span>
+          </DetailField>
+          {inspected.version && (
+            <DetailField label="Versión">
+              <span className="mono">{inspected.version}</span>
+            </DetailField>
+          )}
+          {inspected.installLocation && (
+            <DetailField label="Carpeta de instalación">
+              <div className="p-2.5 rounded-[8px] bg-canvas border border-border-default">
+                <PathDisplay path={inspected.installLocation} maxChars={90} />
+              </div>
+            </DetailField>
+          )}
+          {inspected.uninstallString && (
+            <DetailField label="Comando de desinstalación nativo">
+              <div className="p-2.5 rounded-[8px] bg-canvas border border-border-default mono text-[11.5px] text-fg-secondary break-all">
+                {inspected.uninstallString}
+              </div>
+            </DetailField>
+          )}
+        </DetailDrawer>
+      )}
     </div>
   );
 }

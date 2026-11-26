@@ -1,5 +1,10 @@
-import { FilePlus, FolderPlus, Lock, Plus, ShieldCheck, Trash2 } from "lucide-react";
+import { ChevronDown, FilePlus, FolderPlus, Lock, Plus, ShieldCheck, Trash2 } from "lucide-react";
 import { useCallback, useEffect, useMemo, useState } from "react";
+import { Badge } from "../components/ui/Badge";
+import { Button } from "../components/ui/Button";
+import { Card } from "../components/ui/Card";
+import { Collapse } from "../components/ui/Collapse";
+import { AlertBanner } from "../components/ui/Feedback";
 import { type ProtectedEntry, type ProtectionType, api } from "../lib/ipc";
 
 export function ProtectedPathsView() {
@@ -10,6 +15,8 @@ export function ProtectedPathsView() {
   const [todasLasUnidades, setTodasLasUnidades] = useState(false);
   const [previewCount, setPreviewCount] = useState<number | null>(null);
   const [error, setError] = useState<string | null>(null);
+  const [userOpen, setUserOpen] = useState(true);
+  const [criticalOpen, setCriticalOpen] = useState(true);
 
   const load = useCallback(() => {
     api
@@ -99,10 +106,12 @@ export function ProtectedPathsView() {
   };
 
   return (
-    <div style={{ display: "flex", flexDirection: "column", gap: 16 }}>
+    <div className="flex flex-col gap-4">
       <div>
-        <h2 style={{ margin: 0, fontSize: 20 }}>Rutas protegidas (Lista negra)</h2>
-        <p style={{ margin: "4px 0 0", color: "var(--text-secondary)", fontSize: 13 }}>
+        <h1 className="m-0 text-[18px] font-semibold tracking-[-0.02em] text-fg-primary">
+          Rutas protegidas (Lista negra)
+        </h1>
+        <p className="m-0 mt-1 text-[13px] text-fg-secondary text-pretty">
           Las rutas protegidas bloquean el borrado en todas las capas (Treemap, Limpieza segura y
           Limpieza Dev). Las entradas de usuario tienen máxima prioridad incluso sobre excepciones
           del sistema.
@@ -110,20 +119,23 @@ export function ProtectedPathsView() {
       </div>
 
       {/* Add user rule card */}
-      <div className="card" style={{ display: "flex", flexDirection: "column", gap: 12 }}>
-        <div style={{ fontWeight: 700, fontSize: 15 }}>Agregar ruta protegida de usuario</div>
+      <Card className="flex flex-col gap-3">
+        <div className="font-semibold text-[14px] text-fg-primary">
+          Agregar ruta protegida de usuario
+        </div>
 
-        <div style={{ display: "flex", gap: 8, flexWrap: "wrap" }}>
-          <button type="button" className="btn" onClick={handlePickFile}>
-            <FilePlus size={14} />
+        <div className="flex items-center gap-2 flex-wrap">
+          <Button onClick={handlePickFile}>
+            <FilePlus size={13} />
             Elegir archivo...
-          </button>
-          <button type="button" className="btn" onClick={handlePickFolder}>
-            <FolderPlus size={14} />
+          </Button>
+          <Button onClick={handlePickFolder}>
+            <FolderPlus size={13} />
             Elegir carpeta...
-          </button>
+          </Button>
           <select
-            className="select"
+            aria-label="Tipo de protección"
+            className="h-8 px-2.5 rounded-[7px] bg-canvas border border-border-default text-[12.5px] text-fg-primary focus:border-accent focus:outline-none"
             value={tipo}
             onChange={(e) => setTipo(e.target.value as ProtectionType)}
           >
@@ -133,11 +145,14 @@ export function ProtectedPathsView() {
           </select>
         </div>
 
-        <div style={{ display: "flex", gap: 8, flexWrap: "wrap" }}>
+        <div className="flex items-center gap-2 flex-wrap">
           <input
             type="text"
-            className="input mono"
-            style={{ flex: 2, minWidth: 260 }}
+            name="protected-pattern"
+            autoComplete="off"
+            spellCheck={false}
+            aria-label="Ruta o patrón glob"
+            className="flex-[2] min-w-[240px] h-8 px-2.5 rounded-[7px] bg-canvas border border-border-default mono text-[12px] text-fg-primary placeholder:text-fg-muted focus:border-accent focus-visible:ring-2 focus-visible:ring-accent/30"
             placeholder="Ruta (ej. D:\Trabajo\Secreto) o glob (ej. **\*.pem)"
             value={patron}
             onChange={(e) => {
@@ -147,148 +162,155 @@ export function ProtectedPathsView() {
           />
           <input
             type="text"
-            className="input"
-            style={{ flex: 1, minWidth: 180 }}
+            name="protected-reason"
+            autoComplete="off"
+            aria-label="Motivo opcional"
+            className="flex-1 min-w-[170px] h-8 px-2.5 rounded-[7px] bg-canvas border border-border-default text-[12.5px] text-fg-primary placeholder:text-fg-muted focus:border-accent focus-visible:ring-2 focus-visible:ring-accent/30"
             placeholder="Motivo (opcional)"
             value={motivo}
             onChange={(e) => setMotivo(e.target.value)}
           />
-          <button type="button" className="btn btn-primary" onClick={handleAdd}>
-            <Plus size={14} />
+          <Button variant="primary" onClick={handleAdd}>
+            <Plus size={13} />
             Proteger
-          </button>
+          </Button>
         </div>
 
-        <div
-          style={{
-            display: "flex",
-            justifyContent: "space-between",
-            alignItems: "center",
-            flexWrap: "wrap",
-            gap: 10,
-            fontSize: 12.5,
-          }}
-        >
-          <label style={{ display: "flex", alignItems: "center", gap: 6, cursor: "pointer" }}>
+        <div className="flex items-center justify-between flex-wrap gap-2.5 text-[12.5px]">
+          <label className="inline-flex items-center gap-2 text-fg-secondary cursor-pointer select-none">
             <input
               type="checkbox"
+              className="accent-accent"
               checked={todasLasUnidades}
               disabled={tipo === "glob"}
               onChange={(e) => setTodasLasUnidades(e.target.checked)}
             />
-            Aplicar a todas las unidades (<code>?:\</code>)
+            Aplicar a todas las unidades (<code className="text-fg-primary">?:\</code>)
           </label>
 
           {previewCount !== null && (
-            <span className="badge badge-info">
+            <Badge tone="accent">
               Vista previa último escaneo: protegería {previewCount.toLocaleString()} ítems
-            </span>
+            </Badge>
           )}
         </div>
 
-        {error && <div style={{ fontSize: 12.5, color: "#fca5a5" }}>{error}</div>}
-      </div>
+        {error && <AlertBanner tone="danger">{error}</AlertBanner>}
+      </Card>
 
       {/* User entries */}
-      <div className="card" style={{ display: "flex", flexDirection: "column", gap: 10 }}>
-        <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center" }}>
-          <h3 style={{ margin: 0, fontSize: 15 }}>Entradas de usuario ({userEntries.length})</h3>
-          <span className="badge badge-info">Prioridad 1 (máxima)</span>
-        </div>
-
-        {userEntries.length === 0 ? (
-          <div style={{ color: "var(--text-muted)", fontSize: 13 }}>
-            Aún no has agregado rutas personalizadas. También puedes hacer clic derecho en el
-            Treemap o en el Ranking y elegir &ldquo;Proteger esta ruta&rdquo;.
+      <Card className="flex flex-col">
+        <button
+          type="button"
+          aria-expanded={userOpen}
+          onClick={() => setUserOpen((v) => !v)}
+          className="w-full flex items-center justify-between gap-2 bg-transparent border-0 p-0 cursor-pointer text-left group"
+        >
+          <div className="flex items-center gap-2">
+            <ChevronDown
+              size={15}
+              className={`text-fg-muted transition-transform duration-200 ease-out ${
+                userOpen ? "rotate-0" : "-rotate-90"
+              }`}
+            />
+            <h2 className="m-0 text-[14px] font-semibold text-fg-primary group-hover:text-accent transition-colors">
+              Entradas de usuario ({userEntries.length})
+            </h2>
           </div>
-        ) : (
-          <div style={{ display: "flex", flexDirection: "column", gap: 6 }}>
-            {userEntries.map((entry) => (
+          <Badge tone="accent">Prioridad 1 (máxima)</Badge>
+        </button>
+
+        <Collapse open={userOpen}>
+          <div className="pt-3">
+            {userEntries.length === 0 ? (
+              <div className="text-[12.5px] text-fg-muted py-1">
+                Aún no has agregado rutas personalizadas. También puedes hacer clic derecho en el
+                Treemap o en el Ranking y elegir &ldquo;Proteger esta ruta&rdquo;.
+              </div>
+            ) : (
+              <div className="flex flex-col gap-1.5">
+                {userEntries.map((entry) => (
+                  <div
+                    key={entry.id}
+                    className="flex items-center justify-between gap-3 px-3 py-2.5 rounded-[8px] bg-canvas border border-border-subtle"
+                  >
+                    <div className="min-w-0">
+                      <div className="flex items-center gap-1.5 flex-wrap">
+                        <ShieldCheck size={13} className="text-accent shrink-0" />
+                        <span className="mono font-medium text-[12.5px] text-fg-primary break-all">
+                          {entry.todasLasUnidades ? `?:\\${entry.patron}` : entry.patron}
+                        </span>
+                        <Badge>{entry.tipo}</Badge>
+                      </div>
+                      {entry.motivo && (
+                        <div className="text-[12px] text-fg-secondary mt-0.5">{entry.motivo}</div>
+                      )}
+                    </div>
+                    <Button
+                      variant="danger"
+                      size="sm"
+                      onClick={() => handleRemove(entry.id)}
+                      title="Quitar entrada de usuario"
+                    >
+                      <Trash2 size={12} />
+                      Quitar
+                    </Button>
+                  </div>
+                ))}
+              </div>
+            )}
+          </div>
+        </Collapse>
+      </Card>
+
+      {/* Critical factory entries (read-only) */}
+      <Card className="flex flex-col">
+        <button
+          type="button"
+          aria-expanded={criticalOpen}
+          onClick={() => setCriticalOpen((v) => !v)}
+          className="w-full flex items-center justify-between gap-2 bg-transparent border-0 p-0 cursor-pointer text-left group"
+        >
+          <div className="flex items-center gap-2">
+            <ChevronDown
+              size={15}
+              className={`text-fg-muted transition-transform duration-200 ease-out ${
+                criticalOpen ? "rotate-0" : "-rotate-90"
+              }`}
+            />
+            <h2 className="m-0 text-[14px] font-semibold text-fg-primary group-hover:text-accent transition-colors">
+              Entradas críticas de fábrica ({criticalEntries.length})
+            </h2>
+          </div>
+          <Badge tone="warning">Inmutables · Solo lectura</Badge>
+        </button>
+
+        <Collapse open={criticalOpen}>
+          <div className="flex flex-col gap-1.5 pt-3">
+            {criticalEntries.map((entry) => (
               <div
                 key={entry.id}
-                style={{
-                  display: "flex",
-                  justifyContent: "space-between",
-                  alignItems: "center",
-                  gap: 12,
-                  padding: "9px 12px",
-                  borderRadius: 8,
-                  background: "#0f172a",
-                  border: "1px solid var(--border)",
-                }}
+                className="flex items-center justify-between gap-3 px-3 py-2 rounded-[8px] bg-canvas border border-border-subtle"
               >
-                <div style={{ overflow: "hidden" }}>
-                  <div style={{ display: "flex", alignItems: "center", gap: 6, flexWrap: "wrap" }}>
-                    <ShieldCheck size={14} color="#38bdf8" />
-                    <span className="mono" style={{ fontWeight: 600, fontSize: 13 }}>
+                <div className="min-w-0">
+                  <div className="flex items-center gap-1.5 flex-wrap">
+                    <Lock size={12} className="text-warning shrink-0" />
+                    <span className="mono font-medium text-[12px] text-fg-primary break-all">
                       {entry.todasLasUnidades ? `?:\\${entry.patron}` : entry.patron}
                     </span>
-                    <span className="badge">{entry.tipo}</span>
+                    <Badge>{entry.tipo}</Badge>
                   </div>
-                  <div style={{ fontSize: 12, color: "var(--text-secondary)", marginTop: 2 }}>
-                    {entry.motivo}
-                  </div>
+                  <div className="text-[12px] text-fg-secondary mt-0.5">{entry.motivo}</div>
                 </div>
-                <button
-                  type="button"
-                  className="btn btn-danger"
-                  style={{ padding: "5px 9px" }}
-                  onClick={() => handleRemove(entry.id)}
-                  title="Quitar entrada de usuario"
-                >
-                  <Trash2 size={13} />
-                  Quitar
-                </button>
+                <Badge tone="warning" title="Bloqueada de fábrica; no editable">
+                  <Lock size={10} />
+                  Crítica
+                </Badge>
               </div>
             ))}
           </div>
-        )}
-      </div>
-
-      {/* Critical factory entries (read-only) */}
-      <div className="card" style={{ display: "flex", flexDirection: "column", gap: 10 }}>
-        <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center" }}>
-          <h3 style={{ margin: 0, fontSize: 15 }}>
-            Entradas críticas de fábrica ({criticalEntries.length})
-          </h3>
-          <span className="badge badge-warning">Inmutables · Solo lectura</span>
-        </div>
-
-        <div style={{ display: "flex", flexDirection: "column", gap: 6 }}>
-          {criticalEntries.map((entry) => (
-            <div
-              key={entry.id}
-              style={{
-                display: "flex",
-                justifyContent: "space-between",
-                alignItems: "center",
-                gap: 12,
-                padding: "8px 12px",
-                borderRadius: 8,
-                background: "#0f172a",
-                border: "1px solid var(--border)",
-              }}
-            >
-              <div style={{ overflow: "hidden" }}>
-                <div style={{ display: "flex", alignItems: "center", gap: 6, flexWrap: "wrap" }}>
-                  <Lock size={13} color="#f59e0b" />
-                  <span className="mono" style={{ fontWeight: 600, fontSize: 12.5 }}>
-                    {entry.todasLasUnidades ? `?:\\${entry.patron}` : entry.patron}
-                  </span>
-                  <span className="badge">{entry.tipo}</span>
-                </div>
-                <div style={{ fontSize: 12, color: "var(--text-secondary)", marginTop: 2 }}>
-                  {entry.motivo}
-                </div>
-              </div>
-              <span className="badge badge-warning" title="Bloqueada de fábrica; no editable">
-                <Lock size={11} style={{ marginRight: 4 }} />
-                Crítica
-              </span>
-            </div>
-          ))}
-        </div>
-      </div>
+        </Collapse>
+      </Card>
     </div>
   );
 }

@@ -1,5 +1,7 @@
 import { ArrowUpRight, ShieldAlert, ShieldCheck } from "lucide-react";
 import type { ElevationStatus } from "../lib/ipc";
+import { Badge } from "./ui/Badge";
+import { Button } from "./ui/Button";
 
 interface ElevationBannerProps {
   elevation: ElevationStatus | null;
@@ -11,27 +13,31 @@ export function ElevationBanner({ elevation, activeDrive, onRelaunch }: Elevatio
   const isElevated = elevation?.isElevated ?? false;
 
   return (
-    <div style={{ display: "flex", alignItems: "center", gap: 10 }}>
+    <div className="flex items-center gap-2 shrink-0">
       {isElevated ? (
-        <span className="badge badge-warning" title="Ejecutando con privilegios elevados">
-          <ShieldCheck size={14} />
-          Modo Administrador ({elevation?.username})
-        </span>
+        <Badge tone="warning" title="Ejecutando con privilegios elevados">
+          <ShieldCheck size={12} />
+          <span className="hidden sm:inline">Administrador</span> ({elevation?.username})
+        </Badge>
       ) : (
         <>
-          <span className="badge badge-info" title="Ejecución estándar sin privilegios">
-            <ShieldAlert size={14} />
-            Modo estándar ({elevation?.username ?? "Usuario"})
-          </span>
-          <button
-            type="button"
-            className="btn btn-warning"
+          <Badge
+            tone="neutral"
+            className="hidden sm:inline-flex"
+            title="Ejecución estándar sin privilegios"
+          >
+            <ShieldAlert size={12} className="text-fg-muted" />
+            Estándar ({elevation?.username ?? "Usuario"})
+          </Badge>
+          <Button
+            variant="warning"
+            size="sm"
             onClick={onRelaunch}
             title={`Reiniciar como administrador${activeDrive ? ` (${activeDrive})` : ""}`}
           >
-            <ArrowUpRight size={14} />
-            Reiniciar como admin
-          </button>
+            <ArrowUpRight size={13} />
+            <span>Admin</span>
+          </Button>
         </>
       )}
     </div>

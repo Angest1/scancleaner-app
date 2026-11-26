@@ -32,25 +32,57 @@ export function formatDurationMs(ms: number): string {
   return `${mins}m ${rem}s`;
 }
 
+/**
+ * Smart middle-ellipsis for Windows/POSIX file paths.
+ * Keeps the drive/root prefix and the leaf folder/filename visible.
+ */
+export function formatMiddleEllipsis(path: string, maxChars = 54): string {
+  if (!path || path.length <= maxChars) return path;
+  const sep = path.includes("\\") ? "\\" : "/";
+  const parts = path.split(sep).filter(Boolean);
+  if (parts.length <= 2) {
+    const head = Math.max(10, Math.floor(maxChars * 0.42));
+    const tail = Math.max(10, maxChars - head - 1);
+    return `${path.slice(0, head)}…${path.slice(-tail)}`;
+  }
+
+  const root = path.startsWith("\\\\")
+    ? `\\\\${parts[0]}${sep}${parts[1]}`
+    : path.startsWith(sep)
+      ? `${sep}${parts[0]}`
+      : `${parts[0]}${sep}${parts[1]}`;
+  const tailTwo = `${parts[parts.length - 2]}${sep}${parts[parts.length - 1]}`;
+  const candidate = `${root}${sep}…${sep}${tailTwo}`;
+  if (candidate.length <= maxChars + 8) return candidate;
+
+  const leaf = parts[parts.length - 1];
+  const shortRoot = parts[0];
+  const compact = `${shortRoot}${sep}…${sep}${leaf}`;
+  if (compact.length <= maxChars + 4) return compact;
+
+  const keepTail = Math.max(14, maxChars - shortRoot.length - 4);
+  return `${shortRoot}${sep}…${sep}${leaf.slice(-keepTail)}`;
+}
+
 export const CATEGORY_COLORS: Record<string, string> = {
-  video: "#f43f5e",
-  image: "#a855f7",
-  audio: "#ec4899",
-  documents: "#38bdf8",
-  archives: "#f59e0b",
-  executables: "#ef4444",
-  code: "#10b981",
-  other: "#64748b",
-  installedapps: "#3b82f6",
-  system: "#6366f1",
-  temp: "#f59e0b",
-  browsercache: "#f97316",
-  devartifact: "#14b8a6",
-  recyclebin: "#ef4444",
-  downloads: "#0ea5e9",
-  userother: "#64748b",
+  video: "#c94a63",
+  image: "#8b63c9",
+  audio: "#b8568f",
+  documents: "#2e8eb8",
+  archives: "#c78832",
+  executables: "#c75050",
+  code: "#279973",
+  other: "#4f5b6e",
+  installedapps: "#3b78c9",
+  system: "#5a63bd",
+  temp: "#c78832",
+  browsercache: "#cc6f35",
+  devartifact: "#249188",
+  recyclebin: "#c75050",
+  downloads: "#2b85b3",
+  userother: "#4f5b6e",
 };
 
 export function colorForCategory(key: string): string {
-  return CATEGORY_COLORS[key.toLowerCase()] ?? "#475569";
+  return CATEGORY_COLORS[key.toLowerCase()] ?? "#4f5b6e";
 }

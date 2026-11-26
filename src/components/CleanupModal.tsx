@@ -1,7 +1,12 @@
-import { AlertTriangle, CheckCircle2, ShieldBan, Trash2, X } from "lucide-react";
+import { ShieldBan, Trash2 } from "lucide-react";
 import { useState } from "react";
 import { formatBytes } from "../lib/format";
 import type { CleanupMode, CleanupPlan, CleanupResult } from "../lib/ipc";
+import { Badge } from "./ui/Badge";
+import { Button } from "./ui/Button";
+import { AlertBanner } from "./ui/Feedback";
+import { Modal } from "./ui/Modal";
+import { SegmentedControl } from "./ui/SegmentedControl";
 
 interface CleanupModalProps {
   plan: CleanupPlan;
@@ -24,273 +29,156 @@ export function CleanupModal({
   const canExecute =
     plan.items.length > 0 && !executing && (plan.mode !== "permanent" || confirmPermanent);
 
+  const footer = result ? (
+    <Button variant="primary" onClick={onClose}>
+      Cerrar
+    </Button>
+  ) : (
+    <>
+      <Button onClick={onClose}>Cancelar</Button>
+      <Button
+        variant={plan.mode === "recycle_bin" ? "primary" : "danger"}
+        disabled={!canExecute}
+        onClick={() => onExecute(confirmPermanent)}
+      >
+        <Trash2 size={14} />
+        {executing ? "Eliminando..." : "Confirmar y ejecutar limpieza"}
+      </Button>
+    </>
+  );
+
   return (
-    <div className="modal-backdrop">
-      <div className="modal-panel">
-        <div
-          style={{
-            padding: "14px 18px",
-            borderBottom: "1px solid var(--border)",
-            display: "flex",
-            alignItems: "center",
-            justifyContent: "space-between",
-          }}
-        >
-          <div style={{ fontWeight: 700, fontSize: 15 }}>
-            {result ? "Resultado de limpieza" : "Vista previa de limpieza (Dry-run)"}
-          </div>
-          <button type="button" className="btn" style={{ padding: 6 }} onClick={onClose}>
-            <X size={15} />
-          </button>
-        </div>
+    <Modal
+      title={result ? "Resultado de limpieza" : "Vista previa de limpieza (Dry-run)"}
+      onClose={onClose}
+      footer={footer}
+    >
+      {result ? (
+        <>
+          <AlertBanner tone="success">
+            <div className="font-semibold text-fg-primary">
+              Espacio liberado: <span className="mono">{formatBytes(result.freedBytes)}</span>
+            </div>
+            <div className="text-[12px] text-fg-secondary mt-0.5 tabular">
+              Completados: {result.succeededCount} · Fallidos: {result.failedCount} · Bloqueados:{" "}
+              {result.skippedCount}
+            </div>
+          </AlertBanner>
 
-        <div
-          style={{
-            padding: 18,
-            overflow: "auto",
-            display: "flex",
-            flexDirection: "column",
-            gap: 14,
-          }}
-        >
-          {result ? (
-            <>
+          <div className="max-h-[280px] overflow-auto flex flex-col gap-1.5">
+            {result.outcomes.map((o) => (
               <div
-                className="card"
-                style={{
-                  borderColor: "rgba(34, 197, 94, 0.45)",
-                  background: "rgba(34, 197, 94, 0.08)",
-                  display: "flex",
-                  alignItems: "center",
-                  gap: 12,
-                }}
+                key={o.path}
+                className="px-3 py-2 rounded-[7px] bg-canvas border border-border-subtle flex items-center justify-between gap-3"
               >
-                <CheckCircle2 size={24} color="#22c55e" />
-                <div>
-                  <div style={{ fontWeight: 700 }}>
-                    Espacio liberado: {formatBytes(result.freedBytes)}
-                  </div>
-                  <div style={{ fontSize: 12.5, color: "var(--text-secondary)" }}>
-                    Completados: {result.succeededCount} · Fallidos: {result.failedCount} ·
-                    Bloqueados: {result.skippedCount}
-                  </div>
-                </div>
-              </div>
-
-              <div
-                style={{
-                  maxHeight: 280,
-                  overflow: "auto",
-                  display: "flex",
-                  flexDirection: "column",
-                  gap: 6,
-                }}
-              >
-                {result.outcomes.map((o) => (
-                  <div
-                    key={o.path}
-                    className="card"
-                    style={{
-                      padding: "8px 12px",
-                      display: "flex",
-                      justifyContent: "space-between",
-                      gap: 10,
-                    }}
-                  >
-                    <div style={{ overflow: "hidden" }}>
-                      <div className="mono" style={{ fontSize: 12, wordBreak: "break-all" }}>
-                        {o.path}
-                      </div>
-                      {o.detail && (
-                        <div style={{ fontSize: 11.5, color: "#fca5a5", marginTop: 2 }}>
-                          {o.detail}
-                        </div>
-                      )}
-                    </div>
-                    <span
-                      className={`badge ${
-                        o.status === "failed" || o.status === "blocked"
-                          ? "badge-danger"
-                          : "badge-success"
-                      }`}
-                    >
-                      {o.status}
-                    </span>
-                  </div>
-                ))}
-              </div>
-            </>
-          ) : (
-            <>
-              {plan.mode !== "empty_recycle_bin" && (
-                <div style={{ display: "flex", gap: 10, alignItems: "center", flexWrap: "wrap" }}>
-                  <span style={{ fontSize: 13, color: "var(--text-secondary)" }}>Método:</span>
-                  <button
-                    type="button"
-                    className={`btn ${plan.mode === "recycle_bin" ? "btn-primary" : ""}`}
-                    onClick={() => {
-                      setConfirmPermanent(false);
-                      onChangeMode("recycle_bin");
-                    }}
-                  >
-                    Enviar a la Papelera (Seguro, por defecto)
-                  </button>
-                  <button
-                    type="button"
-                    className={`btn ${plan.mode === "permanent" ? "btn-danger" : ""}`}
-                    onClick={() => onChangeMode("permanent")}
-                  >
-                    Borrado permanente
-                  </button>
-                </div>
-              )}
-
-              <div
-                className="card"
-                style={{ display: "flex", justifyContent: "space-between", alignItems: "center" }}
-              >
-                <div>
-                  <div style={{ fontSize: 12, color: "var(--text-muted)" }}>Resumen a liberar</div>
-                  <div className="mono" style={{ fontSize: 22, fontWeight: 700, color: "#38bdf8" }}>
-                    {formatBytes(plan.totalBytes)}
-                  </div>
-                </div>
-                <div style={{ textAlign: "right", fontSize: 13 }}>
-                  <div>{plan.items.length} elementos listos</div>
-                  {plan.blockedItems.length > 0 && (
-                    <div style={{ color: "#fca5a5" }}>
-                      {plan.blockedItems.length} bloqueados por seguridad
-                    </div>
+                <div className="min-w-0">
+                  <div className="mono text-[12px] text-fg-primary break-all">{o.path}</div>
+                  {o.detail && (
+                    <div className="text-[11.5px] text-danger-text mt-0.5">{o.detail}</div>
                   )}
                 </div>
-              </div>
-
-              {plan.warnings.map((w) => (
-                <div
-                  key={w}
-                  className="card"
-                  style={{
-                    borderColor: "rgba(245, 158, 11, 0.5)",
-                    background: "rgba(245, 158, 11, 0.08)",
-                    display: "flex",
-                    alignItems: "center",
-                    gap: 10,
-                    fontSize: 12.5,
-                  }}
+                <Badge
+                  tone={o.status === "failed" || o.status === "blocked" ? "danger" : "success"}
                 >
-                  <AlertTriangle size={16} color="#f59e0b" />
-                  <span>{w}</span>
-                </div>
-              ))}
+                  {o.status}
+                </Badge>
+              </div>
+            ))}
+          </div>
+        </>
+      ) : (
+        <>
+          {plan.mode !== "empty_recycle_bin" && (
+            <div className="flex items-center justify-between gap-3 flex-wrap">
+              <span className="text-[12.5px] text-fg-secondary">Método de eliminación</span>
+              <SegmentedControl
+                ariaLabel="Método de eliminación"
+                value={plan.mode === "permanent" ? "permanent" : "recycle_bin"}
+                onChange={(mode) => {
+                  if (mode === "recycle_bin") setConfirmPermanent(false);
+                  onChangeMode(mode);
+                }}
+                options={[
+                  { value: "recycle_bin", label: "Papelera (Seguro)" },
+                  { value: "permanent", label: "Borrado permanente" },
+                ]}
+              />
+            </div>
+          )}
 
+          <div className="px-4 py-3 rounded-[8px] bg-canvas border border-border-default flex items-center justify-between gap-3">
+            <div>
+              <div className="text-[11.5px] text-fg-muted">Resumen a liberar</div>
+              <div className="mono text-[22px] font-semibold text-accent leading-tight mt-0.5">
+                {formatBytes(plan.totalBytes)}
+              </div>
+            </div>
+            <div className="text-right text-[12.5px] tabular">
+              <div className="text-fg-primary font-medium">
+                {plan.items.length} elementos listos
+              </div>
               {plan.blockedItems.length > 0 && (
-                <div className="card" style={{ borderColor: "rgba(239, 68, 68, 0.4)" }}>
-                  <div
-                    style={{
-                      display: "flex",
-                      alignItems: "center",
-                      gap: 6,
-                      fontWeight: 600,
-                      marginBottom: 6,
-                    }}
-                  >
-                    <ShieldBan size={15} color="#ef4444" />
-                    Rutas bloqueadas por Guardrails
-                  </div>
-                  {plan.blockedItems.map((b) => (
-                    <div key={b.path} style={{ fontSize: 12, color: "#fca5a5" }}>
-                      <span className="mono">{b.path}</span> — {b.reason}
-                    </div>
-                  ))}
+                <div className="text-danger-text text-[12px] mt-0.5">
+                  {plan.blockedItems.length} bloqueados por seguridad
                 </div>
               )}
+            </div>
+          </div>
 
-              <div
-                style={{
-                  maxHeight: 240,
-                  overflow: "auto",
-                  display: "flex",
-                  flexDirection: "column",
-                  gap: 5,
-                }}
-              >
-                {plan.items.map((item) => (
-                  <div
-                    key={item.path}
-                    style={{
-                      display: "flex",
-                      justifyContent: "space-between",
-                      gap: 10,
-                      padding: "6px 10px",
-                      background: "#0f172a",
-                      borderRadius: 6,
-                      fontSize: 12,
-                    }}
-                  >
-                    <span className="mono" style={{ overflow: "hidden", textOverflow: "ellipsis" }}>
-                      {item.path}
-                    </span>
-                    <span className="mono" style={{ color: "var(--accent)", flexShrink: 0 }}>
-                      {formatBytes(item.bytes)}
-                    </span>
+          {plan.warnings.map((w) => (
+            <AlertBanner key={w} tone="warning">
+              {w}
+            </AlertBanner>
+          ))}
+
+          {plan.blockedItems.length > 0 && (
+            <div className="px-3.5 py-3 rounded-[8px] bg-danger-soft border border-danger-border">
+              <div className="flex items-center gap-1.5 font-semibold text-[12.5px] text-fg-primary mb-1.5">
+                <ShieldBan size={14} className="text-danger" />
+                Rutas bloqueadas por Guardrails
+              </div>
+              <div className="flex flex-col gap-1">
+                {plan.blockedItems.map((b) => (
+                  <div key={b.path} className="text-[12px] text-danger-text break-all">
+                    <span className="mono">{b.path}</span> — {b.reason}
                   </div>
                 ))}
               </div>
-
-              {plan.mode === "permanent" && (
-                <label
-                  style={{
-                    display: "flex",
-                    alignItems: "center",
-                    gap: 8,
-                    fontSize: 13,
-                    color: "#fca5a5",
-                  }}
-                >
-                  <input
-                    type="checkbox"
-                    checked={confirmPermanent}
-                    onChange={(e) => setConfirmPermanent(e.target.checked)}
-                  />
-                  Confirmo que deseo eliminar estos elementos permanentemente sin pasar por la
-                  Papelera.
-                </label>
-              )}
-            </>
+            </div>
           )}
-        </div>
 
-        <div
-          style={{
-            padding: "12px 18px",
-            borderTop: "1px solid var(--border)",
-            display: "flex",
-            justifyContent: "flex-end",
-            gap: 10,
-          }}
-        >
-          {result ? (
-            <button type="button" className="btn btn-primary" onClick={onClose}>
-              Cerrar
-            </button>
-          ) : (
-            <>
-              <button type="button" className="btn" onClick={onClose}>
-                Cancelar
-              </button>
-              <button
-                type="button"
-                className={`btn ${plan.mode === "recycle_bin" ? "btn-primary" : "btn-danger"}`}
-                disabled={!canExecute}
-                onClick={() => onExecute(confirmPermanent)}
+          <div className="max-h-[240px] overflow-auto flex flex-col gap-1">
+            {plan.items.map((item) => (
+              <div
+                key={item.path}
+                className="flex items-center justify-between gap-3 px-2.5 py-1.5 rounded-[6px] bg-canvas border border-border-subtle text-[12px]"
               >
-                <Trash2 size={14} />
-                {executing ? "Eliminando..." : "Confirmar y ejecutar limpieza"}
-              </button>
-            </>
+                <span className="mono text-fg-secondary truncate" title={item.path}>
+                  {item.path}
+                </span>
+                <span className="mono text-accent font-medium shrink-0">
+                  {formatBytes(item.bytes)}
+                </span>
+              </div>
+            ))}
+          </div>
+
+          {plan.mode === "permanent" && (
+            <label className="flex items-start gap-2.5 px-3 py-2.5 rounded-[8px] bg-danger-soft border border-danger-border text-[12.5px] text-danger-text cursor-pointer">
+              <input
+                type="checkbox"
+                className="mt-0.5 accent-danger"
+                checked={confirmPermanent}
+                onChange={(e) => setConfirmPermanent(e.target.checked)}
+              />
+              <span>
+                Confirmo que deseo eliminar estos elementos permanentemente sin pasar por la
+                Papelera.
+              </span>
+            </label>
           )}
-        </div>
-      </div>
-    </div>
+        </>
+      )}
+    </Modal>
   );
 }

@@ -1,6 +1,7 @@
 import { useState } from "react";
 import { colorForCategory, formatBytes } from "../lib/format";
 import type { CategoryBreakdown } from "../lib/ipc";
+import { SegmentedControl } from "./ui/SegmentedControl";
 
 interface CategoryChartsProps {
   breakdown: CategoryBreakdown | null;
@@ -11,7 +12,7 @@ export function CategoryCharts({ breakdown }: CategoryChartsProps) {
 
   if (!breakdown) {
     return (
-      <div style={{ padding: 24, color: "var(--text-muted)" }}>
+      <div className="py-6 text-[12.5px] text-fg-muted">
         Escanea una unidad para visualizar el desglose por categorías.
       </div>
     );
@@ -20,93 +21,69 @@ export function CategoryCharts({ breakdown }: CategoryChartsProps) {
   const buckets = mode === "type" ? breakdown.byType : breakdown.byOrigin;
 
   return (
-    <div style={{ display: "flex", flexDirection: "column", gap: 14 }}>
-      <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between" }}>
-        <div style={{ display: "flex", gap: 8 }}>
-          <button
-            type="button"
-            className={`btn ${mode === "type" ? "btn-primary" : ""}`}
-            onClick={() => setMode("type")}
-          >
-            Por tipo de archivo
-          </button>
-          <button
-            type="button"
-            className={`btn ${mode === "origin" ? "btn-primary" : ""}`}
-            onClick={() => setMode("origin")}
-          >
-            Por origen
-          </button>
-        </div>
-        <span className="mono" style={{ color: "var(--text-secondary)", fontSize: 12.5 }}>
-          Total medido: {formatBytes(breakdown.totalAllocatedBytes)}
+    <div className="flex flex-col gap-4">
+      <div className="flex items-center justify-between flex-wrap gap-2">
+        <SegmentedControl
+          ariaLabel="Agrupar categorías"
+          value={mode}
+          onChange={setMode}
+          options={[
+            { value: "type", label: "Por tipo de archivo" },
+            { value: "origin", label: "Por origen" },
+          ]}
+        />
+        <span className="mono text-[12px] text-fg-secondary">
+          Total medido:{" "}
+          <strong className="text-fg-primary">{formatBytes(breakdown.totalAllocatedBytes)}</strong>
         </span>
       </div>
 
       {/* Stacked bar summary */}
-      <div
-        style={{
-          height: 22,
-          borderRadius: 6,
-          overflow: "hidden",
-          display: "flex",
-          background: "#0f172a",
-          border: "1px solid var(--border)",
-        }}
-      >
+      <div className="h-4 rounded-[6px] overflow-hidden flex bg-canvas border border-border-default">
         {buckets
           .filter((b) => b.percentage > 0.3)
           .map((b) => (
             <div
               key={b.key}
               title={`${b.label}: ${formatBytes(b.allocatedBytes)} (${b.percentage.toFixed(1)}%)`}
+              className="h-full border-r border-canvas/70 last:border-r-0"
               style={{
                 width: `${b.percentage}%`,
-                background: colorForCategory(b.key),
+                backgroundColor: colorForCategory(b.key),
               }}
             />
           ))}
       </div>
 
-      <div style={{ display: "flex", flexDirection: "column", gap: 10 }}>
+      <div className="flex flex-col gap-2.5">
         {buckets.map((b) => (
           <div
             key={b.key}
-            style={{
-              display: "grid",
-              gridTemplateColumns: "210px 1fr 120px 70px",
-              alignItems: "center",
-              gap: 12,
-            }}
+            className="grid grid-cols-[160px_1fr_95px_54px] sm:grid-cols-[200px_1fr_110px_62px] items-center gap-3"
           >
-            <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
+            <div className="flex items-center gap-2 min-w-0">
               <span
-                style={{
-                  width: 10,
-                  height: 10,
-                  borderRadius: 3,
-                  background: colorForCategory(b.key),
-                  flexShrink: 0,
-                }}
+                className="w-2.5 h-2.5 rounded-[3px] shrink-0"
+                style={{ backgroundColor: colorForCategory(b.key) }}
               />
-              <span style={{ fontWeight: 500 }}>{b.label}</span>
+              <span className="font-medium text-[12.5px] text-fg-primary truncate">{b.label}</span>
             </div>
 
-            <div className="progress-track">
+            <div className="w-full h-1.5 rounded-full bg-canvas overflow-hidden">
               <div
+                className="h-full rounded-full"
                 style={{
-                  height: "100%",
                   width: `${Math.min(100, b.percentage)}%`,
-                  background: colorForCategory(b.key),
+                  backgroundColor: colorForCategory(b.key),
                 }}
               />
             </div>
 
-            <span className="mono" style={{ textAlign: "right", fontSize: 12.5 }}>
+            <span className="mono text-right text-[12px] text-fg-primary">
               {formatBytes(b.allocatedBytes)}
             </span>
 
-            <span style={{ textAlign: "right", color: "var(--text-muted)", fontSize: 12 }}>
+            <span className="mono text-right text-[11.5px] text-fg-muted">
               {b.percentage.toFixed(1)}%
             </span>
           </div>

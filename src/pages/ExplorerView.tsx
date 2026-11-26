@@ -1,10 +1,16 @@
-import { AlertTriangle, RefreshCw, ShieldAlert } from "lucide-react";
+import { AlertTriangle, FolderTree, Home, RefreshCw, ShieldAlert } from "lucide-react";
 import { useEffect, useState } from "react";
 import { BreadcrumbBar } from "../components/BreadcrumbBar";
 import { CategoryCharts } from "../components/CategoryCharts";
 import { SystemFilesPanel } from "../components/SystemFilesPanel";
 import { TopEntriesTable } from "../components/TopEntriesTable";
 import { TreemapCanvas } from "../components/TreemapCanvas";
+import { Badge } from "../components/ui/Badge";
+import { Button } from "../components/ui/Button";
+import { Card } from "../components/ui/Card";
+import { Collapse } from "../components/ui/Collapse";
+import { EmptyState } from "../components/ui/Feedback";
+import { SegmentedControl } from "../components/ui/SegmentedControl";
 import { formatBytes, formatDurationMs } from "../lib/format";
 import {
   type CategoryBreakdown,
@@ -19,6 +25,7 @@ interface ExplorerViewProps {
   scanSummary: ScanSummary | null;
   rulesPath: string;
   isElevated: boolean;
+  onGoHome: () => void;
   onRelaunchAdmin: () => void;
   onQueueCleanup: (path: string, category: string) => void;
 }
@@ -27,6 +34,7 @@ export function ExplorerView({
   scanSummary,
   rulesPath,
   isElevated,
+  onGoHome,
   onRelaunchAdmin,
   onQueueCleanup,
 }: ExplorerViewProps) {
@@ -69,13 +77,18 @@ export function ExplorerView({
 
   if (!scanSummary) {
     return (
-      <div className="card" style={{ padding: 36, textAlign: "center" }}>
-        <h3 style={{ margin: "0 0 8px" }}>No hay ningún escaneo cargado</h3>
-        <p style={{ margin: 0, color: "var(--text-secondary)" }}>
-          Ve a la pestaña <strong>Unidades</strong> y escanea un disco para explorar su Treemap,
-          ranking y categorías.
-        </p>
-      </div>
+      <EmptyState
+        fullHeight
+        icon={<FolderTree size={20} />}
+        title="No hay ningún escaneo cargado"
+        description="Ve a Inicio y escanea una unidad para explorar su Treemap, ranking de espacio y categorías."
+        action={
+          <Button variant="primary" onClick={onGoHome}>
+            <Home size={13} />
+            Ir a Inicio
+          </Button>
+        }
+      />
     );
   }
 
@@ -102,122 +115,92 @@ export function ExplorerView({
       .catch((err) => alert(String(err)));
   };
 
+  const skippedLinks = scanSummary.stats.symlinksSkipped + scanSummary.stats.junctionsSkipped;
+
   return (
-    <div style={{ display: "flex", flexDirection: "column", gap: 16 }}>
-      <div
-        className="card"
-        style={{
-          display: "flex",
-          justifyContent: "space-between",
-          alignItems: "center",
-          flexWrap: "wrap",
-          gap: 12,
-        }}
-      >
+    <div className="flex flex-col gap-4">
+      {/* Scan summary strip */}
+      <Card className="flex items-center justify-between flex-wrap gap-3">
         <div>
-          <div style={{ fontSize: 12, color: "var(--text-muted)" }}>
-            Escaneo de <span className="mono">{scanSummary.rootPath}</span> (
+          <div className="text-[12px] text-fg-muted">
+            Escaneo de <span className="mono text-fg-secondary">{scanSummary.rootPath}</span> (
             {scanSummary.fsType.toUpperCase()})
           </div>
-          <div style={{ display: "flex", gap: 16, flexWrap: "wrap", marginTop: 4, fontSize: 13 }}>
+          <div className="flex items-center gap-4 flex-wrap mt-1 text-[13px] tabular">
             <span>
-              <strong>{formatBytes(scanSummary.stats.totalAllocatedBytes)}</strong> en disco
+              <strong className="mono font-semibold text-fg-primary">
+                {formatBytes(scanSummary.stats.totalAllocatedBytes)}
+              </strong>{" "}
+              <span className="text-fg-secondary">en disco</span>
             </span>
-            <span>{scanSummary.stats.totalFiles.toLocaleString()} archivos</span>
-            <span>{scanSummary.stats.totalDirs.toLocaleString()} carpetas</span>
-            <span>Duración: {formatDurationMs(scanSummary.stats.durationMs)}</span>
+            <span className="text-fg-secondary">
+              {scanSummary.stats.totalFiles.toLocaleString()} archivos
+            </span>
+            <span className="text-fg-secondary">
+              {scanSummary.stats.totalDirs.toLocaleString()} carpetas
+            </span>
+            <span className="text-fg-secondary">
+              Duración:{" "}
+              <span className="mono">{formatDurationMs(scanSummary.stats.durationMs)}</span>
+            </span>
             {scanSummary.stats.hardlinksDeduplicated > 0 && (
-              <span className="badge badge-info">
+              <Badge tone="accent">
                 {scanSummary.stats.hardlinksDeduplicated.toLocaleString()} hardlinks deduplicados
-              </span>
+              </Badge>
             )}
-            {scanSummary.stats.symlinksSkipped + scanSummary.stats.junctionsSkipped > 0 && (
-              <span className="badge">
-                {(
-                  scanSummary.stats.symlinksSkipped + scanSummary.stats.junctionsSkipped
-                ).toLocaleString()}{" "}
-                enlaces omitidos
-              </span>
-            )}
+            {skippedLinks > 0 && <Badge>{skippedLinks.toLocaleString()} enlaces omitidos</Badge>}
           </div>
         </div>
 
-        <div style={{ display: "flex", gap: 8, alignItems: "center" }}>
-          {scanSummary.stats.accessDeniedCount > 0 && (
-            <button
-              type="button"
-              className="btn btn-warning"
-              onClick={() => setShowDenied((v) => !v)}
-            >
-              <AlertTriangle size={14} />
-              Omitidas por permisos ({scanSummary.stats.accessDeniedCount})
-            </button>
-          )}
-        </div>
-      </div>
+        {scanSummary.stats.accessDeniedCount > 0 && (
+          <Button variant="warning" size="sm" onClick={() => setShowDenied((v) => !v)}>
+            <AlertTriangle size={13} />
+            Omitidas por permisos ({scanSummary.stats.accessDeniedCount})
+          </Button>
+        )}
+      </Card>
 
-      {showDenied && deniedPaths.length > 0 && (
-        <div className="card" style={{ borderColor: "rgba(245, 158, 11, 0.5)" }}>
-          <div
-            style={{
-              display: "flex",
-              justifyContent: "space-between",
-              alignItems: "center",
-              marginBottom: 8,
-            }}
-          >
-            <div style={{ display: "flex", alignItems: "center", gap: 8, fontWeight: 600 }}>
-              <ShieldAlert size={16} color="#f59e0b" />
+      <Collapse open={showDenied && deniedPaths.length > 0}>
+        <Card className="border-warning-border bg-warning-soft/50">
+          <div className="flex items-center justify-between flex-wrap gap-2 mb-2">
+            <div className="flex items-center gap-2 font-semibold text-[13px] text-fg-primary">
+              <ShieldAlert size={15} className="text-warning" />
               Rutas sin acceso durante el escaneo (mostrando hasta {deniedPaths.length})
             </div>
             {!isElevated && (
-              <button type="button" className="btn btn-warning" onClick={onRelaunchAdmin}>
+              <Button variant="warning" size="sm" onClick={onRelaunchAdmin}>
                 Reiniciar como admin para acceso amplio
-              </button>
+              </Button>
             )}
           </div>
-          <div style={{ maxHeight: 140, overflow: "auto", fontSize: 12 }} className="mono">
+          <div className="max-h-[140px] overflow-auto mono text-[11.5px] text-fg-secondary flex flex-col gap-0.5">
             {deniedPaths.map((p) => (
-              <div key={p} style={{ color: "var(--text-secondary)", padding: "2px 0" }}>
+              <div key={p} className="truncate">
                 {p}
               </div>
             ))}
           </div>
-        </div>
-      )}
+        </Card>
+      </Collapse>
 
-      <div className="card" style={{ display: "flex", flexDirection: "column", gap: 12 }}>
-        <div
-          style={{
-            display: "flex",
-            justifyContent: "space-between",
-            alignItems: "center",
-            flexWrap: "wrap",
-            gap: 10,
-          }}
-        >
+      {/* Treemap container */}
+      <Card className="flex flex-col gap-3">
+        <div className="flex items-center justify-between flex-wrap gap-2.5">
           <BreadcrumbBar
             breadcrumbs={treemap?.breadcrumbs ?? []}
             onSelectNode={(id) => setNodeId(id)}
           />
-          <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
-            <span style={{ fontSize: 12, color: "var(--text-muted)" }}>Color por:</span>
-            <button
-              type="button"
-              className={`btn ${colorBy === "type" ? "btn-primary" : ""}`}
-              style={{ padding: "5px 10px" }}
-              onClick={() => setColorBy("type")}
-            >
-              Tipo
-            </button>
-            <button
-              type="button"
-              className={`btn ${colorBy === "origin" ? "btn-primary" : ""}`}
-              style={{ padding: "5px 10px" }}
-              onClick={() => setColorBy("origin")}
-            >
-              Origen
-            </button>
+          <div className="flex items-center gap-2">
+            <span className="text-[12px] text-fg-muted">Color por</span>
+            <SegmentedControl
+              ariaLabel="Colorear treemap por"
+              value={colorBy}
+              onChange={setColorBy}
+              options={[
+                { value: "type", label: "Tipo" },
+                { value: "origin", label: "Origen" },
+              ]}
+            />
           </div>
         </div>
 
@@ -229,91 +212,62 @@ export function ExplorerView({
           onSendToCleanup={(n: TreemapNodeDto) => onQueueCleanup(n.fullPath, n.originCat)}
           onProtectPath={(n: TreemapNodeDto) => handleProtectPath(n.fullPath, n.kind === "dir")}
         />
-      </div>
+      </Card>
 
-      <div className="card" style={{ display: "flex", flexDirection: "column", gap: 14 }}>
-        <div
-          style={{
-            display: "flex",
-            justifyContent: "space-between",
-            alignItems: "center",
-            flexWrap: "wrap",
-            gap: 10,
-          }}
-        >
-          <div style={{ display: "flex", gap: 8 }}>
-            <button
-              type="button"
-              className={`btn ${tab === "ranking" ? "btn-primary" : ""}`}
-              onClick={() => setTab("ranking")}
-            >
-              Ranking Top 100
-            </button>
-            <button
-              type="button"
-              className={`btn ${tab === "categories" ? "btn-primary" : ""}`}
-              onClick={() => setTab("categories")}
-            >
-              Categorías
-            </button>
-            <button
-              type="button"
-              className={`btn ${tab === "system" ? "btn-primary" : ""}`}
-              onClick={() => setTab("system")}
-            >
-              Sistema (no eliminable)
-            </button>
-          </div>
+      {/* Bottom analysis tabs */}
+      <Card className="flex flex-col gap-3.5">
+        <div className="flex items-center justify-between flex-wrap gap-2.5">
+          <SegmentedControl
+            ariaLabel="Panel de análisis"
+            value={tab}
+            onChange={setTab}
+            options={[
+              { value: "ranking", label: "Ranking Top 100" },
+              { value: "categories", label: "Categorías" },
+              { value: "system", label: "Sistema (no eliminable)" },
+            ]}
+          />
 
           {tab === "ranking" ? (
-            <div style={{ display: "flex", gap: 8 }}>
-              <button
-                type="button"
-                className={`btn ${rankingKind === "dirs" ? "btn-primary" : ""}`}
-                onClick={() => setRankingKind("dirs")}
-              >
-                Carpetas más grandes
-              </button>
-              <button
-                type="button"
-                className={`btn ${rankingKind === "files" ? "btn-primary" : ""}`}
-                onClick={() => setRankingKind("files")}
-              >
-                Archivos más grandes
-              </button>
-            </div>
+            <SegmentedControl
+              ariaLabel="Tipo de ranking"
+              value={rankingKind}
+              onChange={setRankingKind}
+              options={[
+                { value: "dirs", label: "Carpetas" },
+                { value: "files", label: "Archivos" },
+              ]}
+            />
           ) : (
-            <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
-              <span
-                className="mono"
-                style={{ fontSize: 11.5, color: "var(--text-muted)" }}
-                title={rulesPath}
-              >
-                Reglas: rules.json
+            <div className="flex items-center gap-2">
+              <span className="mono text-[11.5px] text-fg-muted" title={rulesPath}>
+                rules.json
               </span>
-              <button type="button" className="btn" onClick={handleReloadRules}>
-                <RefreshCw size={13} />
+              <Button size="sm" onClick={handleReloadRules}>
+                <RefreshCw size={12} />
                 Recargar reglas
-              </button>
+              </Button>
             </div>
           )}
         </div>
 
-        {tab === "ranking" ? (
-          <TopEntriesTable
-            entries={topEntries}
-            kind={rankingKind}
-            onDrillDown={(id) => setNodeId(id)}
-            onOpenExplorer={handleOpenExplorer}
-            onSendToCleanup={(entry) => onQueueCleanup(entry.fullPath, entry.originCat)}
-            onProtectPath={(entry) => handleProtectPath(entry.fullPath, rankingKind === "dirs")}
-          />
-        ) : tab === "categories" ? (
-          <CategoryCharts breakdown={breakdown} />
-        ) : (
-          <SystemFilesPanel driveRoot={scanSummary.rootPath} />
-        )}
-      </div>
+        <div key={tab} className="animate-view-in">
+          {tab === "ranking" ? (
+            <TopEntriesTable
+              entries={topEntries}
+              kind={rankingKind}
+              onDrillDown={(id) => setNodeId(id)}
+              onOpenExplorer={handleOpenExplorer}
+              onSendToCleanup={(entry) => onQueueCleanup(entry.fullPath, entry.originCat)}
+              onProtectPath={(entry) => handleProtectPath(entry.fullPath, rankingKind === "dirs")}
+            />
+          ) : tab === "categories" ? (
+            <CategoryCharts breakdown={breakdown} />
+          ) : (
+            <SystemFilesPanel driveRoot={scanSummary.rootPath} />
+          )}
+        </div>
+      </Card>
     </div>
   );
 }

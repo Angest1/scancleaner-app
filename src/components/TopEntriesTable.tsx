@@ -1,8 +1,18 @@
 import { useVirtualizer } from "@tanstack/react-virtual";
-import { File, Folder, FolderOpen, Lock, ShieldPlus, Trash2 } from "lucide-react";
-import { useRef } from "react";
+import { File, Folder, FolderOpen, Lock, MoreHorizontal, ShieldPlus, Trash2 } from "lucide-react";
+import { useMemo, useRef, useState } from "react";
 import { formatBytes, formatUnixTs } from "../lib/format";
 import type { TopEntryDto } from "../lib/ipc";
+import { Badge } from "./ui/Badge";
+import { Button } from "./ui/Button";
+import { DetailDrawer, DetailField } from "./ui/DetailDrawer";
+import { PathDisplay } from "./ui/PathDisplay";
+import {
+  DensityToggle,
+  type SortDir,
+  SortHeaderButton,
+  type TableDensity,
+} from "./ui/TableToolbar";
 
 interface TopEntriesTableProps {
   entries: TopEntryDto[];
@@ -13,6 +23,8 @@ interface TopEntriesTableProps {
   onProtectPath: (entry: TopEntryDto) => void;
 }
 
+type SortKey = "name" | "size" | "date";
+
 export function TopEntriesTable({
   entries,
   kind,
@@ -22,169 +34,287 @@ export function TopEntriesTable({
   onProtectPath,
 }: TopEntriesTableProps) {
   const parentRef = useRef<HTMLDivElement>(null);
+  const [sortKey, setSortKey] = useState<SortKey>("size");
+  const [sortDir, setSortDir] = useState<SortDir>("desc");
+  const [density, setDensity] = useState<TableDensity>("comfortable");
+  const [inspected, setInspected] = useState<TopEntryDto | null>(null);
+
+  const handleSort = (key: SortKey) => {
+    if (sortKey === key) {
+      setSortDir((d) => (d === "asc" ? "desc" : "asc"));
+    } else {
+      setSortKey(key);
+      setSortDir(key === "name" ? "asc" : "desc");
+    }
+  };
+
+  const sorted = useMemo(() => {
+    const list = [...entries];
+    const mult = sortDir === "asc" ? 1 : -1;
+    list.sort((a, b) => {
+      if (sortKey === "name") return a.name.localeCompare(b.name) * mult;
+      if (sortKey === "date") return (a.lastWriteTs - b.lastWriteTs) * mult;
+      return (a.allocatedBytes - b.allocatedBytes) * mult;
+    });
+    return list;
+  }, [entries, sortKey, sortDir]);
+
+  const rowHeight = density === "compact" ? 42 : 54;
+
   const virtualizer = useVirtualizer({
-    count: entries.length,
+    count: sorted.length,
     getScrollElement: () => parentRef.current,
-    estimateSize: () => 44,
+    estimateSize: () => rowHeight,
     overscan: 8,
   });
 
   if (entries.length === 0) {
     return (
-      <div style={{ padding: 24, textAlign: "center", color: "var(--text-muted)" }}>
+      <div className="py-8 text-center text-[12.5px] text-fg-muted border border-border-subtle rounded-[10px] bg-canvas/60">
         No hay elementos para mostrar en este nivel.
       </div>
     );
   }
 
   return (
-    <div style={{ border: "1px solid var(--border)", borderRadius: 8, overflow: "hidden" }}>
-      <div className="table-header" style={{ gridTemplateColumns: "1fr 120px 110px 150px" }}>
-        <span>Ruta</span>
-        <span style={{ textAlign: "right" }}>En disco</span>
-        <span style={{ textAlign: "right" }}>Modificado</span>
-        <span style={{ textAlign: "right" }}>Acciones</span>
+    <div className="flex flex-col gap-2">
+      <div className="flex items-center justify-between gap-2 text-[11.5px] text-fg-muted">
+        <span className="tabular">{sorted.length} elementos en este nivel</span>
+        <DensityToggle density={density} onChange={setDensity} />
       </div>
 
-      <div ref={parentRef} style={{ height: 320, overflow: "auto" }}>
-        <div style={{ height: `${virtualizer.getTotalSize()}px`, position: "relative" }}>
-          {virtualizer.getVirtualItems().map((vRow) => {
-            const item = entries[vRow.index];
-            return (
-              <div
-                key={item.nodeId}
-                className="table-row"
-                style={{
-                  position: "absolute",
-                  top: 0,
-                  left: 0,
-                  width: "100%",
-                  height: `${vRow.size}px`,
-                  transform: `translateY(${vRow.start}px)`,
-                  gridTemplateColumns: "1fr 120px 110px 150px",
-                }}
-              >
+      <div className="border border-border-default rounded-[10px] overflow-hidden bg-canvas/40">
+        <div ref={parentRef} className="h-[360px] overflow-y-auto overflow-x-hidden">
+          {/* Sticky adaptive header (zero horizontal scroll) */}
+          <div className="sticky top-0 z-10 grid grid-cols-[minmax(0,1fr)_88px_40px] sm:grid-cols-[minmax(0,1fr)_104px_96px_118px] items-center gap-2 px-3 py-2 border-b border-border-default bg-shell backdrop-blur-md">
+            <SortHeaderButton
+              label="Ruta"
+              active={sortKey === "name"}
+              dir={sortDir}
+              onClick={() => handleSort("name")}
+            />
+            <SortHeaderButton
+              label="En disco"
+              active={sortKey === "size"}
+              dir={sortDir}
+              align="right"
+              onClick={() => handleSort("size")}
+            />
+            <div className="hidden sm:flex justify-end">
+              <SortHeaderButton
+                label="Modificado"
+                active={sortKey === "date"}
+                dir={sortDir}
+                align="right"
+                onClick={() => handleSort("date")}
+              />
+            </div>
+            <span className="text-right text-[11.5px] font-medium text-fg-muted">
+              <span className="hidden sm:inline">Acciones</span>
+            </span>
+          </div>
+
+          <div style={{ height: `${virtualizer.getTotalSize()}px`, position: "relative" }}>
+            {virtualizer.getVirtualItems().map((vRow) => {
+              const item = sorted[vRow.index];
+              return (
                 <div
+                  key={item.nodeId}
+                  className="group grid grid-cols-[minmax(0,1fr)_88px_40px] sm:grid-cols-[minmax(0,1fr)_104px_96px_118px] items-center gap-2 px-3 border-b border-border-subtle hover:bg-elevated/65 transition-colors duration-140"
                   style={{
-                    display: "flex",
-                    alignItems: "center",
-                    gap: 8,
-                    overflow: "hidden",
-                    cursor: kind === "dirs" ? "pointer" : "default",
+                    position: "absolute",
+                    top: 0,
+                    left: 0,
+                    width: "100%",
+                    height: `${rowHeight}px`,
+                    transform: `translateY(${vRow.start}px)`,
                   }}
-                  onClick={() => {
-                    if (kind === "dirs") onDrillDown(item.nodeId);
-                  }}
-                  onKeyDown={(e) => {
-                    if (kind === "dirs" && e.key === "Enter") onDrillDown(item.nodeId);
-                  }}
-                  title={item.fullPath}
                 >
-                  {kind === "dirs" ? (
-                    <Folder size={15} color="#38bdf8" style={{ flexShrink: 0 }} />
-                  ) : (
-                    <File size={15} color="#94a3b8" style={{ flexShrink: 0 }} />
-                  )}
-                  <div
-                    style={{ overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}
-                  >
-                    <div
-                      style={{
-                        fontWeight: 500,
-                        overflow: "hidden",
-                        textOverflow: "ellipsis",
-                        display: "flex",
-                        alignItems: "center",
-                        gap: 6,
-                      }}
-                    >
-                      <span style={{ overflow: "hidden", textOverflow: "ellipsis" }}>
-                        {item.name}
-                      </span>
-                      {item.isProtected && (
-                        <span
-                          className="badge badge-warning"
-                          title={item.protectionReason ?? "Ruta protegida"}
-                          style={{
-                            display: "inline-flex",
-                            alignItems: "center",
-                            gap: 3,
-                            flexShrink: 0,
-                          }}
-                        >
-                          <Lock size={10} />
-                          Protegida
-                        </span>
+                  <div className="flex items-center gap-2.5 min-w-0">
+                    {kind === "dirs" ? (
+                      <Folder size={15} className="text-accent shrink-0" />
+                    ) : (
+                      <File size={15} className="text-fg-muted shrink-0" />
+                    )}
+                    <div className="min-w-0 flex-1">
+                      <div className="flex items-center gap-1.5 min-w-0">
+                        {kind === "dirs" ? (
+                          <button
+                            type="button"
+                            onClick={() => onDrillDown(item.nodeId)}
+                            title={item.fullPath}
+                            className="font-medium text-[12.5px] text-fg-primary hover:text-accent transition-colors truncate bg-transparent border-0 p-0 cursor-pointer text-left"
+                          >
+                            {item.name}
+                          </button>
+                        ) : (
+                          <button
+                            type="button"
+                            onClick={() => setInspected(item)}
+                            title={item.fullPath}
+                            className="font-medium text-[12.5px] text-fg-primary hover:text-accent transition-colors truncate bg-transparent border-0 p-0 cursor-pointer text-left"
+                          >
+                            {item.name}
+                          </button>
+                        )}
+                        {item.isProtected && (
+                          <Badge tone="warning" title={item.protectionReason ?? "Ruta protegida"}>
+                            <Lock size={10} />
+                            <span className="hidden md:inline">Protegida</span>
+                          </Badge>
+                        )}
+                      </div>
+                      {density === "comfortable" && (
+                        <div className="flex items-center gap-2 text-[11px] text-fg-muted min-w-0">
+                          <PathDisplay path={item.fullPath} maxChars={48} />
+                          <span className="sm:hidden shrink-0 tabular">
+                            · {formatUnixTs(item.lastWriteTs)}
+                          </span>
+                        </div>
                       )}
                     </div>
-                    <div
-                      style={{
-                        fontSize: 11,
-                        color: "var(--text-muted)",
-                        overflow: "hidden",
-                        textOverflow: "ellipsis",
-                      }}
-                    >
-                      {item.fullPath}
+                  </div>
+
+                  <div className="mono text-right text-[12.5px] font-medium text-fg-primary">
+                    {formatBytes(item.allocatedBytes)}
+                  </div>
+
+                  <div className="hidden sm:block text-right text-[12px] text-fg-secondary tabular">
+                    {formatUnixTs(item.lastWriteTs)}
+                  </div>
+
+                  {/* Progressive hover actions + Inspector trigger */}
+                  <div className="flex justify-end items-center gap-1">
+                    <div className="hidden sm:flex items-center gap-1 opacity-0 group-hover:opacity-100 group-focus-within:opacity-100 transition-opacity duration-140">
+                      <Button
+                        variant="ghost"
+                        size="icon"
+                        onClick={() => onOpenExplorer(item.fullPath)}
+                        title="Abrir en Explorador"
+                        aria-label={`Abrir ${item.name} en Explorador`}
+                      >
+                        <FolderOpen size={13} />
+                      </Button>
+                      {!item.isProtected && (
+                        <Button
+                          variant="ghost"
+                          size="icon"
+                          onClick={() => onProtectPath(item)}
+                          title="Proteger esta ruta"
+                          aria-label={`Proteger ${item.name}`}
+                        >
+                          <ShieldPlus size={13} className="text-accent" />
+                        </Button>
+                      )}
+                      <Button
+                        variant="danger"
+                        size="icon"
+                        disabled={item.isProtected}
+                        onClick={() => {
+                          if (!item.isProtected) onSendToCleanup(item);
+                        }}
+                        title={
+                          item.isProtected
+                            ? (item.protectionReason ?? "Ruta protegida por lista negra")
+                            : "Enviar a Limpieza (Dry-run)"
+                        }
+                        aria-label={
+                          item.isProtected
+                            ? `${item.name} está protegida`
+                            : `Enviar ${item.name} a limpieza`
+                        }
+                      >
+                        {item.isProtected ? <Lock size={13} /> : <Trash2 size={13} />}
+                      </Button>
                     </div>
+                    <Button
+                      variant="ghost"
+                      size="icon"
+                      onClick={() => setInspected(item)}
+                      title="Inspeccionar detalles"
+                      aria-label={`Inspeccionar ${item.name}`}
+                    >
+                      <MoreHorizontal size={14} />
+                    </Button>
                   </div>
                 </div>
-
-                <div className="mono" style={{ textAlign: "right", fontWeight: 600 }}>
-                  {formatBytes(item.allocatedBytes)}
-                </div>
-
-                <div style={{ textAlign: "right", color: "var(--text-secondary)", fontSize: 12 }}>
-                  {formatUnixTs(item.lastWriteTs)}
-                </div>
-
-                <div style={{ display: "flex", justifyContent: "flex-end", gap: 6 }}>
-                  <button
-                    type="button"
-                    className="btn"
-                    style={{ padding: "4px 8px" }}
-                    onClick={() => onOpenExplorer(item.fullPath)}
-                    title="Abrir en Explorador"
-                  >
-                    <FolderOpen size={13} />
-                  </button>
-                  {!item.isProtected && (
-                    <button
-                      type="button"
-                      className="btn"
-                      style={{ padding: "4px 8px" }}
-                      onClick={() => onProtectPath(item)}
-                      title="Proteger esta ruta"
-                    >
-                      <ShieldPlus size={13} color="#38bdf8" />
-                    </button>
-                  )}
-                  <button
-                    type="button"
-                    className="btn btn-danger"
-                    style={{
-                      padding: "4px 8px",
-                      opacity: item.isProtected ? 0.45 : 1,
-                      cursor: item.isProtected ? "not-allowed" : "pointer",
-                    }}
-                    disabled={item.isProtected}
-                    onClick={() => {
-                      if (!item.isProtected) onSendToCleanup(item);
-                    }}
-                    title={
-                      item.isProtected
-                        ? (item.protectionReason ?? "Ruta protegida por lista negra")
-                        : "Enviar a Limpieza (Dry-run)"
-                    }
-                  >
-                    {item.isProtected ? <Lock size={13} /> : <Trash2 size={13} />}
-                  </button>
-                </div>
-              </div>
-            );
-          })}
+              );
+            })}
+          </div>
         </div>
       </div>
+
+      {inspected && (
+        <DetailDrawer
+          title={inspected.name}
+          subtitle={kind === "dirs" ? "Carpeta en disco" : "Archivo en disco"}
+          badge={
+            inspected.isProtected ? (
+              <Badge tone="warning">
+                <Lock size={10} />
+                Protegida
+              </Badge>
+            ) : undefined
+          }
+          onClose={() => setInspected(null)}
+          footer={
+            <>
+              <Button onClick={() => onOpenExplorer(inspected.fullPath)}>
+                <FolderOpen size={13} />
+                Explorador
+              </Button>
+              {!inspected.isProtected && (
+                <Button
+                  onClick={() => {
+                    onProtectPath(inspected);
+                    setInspected(null);
+                  }}
+                >
+                  <ShieldPlus size={13} className="text-accent" />
+                  Proteger
+                </Button>
+              )}
+              <Button
+                variant="danger"
+                disabled={inspected.isProtected}
+                onClick={() => {
+                  if (!inspected.isProtected) {
+                    onSendToCleanup(inspected);
+                    setInspected(null);
+                  }
+                }}
+              >
+                <Trash2 size={13} />
+                Limpiar
+              </Button>
+            </>
+          }
+        >
+          <DetailField label="Tamaño asignado en disco">
+            <span className="mono text-[18px] font-semibold text-accent">
+              {formatBytes(inspected.allocatedBytes)}
+            </span>
+          </DetailField>
+          <DetailField label="Ruta completa">
+            <div className="p-2.5 rounded-[8px] bg-canvas border border-border-default mono text-[12px] break-all">
+              {inspected.fullPath}
+            </div>
+          </DetailField>
+          <DetailField label="Última modificación">
+            <span className="tabular">{formatUnixTs(inspected.lastWriteTs)}</span>
+          </DetailField>
+          <DetailField label="Categoría de origen">
+            <Badge>{inspected.originCat}</Badge>
+          </DetailField>
+          {inspected.isProtected && (
+            <DetailField label="Motivo de protección">
+              <span className="text-warning-text">
+                {inspected.protectionReason ?? "En lista negra"}
+              </span>
+            </DetailField>
+          )}
+        </DetailDrawer>
+      )}
     </div>
   );
 }

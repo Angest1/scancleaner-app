@@ -1,5 +1,10 @@
-import { AlertTriangle, Lock, RefreshCw, ShieldCheck, Trash2 } from "lucide-react";
+import { ChevronDown, Lock, RefreshCw, ShieldCheck, Sparkles, Trash2 } from "lucide-react";
 import { useCallback, useEffect, useMemo, useState } from "react";
+import { Button } from "../components/ui/Button";
+import { Card } from "../components/ui/Card";
+import { Collapse } from "../components/ui/Collapse";
+import { AlertBanner, EmptyState, Skeleton } from "../components/ui/Feedback";
+import { PathDisplay } from "../components/ui/PathDisplay";
 import { formatBytes, formatUnixTs } from "../lib/format";
 import {
   type CleanCandidate,
@@ -29,8 +34,18 @@ export function CleanerView({ isElevated, onRelaunchAdmin, onStartPreview }: Cle
   const [report, setReport] = useState<CleanupCandidatesReport | null>(null);
   const [loading, setLoading] = useState(false);
   const [selectedIds, setSelectedIds] = useState<Set<string>>(new Set());
+  const [collapsedCats, setCollapsedCats] = useState<Set<CleanCategory>>(new Set());
   const [minLargeMb, setMinLargeMb] = useState(100);
   const [minAgeDays, setMinAgeDays] = useState(30);
+
+  const toggleCategory = (cat: CleanCategory) => {
+    setCollapsedCats((prev) => {
+      const next = new Set(prev);
+      if (next.has(cat)) next.delete(cat);
+      else next.add(cat);
+      return next;
+    });
+  };
 
   const loadCandidates = useCallback(() => {
     setLoading(true);
@@ -87,216 +102,194 @@ export function CleanerView({ isElevated, onRelaunchAdmin, onStartPreview }: Cle
   };
 
   return (
-    <div style={{ display: "flex", flexDirection: "column", gap: 16 }}>
-      <div
-        style={{
-          display: "flex",
-          justifyContent: "space-between",
-          alignItems: "center",
-          flexWrap: "wrap",
-          gap: 12,
-        }}
-      >
+    <div className="flex flex-col gap-4">
+      <div className="flex items-start justify-between flex-wrap gap-3">
         <div>
-          <h2 style={{ margin: 0, fontSize: 20 }}>Limpieza segura</h2>
-          <p style={{ margin: "4px 0 0", color: "var(--text-secondary)", fontSize: 13 }}>
+          <h1 className="m-0 text-[18px] font-semibold tracking-[-0.02em] text-fg-primary">
+            Limpieza segura
+          </h1>
+          <p className="m-0 mt-1 text-[13px] text-fg-secondary">
             Todo pasa por vista previa (Dry-run), lista negra de rutas protegidas y Papelera por
             defecto.
           </p>
         </div>
 
-        <div style={{ display: "flex", gap: 8, alignItems: "center", flexWrap: "wrap" }}>
-          <label style={{ fontSize: 12.5, display: "flex", alignItems: "center", gap: 6 }}>
-            Mín. MB:
+        <div className="flex items-center gap-2 flex-wrap">
+          <label className="text-[12px] text-fg-secondary flex items-center gap-1.5">
+            Mín. MB
             <input
               type="number"
-              className="input"
-              style={{ width: 78 }}
+              className="w-[72px] h-8 px-2 rounded-[7px] bg-canvas border border-border-default mono text-[12px] text-fg-primary focus:border-accent focus:outline-none"
               min={10}
               value={minLargeMb}
               onChange={(e) => setMinLargeMb(Math.max(10, Number(e.target.value) || 100))}
             />
           </label>
-          <label style={{ fontSize: 12.5, display: "flex", alignItems: "center", gap: 6 }}>
-            Antigüedad (días):
+          <label className="text-[12px] text-fg-secondary flex items-center gap-1.5">
+            Días
             <input
               type="number"
-              className="input"
-              style={{ width: 72 }}
+              className="w-[64px] h-8 px-2 rounded-[7px] bg-canvas border border-border-default mono text-[12px] text-fg-primary focus:border-accent focus:outline-none"
               min={1}
               value={minAgeDays}
               onChange={(e) => setMinAgeDays(Math.max(1, Number(e.target.value) || 30))}
             />
           </label>
-          <button type="button" className="btn" onClick={loadCandidates} disabled={loading}>
-            <RefreshCw size={14} />
+          <Button onClick={loadCandidates} disabled={loading}>
+            <RefreshCw size={13} className={loading ? "animate-spin" : ""} />
             {loading ? "Analizando..." : "Reanalizar"}
-          </button>
-          <button
-            type="button"
-            className="btn btn-primary"
+          </Button>
+          <Button
+            variant="primary"
             disabled={selectedCandidates.length === 0}
             onClick={handlePreview}
           >
-            <ShieldCheck size={14} />
+            <ShieldCheck size={13} />
             Previsualizar ({selectedCandidates.length} · {formatBytes(selectedBytes)})
-          </button>
+          </Button>
         </div>
       </div>
 
       {report && report.runningBrowsers.length > 0 && (
-        <div
-          className="card"
-          style={{
-            borderColor: "rgba(245, 158, 11, 0.5)",
-            background: "rgba(245, 158, 11, 0.08)",
-            display: "flex",
-            alignItems: "center",
-            gap: 10,
-            fontSize: 13,
-          }}
-        >
-          <AlertTriangle size={18} color="#f59e0b" />
-          <span>
-            Navegadores en ejecución: <strong>{report.runningBrowsers.join(", ")}</strong>. Cierra
-            el navegador antes de limpiar su caché para evitar bloqueos de archivo.
-          </span>
-        </div>
+        <AlertBanner tone="warning">
+          Navegadores en ejecución: <strong>{report.runningBrowsers.join(", ")}</strong>. Cierra el
+          navegador antes de limpiar su caché para evitar bloqueos de archivo.
+        </AlertBanner>
       )}
 
       {/* Recycle Bin summary card */}
-      <div
-        className="card"
-        style={{
-          display: "flex",
-          justifyContent: "space-between",
-          alignItems: "center",
-          flexWrap: "wrap",
-          gap: 12,
-        }}
-      >
+      <Card className="flex items-center justify-between flex-wrap gap-3">
         <div>
-          <div style={{ fontWeight: 700, fontSize: 15 }}>Papelera de reciclaje</div>
-          <div style={{ fontSize: 13, color: "var(--text-secondary)", marginTop: 2 }}>
+          <div className="font-semibold text-[14px] text-fg-primary">Papelera de reciclaje</div>
+          <div className="text-[12.5px] text-fg-secondary mt-0.5 tabular">
             {report
               ? `${report.recycleBinItems.toLocaleString()} elementos · ${formatBytes(report.recycleBinBytes)}`
               : "Consultando Papelera..."}
           </div>
         </div>
-        <button
-          type="button"
-          className="btn btn-danger"
+        <Button
+          variant="danger"
+          size="sm"
           disabled={!report || report.recycleBinItems === 0}
           onClick={() => onStartPreview([], "empty_recycle_bin")}
         >
-          <Trash2 size={14} />
+          <Trash2 size={13} />
           Vaciar Papelera
-        </button>
-      </div>
+        </Button>
+      </Card>
 
-      {Array.from(grouped.entries()).map(([cat, items]) => (
-        <div
-          key={cat}
-          className="card"
-          style={{ display: "flex", flexDirection: "column", gap: 10 }}
-        >
-          <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center" }}>
-            <h3 style={{ margin: 0, fontSize: 15 }}>{CATEGORY_TITLES[cat]}</h3>
-            <span className="mono" style={{ fontSize: 12.5, color: "var(--accent)" }}>
-              {formatBytes(items.reduce((a, b) => a + b.sizeBytes, 0))}
-            </span>
-          </div>
-
-          <div style={{ display: "flex", flexDirection: "column", gap: 6 }}>
-            {items.map((item) => {
-              const locked = item.requiresAdmin && !isElevated;
-              const checked = selectedIds.has(item.id);
-              return (
-                <div
-                  key={item.id}
-                  style={{
-                    display: "flex",
-                    alignItems: "center",
-                    justifyContent: "space-between",
-                    gap: 12,
-                    padding: "9px 12px",
-                    borderRadius: 8,
-                    background: "#0f172a",
-                    border: checked
-                      ? "1px solid rgba(56, 189, 248, 0.55)"
-                      : "1px solid var(--border)",
-                    opacity: locked ? 0.72 : 1,
-                  }}
-                >
-                  <label
-                    style={{
-                      display: "flex",
-                      alignItems: "flex-start",
-                      gap: 10,
-                      cursor: locked ? "not-allowed" : "pointer",
-                      flex: 1,
-                      overflow: "hidden",
-                    }}
-                  >
-                    <input
-                      type="checkbox"
-                      checked={checked}
-                      disabled={locked}
-                      onChange={() => toggleItem(item)}
-                      style={{ marginTop: 3 }}
-                    />
-                    <div style={{ overflow: "hidden" }}>
-                      <div style={{ fontWeight: 600, fontSize: 13.5 }}>{item.displayName}</div>
-                      <div
-                        className="mono"
-                        style={{
-                          fontSize: 11.5,
-                          color: "var(--text-muted)",
-                          overflow: "hidden",
-                          textOverflow: "ellipsis",
-                          whiteSpace: "nowrap",
-                        }}
-                      >
-                        {item.path}
-                      </div>
-                      {item.warning && (
-                        <div style={{ fontSize: 11.5, color: "#fcd34d", marginTop: 3 }}>
-                          {item.warning}
-                        </div>
-                      )}
-                    </div>
-                  </label>
-
-                  <div style={{ display: "flex", alignItems: "center", gap: 10, flexShrink: 0 }}>
-                    {item.lastModifiedTs > 0 && (
-                      <span style={{ fontSize: 11.5, color: "var(--text-muted)" }}>
-                        {formatUnixTs(item.lastModifiedTs)}
-                      </span>
-                    )}
-                    <span
-                      className="mono"
-                      style={{ fontWeight: 600, minWidth: 85, textAlign: "right" }}
-                    >
-                      {formatBytes(item.sizeBytes)}
-                    </span>
-                    {locked && (
-                      <button
-                        type="button"
-                        className="btn btn-warning"
-                        style={{ padding: "4px 8px" }}
-                        onClick={onRelaunchAdmin}
-                      >
-                        <Lock size={13} />
-                        Admin
-                      </button>
-                    )}
-                  </div>
+      {loading && !report ? (
+        <Card className="flex flex-col gap-2.5">
+          {[0, 1, 2, 3].map((i) => (
+            <Skeleton key={i} className="h-12 w-full" />
+          ))}
+        </Card>
+      ) : grouped.size === 0 ? (
+        <EmptyState
+          icon={<Sparkles size={18} />}
+          title="Sin elementos pendientes"
+          description="No se encontraron temporales ni archivos grandes que coincidan con los umbrales actuales."
+        />
+      ) : (
+        Array.from(grouped.entries()).map(([cat, items], idx) => {
+          const isOpen = !collapsedCats.has(cat);
+          return (
+            <Card
+              key={cat}
+              style={{ animationDelay: `${Math.min(idx, 6) * 40}ms` }}
+              className="flex flex-col animate-fade-up"
+            >
+              <button
+                type="button"
+                aria-expanded={isOpen}
+                onClick={() => toggleCategory(cat)}
+                className="w-full flex items-center justify-between gap-2 bg-transparent border-0 p-0 cursor-pointer text-left group"
+              >
+                <div className="flex items-center gap-2">
+                  <ChevronDown
+                    size={15}
+                    className={`text-fg-muted transition-transform duration-200 ease-out ${
+                      isOpen ? "rotate-0" : "-rotate-90"
+                    }`}
+                  />
+                  <h2 className="m-0 text-[14px] font-semibold text-fg-primary group-hover:text-accent transition-colors">
+                    {CATEGORY_TITLES[cat]}
+                  </h2>
+                  <span className="mono text-[11.5px] text-fg-muted">({items.length})</span>
                 </div>
-              );
-            })}
-          </div>
-        </div>
-      ))}
+                <span className="mono text-[12px] font-medium text-accent">
+                  {formatBytes(items.reduce((a, b) => a + b.sizeBytes, 0))}
+                </span>
+              </button>
+
+              <Collapse open={isOpen}>
+                <div className="flex flex-col gap-1.5 pt-3">
+                  {items.map((item) => {
+                    const locked = item.requiresAdmin && !isElevated;
+                    const checked = selectedIds.has(item.id);
+                    return (
+                      <div
+                        key={item.id}
+                        className={`flex items-center justify-between gap-3 px-3 py-2.5 rounded-[8px] bg-canvas border transition-colors duration-140 ${
+                          checked
+                            ? "border-accent-border bg-accent-soft/30"
+                            : "border-border-subtle"
+                        } ${locked ? "opacity-65" : ""}`}
+                      >
+                        <label
+                          className={`flex items-start gap-2.5 flex-1 min-w-0 ${
+                            locked ? "cursor-not-allowed" : "cursor-pointer"
+                          }`}
+                        >
+                          <input
+                            type="checkbox"
+                            className="mt-0.5 accent-accent shrink-0"
+                            checked={checked}
+                            disabled={locked}
+                            onChange={() => toggleItem(item)}
+                          />
+                          <div className="min-w-0 flex-1">
+                            <div className="font-medium text-[13px] text-fg-primary truncate">
+                              {item.displayName}
+                            </div>
+                            <PathDisplay
+                              path={item.path}
+                              maxChars={58}
+                              className="text-[11.5px] text-fg-muted"
+                            />
+                            {item.warning && (
+                              <div className="text-[11.5px] text-warning-text mt-0.5">
+                                {item.warning}
+                              </div>
+                            )}
+                          </div>
+                        </label>
+
+                        <div className="flex items-center gap-2.5 shrink-0">
+                          {item.lastModifiedTs > 0 && (
+                            <span className="hidden sm:inline text-[11.5px] text-fg-muted tabular">
+                              {formatUnixTs(item.lastModifiedTs)}
+                            </span>
+                          )}
+                          <span className="mono font-medium text-[12.5px] text-fg-primary min-w-[78px] text-right">
+                            {formatBytes(item.sizeBytes)}
+                          </span>
+                          {locked && (
+                            <Button variant="warning" size="sm" onClick={onRelaunchAdmin}>
+                              <Lock size={12} />
+                              Admin
+                            </Button>
+                          )}
+                        </div>
+                      </div>
+                    );
+                  })}
+                </div>
+              </Collapse>
+            </Card>
+          );
+        })
+      )}
     </div>
   );
 }

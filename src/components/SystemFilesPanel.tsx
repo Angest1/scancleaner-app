@@ -10,6 +10,11 @@ import {
 import { useCallback, useEffect, useState } from "react";
 import { formatBytes } from "../lib/format";
 import { type PowercfgAction, type SystemFileEntry, type SystemFilesReport, api } from "../lib/ipc";
+import { Badge } from "./ui/Badge";
+import { Button } from "./ui/Button";
+import { Collapse } from "./ui/Collapse";
+import { AlertBanner, Skeleton } from "./ui/Feedback";
+import { Modal } from "./ui/Modal";
 
 interface SystemFilesPanelProps {
   driveRoot: string | null;
@@ -76,10 +81,6 @@ export function SystemFilesPanel({ driveRoot }: SystemFilesPanelProps) {
       .catch((err) => alert(String(err)));
   };
 
-  const handleOpenPowerOptions = () => {
-    api.openPowerOptions().catch((err) => alert(String(err)));
-  };
-
   const handleRunPowercfg = () => {
     if (!confirmAction) return;
     api
@@ -94,247 +95,157 @@ export function SystemFilesPanel({ driveRoot }: SystemFilesPanelProps) {
 
   if (!report) {
     return (
-      <div style={{ padding: 20, color: "var(--text-muted)" }}>
-        Consultando archivos de sistema...
+      <div className="flex flex-col gap-2.5 py-2">
+        <Skeleton className="h-5 w-48" />
+        <Skeleton className="h-20 w-full" />
+        <Skeleton className="h-20 w-full" />
       </div>
     );
   }
 
   return (
-    <div style={{ display: "flex", flexDirection: "column", gap: 12 }}>
-      <div
-        style={{
-          display: "flex",
-          justifyContent: "space-between",
-          alignItems: "center",
-          flexWrap: "wrap",
-          gap: 8,
-        }}
-      >
-        <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
-          <Lock size={16} color="#f59e0b" />
-          <span style={{ fontWeight: 700, fontSize: 15 }}>Sistema (no eliminable)</span>
-          <span className="badge badge-warning">Protegido</span>
+    <div className="flex flex-col gap-3">
+      <div className="flex items-center justify-between flex-wrap gap-2">
+        <div className="flex items-center gap-2">
+          <Lock size={15} className="text-warning" />
+          <span className="font-semibold text-[14px] text-fg-primary">Sistema (no eliminable)</span>
+          <Badge tone="warning">Protegido</Badge>
         </div>
-        <span className="mono" style={{ fontSize: 13, color: "var(--accent)", fontWeight: 600 }}>
+        <span className="mono text-[12.5px] font-semibold text-accent">
           Total: {formatBytes(report.totalBytes)}
         </span>
       </div>
 
-      {feedback && (
-        <div
-          className="card"
-          style={{
-            padding: "8px 12px",
-            borderColor: "rgba(56, 189, 248, 0.45)",
-            background: "rgba(56, 189, 248, 0.08)",
-            fontSize: 12.5,
-          }}
-        >
-          {feedback}
-        </div>
-      )}
+      {feedback && <AlertBanner tone="info">{feedback}</AlertBanner>}
 
       {report.files.length === 0 ? (
-        <div style={{ padding: 16, color: "var(--text-muted)", fontSize: 13 }}>
+        <div className="py-4 text-[12.5px] text-fg-muted">
           No se detectaron <code>pagefile.sys</code>, <code>swapfile.sys</code> ni{" "}
           <code>hiberfil.sys</code> en esta unidad.
         </div>
       ) : (
-        <div style={{ display: "flex", flexDirection: "column", gap: 10 }}>
+        <div className="flex flex-col gap-2.5">
           {report.files.map((file: SystemFileEntry) => {
             const isExpanded = expandedId === file.id;
             return (
               <div
                 key={file.id}
-                style={{
-                  background: "#0f172a",
-                  border: "1px solid var(--border)",
-                  borderRadius: 8,
-                  padding: "12px 14px",
-                  display: "flex",
-                  flexDirection: "column",
-                  gap: 10,
-                }}
+                className="rounded-[8px] bg-canvas border border-border-default px-3.5 py-3 flex flex-col gap-2.5"
               >
-                <div
-                  style={{
-                    display: "flex",
-                    justifyContent: "space-between",
-                    alignItems: "flex-start",
-                    gap: 12,
-                    flexWrap: "wrap",
-                  }}
-                >
-                  <div style={{ flex: 1, minWidth: 240 }}>
-                    <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
-                      <Lock size={14} color="#f59e0b" />
-                      <span className="mono" style={{ fontWeight: 700, fontSize: 14 }}>
+                <div className="flex items-start justify-between flex-wrap gap-3">
+                  <div className="flex-1 min-w-[240px]">
+                    <div className="flex items-center gap-2 flex-wrap">
+                      <Lock size={13} className="text-warning shrink-0" />
+                      <span className="mono font-semibold text-[13.5px] text-fg-primary">
                         {file.name}
                       </span>
-                      <span className="mono" style={{ fontSize: 11.5, color: "var(--text-muted)" }}>
-                        {file.path}
-                      </span>
+                      <span className="mono text-[11.5px] text-fg-muted">{file.path}</span>
                     </div>
-                    <p
-                      style={{
-                        margin: "6px 0 0",
-                        fontSize: 12.5,
-                        color: "var(--text-secondary)",
-                        lineHeight: 1.45,
-                      }}
-                    >
+                    <p className="m-0 mt-1.5 text-[12.5px] text-fg-secondary leading-relaxed">
                       {file.explanation}
                     </p>
                   </div>
 
-                  <div style={{ display: "flex", alignItems: "center", gap: 10 }}>
-                    <span className="mono" style={{ fontWeight: 700, fontSize: 14 }}>
+                  <div className="flex items-center gap-2.5 shrink-0">
+                    <span className="mono font-semibold text-[13.5px] text-fg-primary">
                       {formatBytes(file.sizeBytes)}
                     </span>
                     {file.canAdjust ? (
-                      <button
-                        type="button"
-                        className="btn btn-primary"
+                      <Button
+                        variant={isExpanded ? "default" : "primary"}
+                        size="sm"
                         onClick={() => setExpandedId(isExpanded ? null : file.id)}
                       >
                         <SlidersHorizontal size={13} />
                         {isExpanded ? "Ocultar" : "Ajustar"}
-                      </button>
+                      </Button>
                     ) : (
-                      <span
-                        className="badge"
-                        title="Administrado exclusivamente por Windows; no requiere ni admite ajuste manual."
-                      >
-                        <Lock size={11} style={{ marginRight: 4 }} />
+                      <Badge title="Administrado exclusivamente por Windows; no requiere ni admite ajuste manual.">
+                        <Lock size={10} />
                         Solo Windows
-                      </span>
+                      </Badge>
                     )}
                   </div>
                 </div>
 
-                {isExpanded && file.adjustKind === "pagefile" && (
-                  <div
-                    style={{
-                      borderTop: "1px solid var(--border)",
-                      paddingTop: 10,
-                      display: "flex",
-                      flexDirection: "column",
-                      gap: 8,
-                    }}
-                  >
-                    <div
-                      style={{ display: "flex", alignItems: "center", gap: 10, flexWrap: "wrap" }}
-                    >
-                      <button
-                        type="button"
-                        className="btn btn-primary"
-                        onClick={handleOpenVirtualMemory}
-                      >
+                {file.adjustKind === "pagefile" && (
+                  <Collapse open={isExpanded}>
+                    <div className="border-t border-border-subtle pt-2.5 flex items-center gap-3 flex-wrap">
+                      <Button variant="primary" size="sm" onClick={handleOpenVirtualMemory}>
                         <ExternalLink size={13} />
                         Abrir memoria virtual
-                      </button>
-                      <span style={{ fontSize: 12.5, color: "#93c5fd" }}>
+                      </Button>
+                      <span className="text-[12px] text-accent">
                         {report.virtualMemoryInstruction}
                       </span>
                     </div>
-                  </div>
+                  </Collapse>
                 )}
 
-                {isExpanded && file.adjustKind === "hiberfil" && (
-                  <div
-                    style={{
-                      borderTop: "1px solid var(--border)",
-                      paddingTop: 10,
-                      display: "flex",
-                      flexDirection: "column",
-                      gap: 10,
-                    }}
-                  >
-                    {report.hibernation.available && (
-                      <div style={{ fontSize: 12.5 }}>
-                        <strong>Estado actual de hibernación:</strong>{" "}
-                        <span style={{ color: "#38bdf8" }}>{report.hibernation.label}</span>
-                        {report.hibernation.detail && (
-                          <span style={{ color: "var(--text-muted)", marginLeft: 6 }}>
-                            ({report.hibernation.detail})
+                {file.adjustKind === "hiberfil" && (
+                  <Collapse open={isExpanded}>
+                    <div className="border-t border-border-subtle pt-2.5 flex flex-col gap-2.5">
+                      {report.hibernation.available && (
+                        <div className="text-[12.5px]">
+                          <span className="font-medium text-fg-secondary">
+                            Estado de hibernación:{" "}
                           </span>
-                        )}
-                      </div>
-                    )}
-
-                    <div style={{ display: "flex", flexDirection: "column", gap: 8 }}>
-                      {POWERCFG_COMMANDS.map((item) => (
-                        <div
-                          key={item.action}
-                          style={{
-                            background: "#020617",
-                            border: "1px solid var(--border)",
-                            borderRadius: 6,
-                            padding: "8px 10px",
-                            display: "flex",
-                            justifyContent: "space-between",
-                            alignItems: "center",
-                            gap: 10,
-                            flexWrap: "wrap",
-                          }}
-                        >
-                          <div style={{ flex: 1, minWidth: 220 }}>
-                            <div
-                              className="mono"
-                              style={{
-                                fontSize: 12.5,
-                                color: "#38bdf8",
-                                display: "flex",
-                                alignItems: "center",
-                                gap: 6,
-                              }}
-                            >
-                              <Terminal size={12} />
-                              {item.cmd}
-                            </div>
-                            <div
-                              style={{
-                                fontSize: 11.5,
-                                color: "var(--text-secondary)",
-                                marginTop: 2,
-                              }}
-                            >
-                              {item.desc}
-                            </div>
-                          </div>
-                          <div style={{ display: "flex", gap: 6 }}>
-                            <button
-                              type="button"
-                              className="btn"
-                              style={{ padding: "4px 8px" }}
-                              onClick={() => handleCopy(item.cmd)}
-                            >
-                              {copiedCmd === item.cmd ? <Check size={12} /> : <Copy size={12} />}
-                              {copiedCmd === item.cmd ? "Copiado" : "Copiar"}
-                            </button>
-                            <button
-                              type="button"
-                              className="btn btn-warning"
-                              style={{ padding: "4px 8px" }}
-                              onClick={() =>
-                                setConfirmAction({ action: item.action, cmd: item.cmd })
-                              }
-                            >
-                              Ejecutar como administrador
-                            </button>
-                          </div>
+                          <span className="text-accent font-medium">
+                            {report.hibernation.label}
+                          </span>
+                          {report.hibernation.detail && (
+                            <span className="text-fg-muted ml-1.5">
+                              ({report.hibernation.detail})
+                            </span>
+                          )}
                         </div>
-                      ))}
-                    </div>
+                      )}
 
-                    <div>
-                      <button type="button" className="btn" onClick={handleOpenPowerOptions}>
-                        <ExternalLink size={13} />
-                        Abrir opciones de energía
-                      </button>
+                      <div className="flex flex-col gap-2">
+                        {POWERCFG_COMMANDS.map((item) => (
+                          <div
+                            key={item.action}
+                            className="rounded-[7px] bg-shell border border-border-subtle px-3 py-2 flex items-center justify-between flex-wrap gap-2.5"
+                          >
+                            <div className="flex-1 min-w-[220px]">
+                              <div className="mono text-[12px] text-accent flex items-center gap-1.5">
+                                <Terminal size={12} />
+                                {item.cmd}
+                              </div>
+                              <div className="text-[11.5px] text-fg-secondary mt-0.5">
+                                {item.desc}
+                              </div>
+                            </div>
+                            <div className="flex gap-1.5">
+                              <Button size="sm" onClick={() => handleCopy(item.cmd)}>
+                                {copiedCmd === item.cmd ? <Check size={12} /> : <Copy size={12} />}
+                                {copiedCmd === item.cmd ? "Copiado" : "Copiar"}
+                              </Button>
+                              <Button
+                                variant="warning"
+                                size="sm"
+                                onClick={() =>
+                                  setConfirmAction({ action: item.action, cmd: item.cmd })
+                                }
+                              >
+                                Ejecutar como admin
+                              </Button>
+                            </div>
+                          </div>
+                        ))}
+                      </div>
+
+                      <div>
+                        <Button
+                          size="sm"
+                          onClick={() => api.openPowerOptions().catch((err) => alert(String(err)))}
+                        >
+                          <ExternalLink size={13} />
+                          Abrir opciones de energía
+                        </Button>
+                      </div>
                     </div>
-                  </div>
+                  </Collapse>
                 )}
               </div>
             );
@@ -343,54 +254,31 @@ export function SystemFilesPanel({ driveRoot }: SystemFilesPanelProps) {
       )}
 
       {confirmAction && (
-        <div className="modal-backdrop">
-          <div className="modal-panel" style={{ maxWidth: 480 }}>
-            <div
-              style={{
-                padding: "14px 18px",
-                borderBottom: "1px solid var(--border)",
-                fontWeight: 700,
-                display: "flex",
-                alignItems: "center",
-                gap: 8,
-              }}
-            >
-              <ShieldAlert size={18} color="#f59e0b" />
+        <Modal
+          title={
+            <span className="inline-flex items-center gap-2">
+              <ShieldAlert size={16} className="text-warning" />
               Confirmar ejecución elevada
-            </div>
-            <div style={{ padding: 18, fontSize: 13, lineHeight: 1.5 }}>
-              Se solicitará elevación UAC de Windows para ejecutar:
-              <div
-                className="mono"
-                style={{
-                  marginTop: 10,
-                  padding: "8px 10px",
-                  background: "#0f172a",
-                  borderRadius: 6,
-                  color: "#38bdf8",
-                }}
-              >
-                {confirmAction.cmd}
-              </div>
-            </div>
-            <div
-              style={{
-                padding: "12px 18px",
-                borderTop: "1px solid var(--border)",
-                display: "flex",
-                justifyContent: "flex-end",
-                gap: 8,
-              }}
-            >
-              <button type="button" className="btn" onClick={() => setConfirmAction(null)}>
-                Cancelar
-              </button>
-              <button type="button" className="btn btn-warning" onClick={handleRunPowercfg}>
+            </span>
+          }
+          maxWidthClass="max-w-[480px]"
+          onClose={() => setConfirmAction(null)}
+          footer={
+            <>
+              <Button onClick={() => setConfirmAction(null)}>Cancelar</Button>
+              <Button variant="warning" onClick={handleRunPowercfg}>
                 Confirmar y ejecutar
-              </button>
-            </div>
+              </Button>
+            </>
+          }
+        >
+          <p className="m-0 text-[13px] text-fg-secondary">
+            Se solicitará elevación UAC de Windows para ejecutar:
+          </p>
+          <div className="mono px-3 py-2 rounded-[7px] bg-canvas border border-border-default text-accent text-[12.5px]">
+            {confirmAction.cmd}
           </div>
-        </div>
+        </Modal>
       )}
     </div>
   );

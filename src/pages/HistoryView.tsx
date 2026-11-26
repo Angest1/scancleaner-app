@@ -1,7 +1,19 @@
 import { Bug, FolderOpen, GitCompare, History, RefreshCw, ScrollText } from "lucide-react";
-import { useCallback, useEffect, useState } from "react";
+import { useCallback, useEffect, useMemo, useState } from "react";
+import { CleanupLogsTable } from "../components/history/CleanupLogsTable";
+import { Button } from "../components/ui/Button";
+import { Card } from "../components/ui/Card";
+import { SegmentedControl } from "../components/ui/SegmentedControl";
+import {
+  DensityToggle,
+  type SortDir,
+  SortHeaderButton,
+  type TableDensity,
+} from "../components/ui/TableToolbar";
 import { formatBytes, formatDurationMs, formatSignedBytes } from "../lib/format";
 import { type CleanupLogEntry, type ScanSnapshot, type SnapshotDiff, api } from "../lib/ipc";
+
+type SnapSortKey = "date" | "bytes" | "files";
 
 export function HistoryView() {
   const [tab, setTab] = useState<"snapshots" | "logs" | "diagnostics">("snapshots");
@@ -11,6 +23,11 @@ export function HistoryView() {
   const [olderId, setOlderId] = useState<number | null>(null);
   const [newerId, setNewerId] = useState<number | null>(null);
   const [diff, setDiff] = useState<SnapshotDiff | null>(null);
+  const [density, setDensity] = useState<TableDensity>("comfortable");
+  const [snapSort, setSnapSort] = useState<{ key: SnapSortKey; dir: SortDir }>({
+    key: "date",
+    dir: "desc",
+  });
 
   const refreshLogs = useCallback(() => {
     api.listCleanupLogs(200).then(setLogs);
@@ -28,6 +45,22 @@ export function HistoryView() {
     refreshLogs();
   }, [refreshLogs]);
 
+  const sortedSnapshots = useMemo(() => {
+    const mult = snapSort.dir === "asc" ? 1 : -1;
+    return [...snapshots].sort((a, b) => {
+      if (snapSort.key === "bytes")
+        return (a.scannedAllocatedBytes - b.scannedAllocatedBytes) * mult;
+      if (snapSort.key === "files") return (a.fileCount - b.fileCount) * mult;
+      return (new Date(a.scannedAt).getTime() - new Date(b.scannedAt).getTime()) * mult;
+    });
+  }, [snapshots, snapSort]);
+
+  const toggleSnapSort = (key: SnapSortKey) =>
+    setSnapSort((s) => ({
+      key,
+      dir: s.key === key ? (s.dir === "asc" ? "desc" : "asc") : "desc",
+    }));
+
   const handleCompare = () => {
     if (!olderId || !newerId || olderId === newerId) return;
     api
@@ -36,282 +69,237 @@ export function HistoryView() {
       .catch((e) => alert(String(e)));
   };
 
+  const rowPad = density === "compact" ? "py-1.5" : "py-2.5";
+
   return (
-    <div style={{ display: "flex", flexDirection: "column", gap: 16 }}>
-      <div
-        style={{
-          display: "flex",
-          justifyContent: "space-between",
-          alignItems: "center",
-          flexWrap: "wrap",
-          gap: 12,
-        }}
-      >
+    <div className="flex flex-col gap-4">
+      <div className="flex items-start justify-between flex-wrap gap-3">
         <div>
-          <h2 style={{ margin: 0, fontSize: 20 }}>Historial y auditoría</h2>
-          <p style={{ margin: "4px 0 0", color: "var(--text-secondary)", fontSize: 13 }}>
+          <h1 className="m-0 text-[18px] font-semibold tracking-[-0.02em] text-fg-primary">
+            Historial y auditoría
+          </h1>
+          <p className="m-0 mt-1 text-[13px] text-fg-secondary text-pretty">
             Evolución de espacio entre escaneos (SQLite) y registro auditable de limpieza (JSONL).
           </p>
         </div>
 
-        <div style={{ display: "flex", gap: 8, flexWrap: "wrap" }}>
-          <button
-            type="button"
-            className={`btn ${tab === "snapshots" ? "btn-primary" : ""}`}
-            onClick={() => setTab("snapshots")}
-          >
-            <History size={14} />
-            Snapshots ({snapshots.length})
-          </button>
-          <button
-            type="button"
-            className={`btn ${tab === "logs" ? "btn-primary" : ""}`}
-            onClick={() => setTab("logs")}
-          >
-            <ScrollText size={14} />
-            Logs de limpieza ({logs.length})
-          </button>
-          <button
-            type="button"
-            className={`btn ${tab === "diagnostics" ? "btn-primary" : ""}`}
-            onClick={() => setTab("diagnostics")}
-          >
-            <Bug size={14} />
-            Diagnóstico / Crashes ({diagLogs.length})
-          </button>
-          <button
-            type="button"
-            className="btn"
+        <div className="flex items-center gap-2 flex-wrap">
+          <SegmentedControl
+            ariaLabel="Sección de historial"
+            value={tab}
+            onChange={setTab}
+            options={[
+              {
+                value: "snapshots",
+                label: "Snapshots",
+                icon: <History size={13} />,
+                count: snapshots.length,
+              },
+              {
+                value: "logs",
+                label: "Limpieza",
+                icon: <ScrollText size={13} />,
+                count: logs.length,
+              },
+              {
+                value: "diagnostics",
+                label: "Diagnóstico",
+                icon: <Bug size={13} />,
+                count: diagLogs.length,
+              },
+            ]}
+          />
+          {tab !== "diagnostics" && <DensityToggle density={density} onChange={setDensity} />}
+          <Button
             onClick={() => api.openLogsFolder().catch((e) => alert(String(e)))}
             title="Abrir %APPDATA%\ScanCleaner\logs"
           >
-            <FolderOpen size={14} />
+            <FolderOpen size={13} />
             Abrir carpeta
-          </button>
+          </Button>
         </div>
       </div>
 
-      {tab === "snapshots" ? (
-        <>
-          {snapshots.length >= 2 && (
-            <div
-              className="card"
-              style={{ display: "flex", alignItems: "center", gap: 10, flexWrap: "wrap" }}
-            >
-              <span style={{ fontWeight: 600 }}>Comparar snapshots:</span>
-              <select
-                className="select"
-                value={olderId ?? ""}
-                onChange={(e) => setOlderId(Number(e.target.value))}
-              >
-                {snapshots.map((s) => (
-                  <option key={s.id} value={s.id}>
-                    #{s.id} · {s.driveRoot} · {new Date(s.scannedAt).toLocaleString("es-ES")}
-                  </option>
-                ))}
-              </select>
-              <span>→</span>
-              <select
-                className="select"
-                value={newerId ?? ""}
-                onChange={(e) => setNewerId(Number(e.target.value))}
-              >
-                {snapshots.map((s) => (
-                  <option key={s.id} value={s.id}>
-                    #{s.id} · {s.driveRoot} · {new Date(s.scannedAt).toLocaleString("es-ES")}
-                  </option>
-                ))}
-              </select>
-              <button type="button" className="btn btn-primary" onClick={handleCompare}>
-                <GitCompare size={14} />
-                Calcular diferencia
-              </button>
-            </div>
-          )}
+      <div key={tab} className="flex flex-col gap-4 animate-view-in">
+        {tab === "snapshots" ? (
+          <>
+            {snapshots.length >= 2 && (
+              <Card className="flex items-center gap-2.5 flex-wrap py-3">
+                <span className="font-medium text-[12.5px] text-fg-primary">
+                  Comparar snapshots
+                </span>
+                <select
+                  aria-label="Snapshot anterior"
+                  className="h-8 px-2.5 rounded-[8px] bg-canvas border border-border-default text-[12px] text-fg-primary focus:border-accent focus:outline-none"
+                  value={olderId ?? ""}
+                  onChange={(e) => setOlderId(Number(e.target.value))}
+                >
+                  {snapshots.map((s) => (
+                    <option key={s.id} value={s.id}>
+                      #{s.id} · {s.driveRoot} · {new Date(s.scannedAt).toLocaleString("es-ES")}
+                    </option>
+                  ))}
+                </select>
+                <span className="text-fg-muted">→</span>
+                <select
+                  aria-label="Snapshot reciente"
+                  className="h-8 px-2.5 rounded-[8px] bg-canvas border border-border-default text-[12px] text-fg-primary focus:border-accent focus:outline-none"
+                  value={newerId ?? ""}
+                  onChange={(e) => setNewerId(Number(e.target.value))}
+                >
+                  {snapshots.map((s) => (
+                    <option key={s.id} value={s.id}>
+                      #{s.id} · {s.driveRoot} · {new Date(s.scannedAt).toLocaleString("es-ES")}
+                    </option>
+                  ))}
+                </select>
+                <Button variant="primary" size="sm" onClick={handleCompare}>
+                  <GitCompare size={13} />
+                  Calcular diferencia
+                </Button>
+              </Card>
+            )}
 
-          {diff && (
-            <div className="card" style={{ borderColor: "rgba(56, 189, 248, 0.5)" }}>
-              <div style={{ fontWeight: 700, marginBottom: 8 }}>
-                Variación en <span className="mono">{diff.driveRoot}</span>:{" "}
-                <span style={{ color: diff.allocatedDeltaBytes > 0 ? "#fca5a5" : "#86efac" }}>
-                  {formatSignedBytes(diff.allocatedDeltaBytes)}
-                </span>{" "}
-                ({diff.fileCountDelta >= 0 ? "+" : ""}
-                {diff.fileCountDelta.toLocaleString()} archivos)
-              </div>
-              <div style={{ display: "flex", flexDirection: "column", gap: 6 }}>
-                {diff.topDirDeltas.slice(0, 12).map((d) => (
-                  <div
-                    key={d.name}
-                    style={{
-                      display: "flex",
-                      justifyContent: "space-between",
-                      fontSize: 12.5,
-                      padding: "4px 8px",
-                      background: "#0f172a",
-                      borderRadius: 6,
-                    }}
-                  >
-                    <span className="mono">{d.name}</span>
-                    <span
-                      className="mono"
-                      style={{ color: d.deltaBytes > 0 ? "#fca5a5" : "#86efac" }}
+            {diff && (
+              <Card className="border-accent-border">
+                <div className="font-semibold text-[13.5px] text-fg-primary mb-2.5 tabular">
+                  Variación en <span className="mono">{diff.driveRoot}</span>:{" "}
+                  <span className={diff.allocatedDeltaBytes > 0 ? "text-danger" : "text-success"}>
+                    {formatSignedBytes(diff.allocatedDeltaBytes)}
+                  </span>{" "}
+                  <span className="text-fg-secondary font-normal">
+                    ({diff.fileCountDelta >= 0 ? "+" : ""}
+                    {diff.fileCountDelta.toLocaleString()} archivos)
+                  </span>
+                </div>
+                <div className="flex flex-col gap-1">
+                  {diff.topDirDeltas.slice(0, 12).map((d) => (
+                    <div
+                      key={d.name}
+                      className="flex items-center justify-between gap-2 text-[12px] px-2.5 py-1.5 rounded-[6px] bg-canvas border border-border-subtle"
                     >
-                      {formatSignedBytes(d.deltaBytes)}
-                    </span>
+                      <span className="mono text-fg-secondary truncate">{d.name}</span>
+                      <span
+                        className={`mono font-medium shrink-0 ${
+                          d.deltaBytes > 0 ? "text-danger" : "text-success"
+                        }`}
+                      >
+                        {formatSignedBytes(d.deltaBytes)}
+                      </span>
+                    </div>
+                  ))}
+                </div>
+              </Card>
+            )}
+
+            <Card padded={false} className="overflow-hidden">
+              <div className="max-h-[460px] overflow-y-auto overflow-x-hidden">
+                <div className="sticky top-0 z-10 grid grid-cols-[minmax(0,1fr)_105px] md:grid-cols-[64px_84px_minmax(0,1fr)_120px_100px_86px] items-center gap-2 px-3.5 py-2.5 border-b border-border-default bg-shell backdrop-blur-md text-[11.5px] font-medium text-fg-muted">
+                  <span className="hidden md:inline">ID</span>
+                  <span className="hidden md:inline">Unidad</span>
+                  <SortHeaderButton
+                    label="Fecha / Unidad"
+                    active={snapSort.key === "date"}
+                    dir={snapSort.dir}
+                    onClick={() => toggleSnapSort("date")}
+                  />
+                  <SortHeaderButton
+                    label="Escaneado"
+                    active={snapSort.key === "bytes"}
+                    dir={snapSort.dir}
+                    align="right"
+                    onClick={() => toggleSnapSort("bytes")}
+                  />
+                  <div className="hidden md:flex justify-end">
+                    <SortHeaderButton
+                      label="Archivos"
+                      active={snapSort.key === "files"}
+                      dir={snapSort.dir}
+                      align="right"
+                      onClick={() => toggleSnapSort("files")}
+                    />
+                  </div>
+                  <span className="hidden md:inline text-right">Duración</span>
+                </div>
+                {sortedSnapshots.length === 0 ? (
+                  <div className="py-10 text-center text-[12.5px] text-fg-muted">
+                    Aún no hay snapshots guardados. Completa un escaneo para registrar el primero.
+                  </div>
+                ) : (
+                  sortedSnapshots.map((s) => (
+                    <div
+                      key={s.id}
+                      className={`grid grid-cols-[minmax(0,1fr)_105px] md:grid-cols-[64px_84px_minmax(0,1fr)_120px_100px_86px] items-center gap-2 px-3.5 ${rowPad} border-b border-border-subtle text-[12.5px] hover:bg-elevated/55 transition-colors`}
+                    >
+                      <span className="hidden md:inline mono text-fg-muted">#{s.id}</span>
+                      <span className="hidden md:inline mono font-medium text-fg-primary">
+                        {s.driveRoot}
+                      </span>
+                      <div className="min-w-0">
+                        <div className="text-fg-primary md:text-fg-secondary tabular truncate">
+                          <span className="md:hidden mono font-semibold mr-1.5">{s.driveRoot}</span>
+                          {new Date(s.scannedAt).toLocaleString("es-ES")}
+                        </div>
+                        <div className="md:hidden text-[11px] text-fg-muted tabular">
+                          #{s.id} · {s.fileCount.toLocaleString()} archivos ·{" "}
+                          {formatDurationMs(s.durationMs)}
+                        </div>
+                      </div>
+                      <span className="mono text-right font-medium text-fg-primary">
+                        {formatBytes(s.scannedAllocatedBytes)}
+                      </span>
+                      <span className="hidden md:inline mono text-right text-fg-secondary">
+                        {s.fileCount.toLocaleString()}
+                      </span>
+                      <span className="hidden md:inline mono text-right text-fg-muted">
+                        {formatDurationMs(s.durationMs)}
+                      </span>
+                    </div>
+                  ))
+                )}
+              </div>
+            </Card>
+          </>
+        ) : tab === "logs" ? (
+          <CleanupLogsTable logs={logs} density={density} />
+        ) : (
+          <Card className="flex flex-col gap-3">
+            <div className="flex items-center justify-between flex-wrap gap-2">
+              <span className="text-[12.5px] text-fg-secondary">
+                Registra inicio, tiempos de escaneo, operaciones lentas (&gt;500 ms) y
+                panics/crashes con stacktrace en{" "}
+                <code className="text-fg-primary">%APPDATA%\ScanCleaner\logs\</code>.
+              </span>
+              <Button size="sm" onClick={refreshLogs}>
+                <RefreshCw size={12} />
+                Actualizar
+              </Button>
+            </div>
+            {diagLogs.length === 0 ? (
+              <div className="py-6 text-center text-[12.5px] text-fg-muted">
+                No hay registros de diagnóstico todavía.
+              </div>
+            ) : (
+              <div className="mono max-h-[420px] overflow-auto rounded-[8px] bg-canvas border border-border-subtle p-3 text-[11.5px] flex flex-col gap-1">
+                {diagLogs.map((line, idx) => (
+                  <div
+                    key={`${idx}-${line.slice(0, 24)}`}
+                    className={`whitespace-pre-wrap break-words ${
+                      line.includes("[CRASH]") || line.includes("[ERROR]")
+                        ? "text-danger-text"
+                        : line.includes("[WARN]")
+                          ? "text-warning-text"
+                          : "text-fg-secondary"
+                    }`}
+                  >
+                    {line}
                   </div>
                 ))}
               </div>
-            </div>
-          )}
-
-          <div className="card" style={{ padding: 0, overflow: "hidden" }}>
-            <div
-              className="table-header"
-              style={{ gridTemplateColumns: "80px 110px 1fr 140px 120px 100px" }}
-            >
-              <span>ID</span>
-              <span>Unidad</span>
-              <span>Fecha</span>
-              <span style={{ textAlign: "right" }}>Escaneado</span>
-              <span style={{ textAlign: "right" }}>Archivos</span>
-              <span style={{ textAlign: "right" }}>Duración</span>
-            </div>
-            {snapshots.length === 0 ? (
-              <div style={{ padding: 24, textAlign: "center", color: "var(--text-muted)" }}>
-                Aún no hay snapshots guardados. Completa un escaneo para registrar el primero.
-              </div>
-            ) : (
-              snapshots.map((s) => (
-                <div
-                  key={s.id}
-                  className="table-row"
-                  style={{ gridTemplateColumns: "80px 110px 1fr 140px 120px 100px" }}
-                >
-                  <span className="mono">#{s.id}</span>
-                  <span className="mono" style={{ fontWeight: 600 }}>
-                    {s.driveRoot}
-                  </span>
-                  <span>{new Date(s.scannedAt).toLocaleString("es-ES")}</span>
-                  <span className="mono" style={{ textAlign: "right" }}>
-                    {formatBytes(s.scannedAllocatedBytes)}
-                  </span>
-                  <span className="mono" style={{ textAlign: "right" }}>
-                    {s.fileCount.toLocaleString()}
-                  </span>
-                  <span style={{ textAlign: "right", color: "var(--text-secondary)" }}>
-                    {formatDurationMs(s.durationMs)}
-                  </span>
-                </div>
-              ))
             )}
-          </div>
-        </>
-      ) : tab === "logs" ? (
-        <div className="card" style={{ padding: 0, overflow: "hidden" }}>
-          <div
-            className="table-header"
-            style={{ gridTemplateColumns: "165px 1fr 110px 110px 110px" }}
-          >
-            <span>Fecha</span>
-            <span>Ruta</span>
-            <span>Modo</span>
-            <span style={{ textAlign: "right" }}>Bytes</span>
-            <span style={{ textAlign: "right" }}>Estado</span>
-          </div>
-          {logs.length === 0 ? (
-            <div style={{ padding: 24, textAlign: "center", color: "var(--text-muted)" }}>
-              No hay registros de limpieza todavía.
-            </div>
-          ) : (
-            logs.map((l, idx) => (
-              <div
-                key={`${l.planId}-${idx}`}
-                className="table-row"
-                style={{ gridTemplateColumns: "165px 1fr 110px 110px 110px" }}
-              >
-                <span style={{ fontSize: 12, color: "var(--text-secondary)" }}>
-                  {new Date(l.timestamp).toLocaleString("es-ES")}
-                </span>
-                <span
-                  className="mono"
-                  style={{
-                    fontSize: 12,
-                    overflow: "hidden",
-                    textOverflow: "ellipsis",
-                    whiteSpace: "nowrap",
-                  }}
-                  title={l.path}
-                >
-                  {l.path}
-                </span>
-                <span style={{ fontSize: 12 }}>{l.mode}</span>
-                <span className="mono" style={{ textAlign: "right" }}>
-                  {formatBytes(l.bytes)}
-                </span>
-                <div style={{ textAlign: "right" }}>
-                  <span
-                    className={`badge ${l.status === "failed" ? "badge-danger" : "badge-success"}`}
-                  >
-                    {l.status}
-                  </span>
-                </div>
-              </div>
-            ))
-          )}
-        </div>
-      ) : (
-        <div className="card" style={{ display: "flex", flexDirection: "column", gap: 10 }}>
-          <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center" }}>
-            <span style={{ fontSize: 13, color: "var(--text-secondary)" }}>
-              Registra inicio, tiempos de escaneo, operaciones lentas (&gt;500 ms) y panics/crashes
-              con stacktrace en <code>%APPDATA%\ScanCleaner\logs\</code>.
-            </span>
-            <button type="button" className="btn" onClick={refreshLogs}>
-              <RefreshCw size={13} />
-              Actualizar
-            </button>
-          </div>
-          {diagLogs.length === 0 ? (
-            <div style={{ padding: 20, textAlign: "center", color: "var(--text-muted)" }}>
-              No hay registros de diagnóstico todavía.
-            </div>
-          ) : (
-            <div
-              className="mono"
-              style={{
-                maxHeight: 420,
-                overflow: "auto",
-                background: "#0f172a",
-                borderRadius: 6,
-                padding: 10,
-                fontSize: 11.5,
-                display: "flex",
-                flexDirection: "column",
-                gap: 4,
-              }}
-            >
-              {diagLogs.map((line, idx) => (
-                <div
-                  key={`${idx}-${line.slice(0, 24)}`}
-                  style={{
-                    color:
-                      line.includes("[CRASH]") || line.includes("[ERROR]")
-                        ? "#fca5a5"
-                        : line.includes("[WARN]")
-                          ? "#fcd34d"
-                          : "var(--text-secondary)",
-                    whiteSpace: "pre-wrap",
-                    wordBreak: "break-word",
-                  }}
-                >
-                  {line}
-                </div>
-              ))}
-            </div>
-          )}
-        </div>
-      )}
+          </Card>
+        )}
+      </div>
     </div>
   );
 }

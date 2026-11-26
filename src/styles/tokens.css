@@ -1,0 +1,144 @@
+:root,
+[data-theme="light"] {
+  color-scheme: light;
+
+  /* Surfaces — Luminous Pearl / Lavender (Proton-inspired) */
+  --surface-canvas: #f4f3fb;
+  --surface-shell: rgba(255, 255, 255, 0.78);
+  --surface-panel: rgba(255, 255, 255, 0.92);
+  --surface-elevated: #f7f6fc;
+  --surface-active: #ecebf7;
+  --surface-tile: #ffffff;
+
+  /* Hairline borders */
+  --border-subtle: rgba(71, 68, 122, 0.08);
+  --border-default: rgba(71, 68, 122, 0.13);
+  --border-strong: rgba(71, 68, 122, 0.22);
+
+  /* Typography */
+  --text-primary: #171726;
+  --text-secondary: #53566e;
+  --text-muted: #7f839c;
+
+  /* Semantic accents */
+  --accent: #3b6ef5;
+  --accent-strong: #2b5ce6;
+  --accent-hover: #214fd4;
+  --accent-soft: rgba(59, 110, 245, 0.11);
+  --accent-border: rgba(59, 110, 245, 0.3);
+
+  --success: #16a34a;
+  --success-text: #15803d;
+  --success-soft: rgba(22, 163, 74, 0.11);
+  --success-border: rgba(22, 163, 74, 0.28);
+
+  --warning: #d97706;
+  --warning-text: #b45309;
+  --warning-soft: rgba(217, 119, 6, 0.12);
+  --warning-border: rgba(217, 119, 6, 0.3);
+
+  --danger: #dc2626;
+  --danger-text: #b91c1c;
+  --danger-soft: rgba(220, 38, 38, 0.1);
+  --danger-border: rgba(220, 38, 38, 0.28);
+
+  /* Soft Neumorphism Shadows (Light) */
+  --shadow-neu: inset 0 1px 0 rgba(255, 255, 255, 0.95), 0 10px 28px -12px rgba(62, 56, 130, 0.14),
+    0 2px 6px -1px rgba(62, 56, 130, 0.06);
+  --shadow-neu-hover: inset 0 1px 0 rgba(255, 255, 255, 1), 0 18px 36px -12px
+    rgba(62, 56, 130, 0.22), 0 4px 12px -2px rgba(62, 56, 130, 0.08);
+  --shadow-tile:
+    inset 0 1.5px 0 rgba(255, 255, 255, 1),
+    inset 0 -1px 2px rgba(99, 91, 180, 0.06),
+    0 12px 28px -8px rgba(72, 64, 150, 0.16),
+    0 3px 8px -2px rgba(72, 64, 150, 0.08);
+  --shadow-tile-hover: inset 0 1.5px 0 rgba(255, 255, 255, 1), 0 22px 42px -10px
+    rgba(72, 64, 150, 0.26), 0 6px 14px -3px rgba(72, 64, 150, 0.12);
+  --shadow-floating: inset 0 1px 0 rgba(255, 255, 255, 0.95), 0 24px 54px -12px
+    rgba(32, 28, 76, 0.24), 0 0 0 1px var(--border-default);
+
+  /* Ambient Gradient Mesh Orbs (Light) */
+  --mesh-1: rgba(129, 114, 255, 0.2);
+  --mesh-2: rgba(56, 189, 248, 0.18);
+  --mesh-3: rgba(167, 139, 250, 0.16);
+  --mesh-4: rgba(52, 211, 153, 0.13);
+
+  /* Treemap canvas */
+  --treemap-bg: #ebeaf5;
+  --treemap-sep: rgba(255, 255, 255, 0.85);
+  --treemap-hover-stroke: #171726;
+
+  /* Motion */
+  --ease-out: cubic-bezier(0.23, 1, 0.32, 1);
+  --ease-in-out: cubic-bezier(0.77, 0, 0.175, 1);
+}
+
+[data-theme="dark"] {
+  color-scheme: dark;
+
+  /* Surfaces — Velvet Obsidian Neumorphism */
+  --surface-canvas: #0a0c13;
+  --surface-shell: rgba(15, 18, 29, 0.8);
+  --surface-panel: rgba(20, 24, 38, 0.88);
+  --surface-elevated: #1c2235;
+  --surface-active: #252d45;
+  --surface-tile: #171c2d;
+
+  /* Hairline borders */
+  --border-subtle: rgba(255, 255, 255, 0.065);
+  --border-default: rgba(255, 255, 255, 0.11);
+  --border-strong: rgba(255, 255, 255, 0.2);
+
+  /* Typography */
+  --text-primary: #f1f3fa;
+  --text-secondary: #9fa7bf;
+  --text-muted: #6f7791;
+
+  /* Semantic accents */
+  --accent: #60a5fa;
+  --accent-strong: #3b82f6;
+  --accent-hover: #2563eb;
+  --accent-soft: rgba(96, 165, 250, 0.14);
+  --accent-border: rgba(96, 165, 250, 0.36);
+
+  --success: #34d399;
+  --success-text: #6ee7b7;
+  --success-soft: rgba(52, 211, 153, 0.13);
+  --success-border: rgba(52, 211, 153, 0.32);
+
+  --warning: #f59e0b;
+  --warning-text: #fcd34d;
+  --warning-soft: rgba(245, 158, 11, 0.14);
+  --warning-border: rgba(245, 158, 11, 0.34);
+
+  --danger: #f87171;
+  --danger-text: #fca5a5;
+  --danger-soft: rgba(248, 113, 113, 0.14);
+  --danger-border: rgba(248, 113, 113, 0.34);
+
+  /* Soft Neumorphism Shadows (Dark) */
+  --shadow-neu: inset 0 1px 0 rgba(255, 255, 255, 0.07), 0 12px 32px -12px rgba(0, 0, 0, 0.65), 0
+    2px 8px -2px rgba(0, 0, 0, 0.45);
+  --shadow-neu-hover: inset 0 1px 0 rgba(255, 255, 255, 0.12), 0 20px 42px -12px rgba(0, 0, 0, 0.78),
+    0 4px 14px -2px rgba(0, 0, 0, 0.55);
+  --shadow-tile:
+    inset 0 1px 0 rgba(255, 255, 255, 0.1),
+    inset 0 -1px 2px rgba(0, 0, 0, 0.45),
+    0 14px 32px -10px rgba(0, 0, 0, 0.72),
+    0 4px 10px -2px rgba(0, 0, 0, 0.5);
+  --shadow-tile-hover: inset 0 1.5px 0 rgba(255, 255, 255, 0.16), 0 24px 48px -10px
+    rgba(0, 0, 0, 0.85), 0 8px 18px -4px rgba(59, 130, 246, 0.18);
+  --shadow-floating: inset 0 1px 0 rgba(255, 255, 255, 0.08), 0 24px 60px -12px rgba(0, 0, 0, 0.82),
+    0 0 0 1px var(--border-default);
+
+  /* Ambient Gradient Mesh Orbs (Dark) */
+  --mesh-1: rgba(99, 102, 241, 0.18);
+  --mesh-2: rgba(56, 189, 248, 0.14);
+  --mesh-3: rgba(168, 85, 247, 0.14);
+  --mesh-4: rgba(16, 185, 129, 0.1);
+
+  /* Treemap canvas */
+  --treemap-bg: #0a0c13;
+  --treemap-sep: rgba(10, 12, 19, 0.92);
+  --treemap-hover-stroke: #f1f3fa;
+}

@@ -6,7 +6,7 @@
     "useIgnoreFile": true
   },
   "files": {
-    "ignore": ["dist", "node_modules", "src-tauri/target", "src-tauri/gen"]
+    "ignore": [".agents", "dist", "node_modules", "src-tauri/target", "src-tauri/gen"]
   },
   "formatter": {
     "enabled": true,
