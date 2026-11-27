@@ -10,7 +10,10 @@ use windows::Win32::Storage::FileSystem::{
 use windows::Win32::System::Ioctl::{FSCTL_QUERY_USN_JOURNAL, FSCTL_READ_USN_JOURNAL};
 use windows::Win32::System::IO::DeviceIoControl;
 
-use crate::scanner::derived::{refresh_derived_for_subtree, DerivedBuildContext};
+use crate::scanner::derived::{
+    refresh_derived_for_parent_shallow, refresh_derived_for_single_node,
+    refresh_derived_for_subtree, DerivedBuildContext,
+};
 use crate::scanner::model::{NodeFlags, NodeId, NodeKind, ScanTree, NONE_NODE};
 
 pub const USN_REASON_DATA_OVERWRITE: u32 = 0x0000_0001;
@@ -374,7 +377,9 @@ pub fn apply_usn_events_to_tree(
     meta_lookup: &dyn FileMetaLookup,
     ctx: &DerivedBuildContext,
 ) -> (usize, Vec<NodeId>) {
+    tree.ensure_frn_index();
     let mut touched_parents: HashSet<NodeId> = HashSet::new();
+    let mut moved_dirs: HashSet<NodeId> = HashSet::new();
     let mut applied = 0usize;
 
     for ev in events {
@@ -387,6 +392,7 @@ pub fn apply_usn_events_to_tree(
                     if pid != NONE_NODE {
                         touched_parents.insert(pid);
                     }
+                    moved_dirs.remove(&nid);
                     applied += 1;
                 }
             }
@@ -397,6 +403,13 @@ pub fn apply_usn_events_to_tree(
         if (ev.reason & USN_REASON_RENAME_NEW_NAME) != 0 {
             if let Some(nid) = tree.frn_to_node.get(&ev.frn).copied() {
                 let old_parent = tree.parent_of(nid);
+                let was_file = matches!(
+                    tree.kind_of(nid),
+                    NodeKind::File | NodeKind::CloudPlaceholder
+                );
+                let old_tcat = tree.type_cat_of(nid);
+                let old_ocat = tree.origin_cat_of(nid);
+
                 tree.rename_node(nid, &ev.file_name);
                 if let Some(new_parent) = tree.frn_to_node.get(&ev.parent_frn).copied() {
                     if new_parent != old_parent && tree.move_node(nid, new_parent) {
@@ -410,6 +423,25 @@ pub fn apply_usn_events_to_tree(
                 } else if old_parent != NONE_NODE {
                     touched_parents.insert(old_parent);
                 }
+
+                if was_file {
+                    refresh_derived_for_single_node(tree, nid, ctx);
+                    let new_tcat = tree.type_cat_of(nid);
+                    let new_ocat = tree.origin_cat_of(nid);
+                    if (new_tcat != old_tcat || new_ocat != old_ocat)
+                        && !tree.flags_of(nid).contains(NodeFlags::OPTIMISTIC_HIDDEN)
+                    {
+                        let alloc = tree.allocated_size[nid as usize] as i64;
+                        let logical = tree.logical_size[nid as usize] as i64;
+                        tree.derived
+                            .apply_file_delta(old_tcat, old_ocat, -alloc, -logical, -1);
+                        tree.derived
+                            .apply_file_delta(new_tcat, new_ocat, alloc, logical, 1);
+                    }
+                } else if tree.kind_of(nid) == NodeKind::Dir {
+                    moved_dirs.insert(nid);
+                }
+
                 applied += 1;
                 continue;
             }
@@ -441,6 +473,7 @@ pub fn apply_usn_events_to_tree(
                         snap.allocated_size,
                         snap.last_write_ts.max(ev.timestamp_unix),
                     );
+                    refresh_derived_for_single_node(tree, nid, ctx);
                     let pid = tree.parent_of(nid);
                     if pid != NONE_NODE {
                         touched_parents.insert(pid);
@@ -463,7 +496,7 @@ pub fn apply_usn_events_to_tree(
                         ev.frn,
                     );
                     tree.stats.total_dirs += 1;
-                    let _ = cid;
+                    moved_dirs.insert(cid);
                     touched_parents.insert(parent_nid);
                     applied += 1;
                 } else {
@@ -492,19 +525,9 @@ pub fn apply_usn_events_to_tree(
                         snap.logical_size as i64,
                         1,
                     );
-                    // Classify the new file and add its contribution to category totals
-                    let full_low = child_path.to_string_lossy().to_ascii_lowercase();
-                    let name_low = ev.file_name.to_ascii_lowercase();
-                    let ext = name_low.rsplit_once('.').map(|(_, e)| e).unwrap_or("");
-                    let tcat =
-                        crate::categorizer::classify_extension(ext, &ctx.rules_config.custom);
-                    let ocat = crate::categorizer::classify_origin_path(
-                        &full_low,
-                        &name_low,
-                        &ctx.rules_config,
-                    );
-                    tree.set_type_cat(cid, tcat);
-                    tree.set_origin_cat(cid, ocat);
+                    refresh_derived_for_single_node(tree, cid, ctx);
+                    let tcat = tree.type_cat_of(cid);
+                    let ocat = tree.origin_cat_of(cid);
                     tree.derived.apply_file_delta(
                         tcat,
                         ocat,
@@ -519,10 +542,14 @@ pub fn apply_usn_events_to_tree(
         }
     }
 
+    for dir_nid in moved_dirs {
+        refresh_derived_for_subtree(tree, dir_nid, ctx);
+    }
+
     let mut touched_vec: Vec<NodeId> = touched_parents.into_iter().collect();
     touched_vec.sort_unstable();
     for &pid in &touched_vec {
-        refresh_derived_for_subtree(tree, pid, ctx);
+        refresh_derived_for_parent_shallow(tree, pid, ctx);
     }
     (applied, touched_vec)
 }

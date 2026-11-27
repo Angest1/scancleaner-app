@@ -10,7 +10,9 @@ use windows::Win32::Storage::FileSystem::{
 };
 
 use crate::scanner::derived::DerivedIndexes;
-use crate::scanner::model::{FileSystemType, ScanEngineMode, ScanStats, ScanTree};
+use crate::scanner::model::{
+    FileSystemType, NodeFlags, NodeId, ScanEngineMode, ScanStats, ScanTree, NONE_NODE,
+};
 
 use super::default_index_dir;
 
@@ -55,14 +57,20 @@ pub fn default_snapshot_path(drive_root: &str, volume_serial: u32) -> PathBuf {
 }
 
 /// Atomically persists a versioned, LZ4-compressed, CRC32-checked binary snapshot of `ScanTree`.
+/// Automatically strips any `TOMBSTONE` or unreachable nodes during serialization so `.scidx` never bloats.
 pub fn save_volume_snapshot(tree: &ScanTree, index_dir: &Path) -> Result<PathBuf, String> {
     fs::create_dir_all(index_dir)
         .map_err(|e| format!("No se pudo crear carpeta de índice: {e}"))?;
+    cleanup_stale_temp_snapshots(index_dir);
+
     let root_str = tree.root_path.to_string_lossy().into_owned();
     let final_path = snapshot_path_for_volume(index_dir, &root_str, tree.volume_serial);
 
     let raw_payload = serialize_soa_payload(tree)?;
+    let raw_len = raw_payload.len() as u64;
     let compressed = lz4_flex::compress(&raw_payload);
+    // Free uncompressed buffer immediately before CRC & disk write to reduce peak heap pressure
+    drop(raw_payload);
     let crc = crc32fast::hash(&compressed);
 
     let mut header = [0u8; HEADER_LEN];
@@ -75,7 +83,7 @@ pub fn save_volume_snapshot(tree: &ScanTree, index_dir: &Path) -> Result<PathBuf
     let flags: u32 = u32::from(tree.include_ads);
     header[40..44].copy_from_slice(&flags.to_le_bytes());
     header[44..48].copy_from_slice(&(tree.fs_type as u32).to_le_bytes());
-    header[48..56].copy_from_slice(&(raw_payload.len() as u64).to_le_bytes());
+    header[48..56].copy_from_slice(&raw_len.to_le_bytes());
     header[56..60].copy_from_slice(&crc.to_le_bytes());
 
     let tmp_name = format!(".tmp-{}-{}.scidx", std::process::id(), uuid::Uuid::new_v4());
@@ -89,9 +97,36 @@ pub fn save_volume_snapshot(tree: &ScanTree, index_dir: &Path) -> Result<PathBuf
             .and_then(|()| f.sync_data())
             .map_err(|e| format!("Error escribiendo snapshot: {e}"))?;
     }
+    drop(compressed);
 
     atomic_replace_file(&tmp_path, &final_path)?;
     Ok(final_path)
+}
+
+fn cleanup_stale_temp_snapshots(index_dir: &Path) {
+    let Ok(rd) = fs::read_dir(index_dir) else {
+        return;
+    };
+    let now = std::time::SystemTime::now();
+    for entry in rd.flatten() {
+        let p = entry.path();
+        let is_tmp = p
+            .file_name()
+            .and_then(|s| s.to_str())
+            .is_some_and(|n| n.starts_with(".tmp-") && n.ends_with(".scidx"));
+        if !is_tmp {
+            continue;
+        }
+        let old_enough = entry
+            .metadata()
+            .ok()
+            .and_then(|m| m.modified().ok())
+            .and_then(|t| now.duration_since(t).ok())
+            .is_some_and(|age| age.as_secs() > 120);
+        if old_enough {
+            let _ = fs::remove_file(p);
+        }
+    }
 }
 
 fn atomic_replace_file(src: &Path, dst: &Path) -> Result<(), String> {
@@ -166,6 +201,9 @@ pub fn load_volume_snapshot(
 
     let raw = lz4_flex::decompress(compressed, uncompressed_len)
         .map_err(|e| format!("Descompresión LZ4 falló: {e}"))?;
+    // Unmap compressed file immediately before allocating SoA vectors
+    drop(mmap);
+    drop(file);
 
     let meta = SnapshotMeta {
         version,
@@ -177,7 +215,15 @@ pub fn load_volume_snapshot(
         fs_type,
     };
 
-    let tree = deserialize_soa_payload(&raw, &meta)?;
+    let mut tree = deserialize_soa_payload(&raw, &meta)?;
+    drop(raw);
+
+    // Automatically compact any legacy snapshot that contained TOMBSTONE / orphaned nodes
+    if tree.has_dead_or_unreachable_nodes() {
+        tree.compact();
+    } else {
+        tree.shrink_build_caches();
+    }
     Ok((tree, meta))
 }
 
@@ -200,6 +246,10 @@ fn push_u64_slice(out: &mut Vec<u8>, slice: &[u64]) {
 }
 
 fn serialize_soa_payload(tree: &ScanTree) -> Result<Vec<u8>, String> {
+    if !tree.is_empty() && tree.has_dead_or_unreachable_nodes() {
+        return serialize_compacted_soa_payload(tree);
+    }
+
     let n = tree.len();
     let tail = SnapshotTailMeta {
         root_path: tree.root_path.to_string_lossy().into_owned(),
@@ -236,6 +286,216 @@ fn serialize_soa_payload(tree: &ScanTree) -> Result<Vec<u8>, String> {
     out.extend_from_slice(&tree.origin_cat);
     push_u64_slice(&mut out, &tree.file_ref);
     out.extend_from_slice(&tree.name_pool);
+    out.extend_from_slice(&tail_json);
+    Ok(out)
+}
+
+/// Serializes ONLY live reachable nodes from root `0` (stripping `TOMBSTONE`s and dead `name_pool`
+/// bytes on the fly) without requiring a mutable borrow on `tree`.
+fn serialize_compacted_soa_payload(tree: &ScanTree) -> Result<Vec<u8>, String> {
+    let old_len = tree.len();
+    let hidden_or_tomb = NodeFlags::TOMBSTONE.bits();
+    let mut remap = vec![NONE_NODE; old_len];
+    let mut order: Vec<NodeId> =
+        Vec::with_capacity(old_len.saturating_sub(tree.tombstone_count()));
+
+    remap[0] = 0;
+    order.push(0);
+    let mut qi = 0usize;
+    while qi < order.len() {
+        let old_nid = order[qi];
+        qi += 1;
+        let mut ch = tree.first_child[old_nid as usize];
+        while ch != NONE_NODE && (ch as usize) < old_len {
+            let cidx = ch as usize;
+            let next = tree.next_sibling[cidx];
+            if (tree.flags[cidx] & hidden_or_tomb) == 0 && remap[cidx] == NONE_NODE {
+                let new_id = order.len() as NodeId;
+                remap[cidx] = new_id;
+                order.push(ch);
+            }
+            ch = next;
+        }
+    }
+
+    let live_n = order.len();
+    let mut first_child_col = vec![NONE_NODE; live_n];
+    let mut next_sibling_col = vec![NONE_NODE; live_n];
+    let mut name_offset_col = vec![0u32; live_n];
+    let mut name_len_col = vec![0u16; live_n];
+    let mut compact_pool: Vec<u8> = Vec::with_capacity(live_n.saturating_mul(14));
+    let mut tmp_intern: std::collections::HashMap<u64, Vec<(u32, u16)>> =
+        std::collections::HashMap::new();
+
+    for (new_idx, &old_nid) in order.iter().enumerate() {
+        let oidx = old_nid as usize;
+        let mut prev_mapped = NONE_NODE;
+        let mut ch = tree.first_child[oidx];
+        while ch != NONE_NODE && (ch as usize) < old_len {
+            let next = tree.next_sibling[ch as usize];
+            let mapped = remap[ch as usize];
+            if mapped != NONE_NODE {
+                if prev_mapped == NONE_NODE {
+                    first_child_col[new_idx] = mapped;
+                } else {
+                    next_sibling_col[prev_mapped as usize] = mapped;
+                }
+                prev_mapped = mapped;
+            }
+            ch = next;
+        }
+
+        let s = tree.name_offset[oidx] as usize;
+        let len_u16 = tree.name_len[oidx];
+        let e = s + (len_u16 as usize);
+        if len_u16 > 0 && e <= tree.name_pool.len() {
+            let slice = &tree.name_pool[s..e];
+            if slice.len() <= 32 {
+                let mut h: u64 = 0xcbf29ce484222325;
+                for &b in slice {
+                    h ^= b as u64;
+                    h = h.wrapping_mul(0x100000001b3);
+                }
+                let mut found = None;
+                if let Some(bucket) = tmp_intern.get(&h) {
+                    for &(off, l) in bucket {
+                        if &compact_pool[off as usize..(off as usize + l as usize)] == slice {
+                            found = Some((off, l));
+                            break;
+                        }
+                    }
+                }
+                if let Some((off, l)) = found {
+                    name_offset_col[new_idx] = off;
+                    name_len_col[new_idx] = l;
+                } else {
+                    let off = compact_pool.len() as u32;
+                    compact_pool.extend_from_slice(slice);
+                    tmp_intern.entry(h).or_default().push((off, len_u16));
+                    name_offset_col[new_idx] = off;
+                    name_len_col[new_idx] = len_u16;
+                }
+            } else {
+                let off = compact_pool.len() as u32;
+                compact_pool.extend_from_slice(slice);
+                name_offset_col[new_idx] = off;
+                name_len_col[new_idx] = len_u16;
+            }
+        }
+    }
+    drop(tmp_intern);
+
+    let map_id = |id: NodeId| -> Option<NodeId> {
+        remap.get(id as usize).copied().filter(|&m| m != NONE_NODE)
+    };
+    let mut derived = tree.derived.clone();
+    derived.top_files = derived.top_files.into_iter().filter_map(map_id).collect();
+    derived.top_files.dedup();
+    derived.top_dirs = derived.top_dirs.into_iter().filter_map(map_id).collect();
+    derived.top_dirs.dedup();
+    derived.pending_trash_nodes = derived
+        .pending_trash_nodes
+        .into_iter()
+        .filter_map(map_id)
+        .collect();
+    derived.pending_trash_nodes.dedup();
+    derived.dev_artifacts = derived
+        .dev_artifacts
+        .into_iter()
+        .filter_map(|mut e| {
+            let nid = map_id(e.node_id)?;
+            let pid = map_id(e.project_dir_id)?;
+            e.node_id = nid;
+            e.project_dir_id = pid;
+            Some(e)
+        })
+        .collect();
+    derived.dev_artifacts.sort_by_key(|e| e.node_id);
+    derived.dev_artifacts.dedup_by_key(|e| e.node_id);
+    derived
+        .dev_artifacts
+        .sort_by_key(|e| std::cmp::Reverse(e.size_bytes));
+    derived.global_caches = derived
+        .global_caches
+        .into_iter()
+        .filter_map(|mut e| {
+            e.node_id = map_id(e.node_id)?;
+            Some(e)
+        })
+        .collect();
+    derived.global_caches.sort_by_key(|e| e.node_id);
+    derived.global_caches.dedup_by_key(|e| e.node_id);
+    derived
+        .global_caches
+        .sort_by_key(|e| std::cmp::Reverse(e.size_bytes));
+
+    let tail = SnapshotTailMeta {
+        root_path: tree.root_path.to_string_lossy().into_owned(),
+        stats: tree.stats.clone(),
+        derived,
+        access_denied: tree
+            .access_denied
+            .iter()
+            .map(|p| p.to_string_lossy().into_owned())
+            .collect(),
+    };
+    let tail_json =
+        serde_json::to_vec(&tail).map_err(|e| format!("Error serializando metadatos: {e}"))?;
+
+    let est = 16 + live_n * 55 + compact_pool.len() + tail_json.len();
+    let mut out = Vec::with_capacity(est);
+    out.extend_from_slice(&(live_n as u32).to_le_bytes());
+    out.extend_from_slice(&(compact_pool.len() as u32).to_le_bytes());
+    out.extend_from_slice(&(tail_json.len() as u32).to_le_bytes());
+    out.extend_from_slice(&0u32.to_le_bytes());
+
+    // Write each SoA column in remapped order directly into `out`
+    for (new_idx, &old_nid) in order.iter().enumerate() {
+        let p = if new_idx == 0 {
+            NONE_NODE
+        } else {
+            let op = tree.parent[old_nid as usize];
+            if (op as usize) < old_len {
+                remap[op as usize]
+            } else {
+                NONE_NODE
+            }
+        };
+        out.extend_from_slice(&p.to_le_bytes());
+    }
+    push_u32_slice(&mut out, &first_child_col);
+    push_u32_slice(&mut out, &next_sibling_col);
+    push_u32_slice(&mut out, &name_offset_col);
+    push_u16_slice(&mut out, &name_len_col);
+    for &old_nid in &order {
+        out.extend_from_slice(&tree.logical_size[old_nid as usize].to_le_bytes());
+    }
+    for &old_nid in &order {
+        out.extend_from_slice(&tree.allocated_size[old_nid as usize].to_le_bytes());
+    }
+    for &old_nid in &order {
+        out.extend_from_slice(&tree.file_count[old_nid as usize].to_le_bytes());
+    }
+    for &old_nid in &order {
+        out.extend_from_slice(&tree.last_write_ts[old_nid as usize].to_le_bytes());
+    }
+    for &old_nid in &order {
+        out.push(tree.kind[old_nid as usize]);
+    }
+    for &old_nid in &order {
+        let clean_flags = tree.flags[old_nid as usize] & !NodeFlags::OPTIMISTIC_HIDDEN.bits();
+        out.extend_from_slice(&clean_flags.to_le_bytes());
+    }
+    for &old_nid in &order {
+        out.push(tree.type_cat[old_nid as usize]);
+    }
+    for &old_nid in &order {
+        out.push(tree.origin_cat[old_nid as usize]);
+    }
+    for &old_nid in &order {
+        out.extend_from_slice(&tree.file_ref[old_nid as usize].to_le_bytes());
+    }
+    out.extend_from_slice(&compact_pool);
     out.extend_from_slice(&tail_json);
     Ok(out)
 }
@@ -333,6 +593,6 @@ fn deserialize_soa_payload(buf: &[u8], meta: &SnapshotMeta) -> Result<ScanTree, 
     tree.access_denied = tail.access_denied.into_iter().map(PathBuf::from).collect();
     tree.stats = tail.stats;
     tree.derived = tail.derived;
-    tree.rebuild_frn_index();
+    // `frn_to_node` is built lazily via `tree.ensure_frn_index()` only when USN sync runs
     Ok(tree)
 }

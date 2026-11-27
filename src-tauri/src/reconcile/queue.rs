@@ -66,9 +66,14 @@ pub struct SyncStatusDto {
 /// only the minimal ancestor set (`C:\a`) is reconciled.
 /// Also filters out paths inside `ignored_index_dir` to guarantee zero feedback loops.
 pub fn coalesce_paths(paths: &[PathBuf], ignored_index_dir: &Path) -> Vec<PathBuf> {
+    let roam_dir = crate::storage::app_data_dir();
     let mut normalized: Vec<(String, PathBuf)> = paths
         .iter()
-        .filter(|p| !p.as_os_str().is_empty() && !is_inside_dir_prefix(p, ignored_index_dir))
+        .filter(|p| {
+            !p.as_os_str().is_empty()
+                && !is_inside_dir_prefix(p, ignored_index_dir)
+                && !is_inside_dir_prefix(p, &roam_dir)
+        })
         .map(|p| {
             let norm = p
                 .to_string_lossy()

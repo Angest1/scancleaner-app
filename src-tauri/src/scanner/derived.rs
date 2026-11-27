@@ -615,10 +615,14 @@ pub fn refresh_derived_for_subtree(
         return;
     }
 
-    // Collect all node IDs currently inside the subtree to prune stale entries from derived vectors
+    // Collect live node IDs currently inside the subtree to prune stale entries from derived vectors
     let mut subtree_set: HashSet<NodeId> = HashSet::new();
     let mut stack = vec![subtree_root];
     while let Some(nid) = stack.pop() {
+        let flags = tree.flags_of(nid);
+        if flags.contains(NodeFlags::TOMBSTONE) {
+            continue;
+        }
         subtree_set.insert(nid);
         let mut child = tree.first_child_of(nid);
         while child != NONE_NODE {
@@ -627,102 +631,158 @@ pub fn refresh_derived_for_subtree(
         }
     }
 
-    tree.derived
-        .dev_artifacts
-        .retain(|e| !subtree_set.contains(&e.node_id));
+    let total_nodes = tree.len();
+    let hidden_mask = (NodeFlags::TOMBSTONE | NodeFlags::OPTIMISTIC_HIDDEN).bits();
+    let is_valid_outside = |id: NodeId| -> bool {
+        let i = id as usize;
+        i < total_nodes && (tree.flags[i] & hidden_mask) == 0 && !subtree_set.contains(&id)
+    };
+
+    tree.derived.dev_artifacts.retain(|e| {
+        let pi = e.project_dir_id as usize;
+        is_valid_outside(e.node_id) && pi < total_nodes && (tree.flags[pi] & hidden_mask) == 0
+    });
     tree.derived
         .global_caches
-        .retain(|e| !subtree_set.contains(&e.node_id));
+        .retain(|e| is_valid_outside(e.node_id));
     tree.derived
         .pending_trash_nodes
-        .retain(|id| !subtree_set.contains(id));
+        .retain(|&id| is_valid_outside(id));
 
     // Re-evaluate dev artifacts, global caches, categories & protection inside subtree
-    let base_path = tree
+    // using a single scratch `path_buf` (O(depth) memory instead of O(N) String allocations!)
+    let mut path_buf = tree
         .reconstruct_path(subtree_root)
         .to_string_lossy()
         .trim_end_matches('\\')
         .to_ascii_lowercase();
 
-    let mut visit_stack: Vec<(NodeId, String)> = vec![(subtree_root, base_path)];
-    while let Some((nid, full_low)) = visit_stack.pop() {
-        let flags = tree.flags_of(nid);
-        if flags.contains(NodeFlags::TOMBSTONE) || flags.contains(NodeFlags::OPTIMISTIC_HIDDEN) {
-            continue;
-        }
-        let kind = tree.kind_of(nid);
-        let name_low = full_low.rsplit('\\').next().unwrap_or("");
-        let origin = classify_origin_path(&full_low, name_low, &ctx.rules_config);
-        tree.set_origin_cat(nid, origin);
+    enum SubOp {
+        Enter(NodeId, usize, bool),
+        Leave(usize),
+    }
 
-        let is_prot = ctx.fast_protection.is_protected_lower(&full_low, name_low);
-        if is_prot {
-            tree.add_flag(nid, NodeFlags::PROTECTED);
-        } else {
-            tree.remove_flag(nid, NodeFlags::PROTECTED);
-        }
+    let mut visit_stack: Vec<SubOp> = Vec::with_capacity(64);
+    visit_stack.push(SubOp::Enter(subtree_root, path_buf.len(), true));
 
-        if kind == NodeKind::Dir {
-            if name_low == ".scancleaner-trash" {
-                tree.add_flag(nid, NodeFlags::PENDING_TRASH);
-                tree.derived.pending_trash_nodes.push(nid);
+    while let Some(op) = visit_stack.pop() {
+        match op {
+            SubOp::Leave(prev_len) => {
+                path_buf.truncate(prev_len);
             }
-            if let Some(spec) = ctx.known_global_caches.get(&full_low) {
-                let idx = nid as usize;
-                tree.derived.global_caches.push(GlobalCacheIndexEntry {
-                    node_id: nid,
-                    cache_key: spec.cache_key.clone(),
-                    label: spec.label.clone(),
-                    category: spec.category.clone(),
-                    rule_id: spec.rule_id.clone(),
-                    size_bytes: tree.allocated_size[idx],
-                    file_count: tree.file_count[idx],
-                    last_write_ts: tree.last_write_ts[idx] as i64,
-                });
-            }
-            let parent_id = tree.parent_of(nid);
-            if parent_id != NONE_NODE && ctx.stop_artifact_names.contains(name_low) {
-                if let Some((rule_id, manifest)) =
-                    match_dev_artifact_in_parent(tree, parent_id, name_low, ctx)
+            SubOp::Enter(nid, prev_len, is_root_visit) => {
+                let flags = tree.flags_of(nid);
+                if flags.contains(NodeFlags::TOMBSTONE)
+                    || flags.contains(NodeFlags::OPTIMISTIC_HIDDEN)
                 {
-                    let idx = nid as usize;
-                    if tree.allocated_size[idx] > 0 || tree.file_count[idx] > 0 {
-                        tree.derived.dev_artifacts.push(DevArtifactIndexEntry {
+                    continue;
+                }
+
+                if !is_root_visit {
+                    let name = tree.node_name(nid);
+                    path_buf.push('\\');
+                    let start = path_buf.len();
+                    path_buf.push_str(name);
+                    if path_buf[start..].is_ascii() {
+                        path_buf[start..].make_ascii_lowercase();
+                    } else {
+                        let lowered = path_buf[start..].to_lowercase();
+                        path_buf.truncate(start);
+                        path_buf.push_str(&lowered);
+                    }
+                    visit_stack.push(SubOp::Leave(prev_len));
+                }
+
+                let kind = tree.kind_of(nid);
+                let name_low = if nid == 0 {
+                    path_buf.as_str()
+                } else {
+                    path_buf.rsplit('\\').next().unwrap_or("")
+                };
+                let origin = classify_origin_path(&path_buf, name_low, &ctx.rules_config);
+                tree.set_origin_cat(nid, origin);
+
+                let parent_id = tree.parent_of(nid);
+                let parent_prot = parent_id != NONE_NODE
+                    && tree.flags_of(parent_id).contains(NodeFlags::PROTECTED);
+                let is_prot = if parent_prot && !matches!(origin, OriginCategory::Temp) {
+                    true
+                } else {
+                    ctx.fast_protection
+                        .is_protected_lower(&path_buf, name_low)
+                };
+                if is_prot {
+                    tree.add_flag(nid, NodeFlags::PROTECTED);
+                } else {
+                    tree.remove_flag(nid, NodeFlags::PROTECTED);
+                }
+
+                if kind == NodeKind::Dir {
+                    if name_low == ".scancleaner-trash" {
+                        tree.add_flag(nid, NodeFlags::PENDING_TRASH);
+                        tree.derived.pending_trash_nodes.push(nid);
+                    }
+                    if let Some(spec) = ctx.known_global_caches.get(&path_buf) {
+                        let idx = nid as usize;
+                        tree.derived.global_caches.push(GlobalCacheIndexEntry {
                             node_id: nid,
-                            project_dir_id: parent_id,
-                            rule_id,
-                            pattern: name_low.to_string(),
-                            manifest_found: manifest,
+                            cache_key: spec.cache_key.clone(),
+                            label: spec.label.clone(),
+                            category: spec.category.clone(),
+                            rule_id: spec.rule_id.clone(),
                             size_bytes: tree.allocated_size[idx],
                             file_count: tree.file_count[idx],
                             last_write_ts: tree.last_write_ts[idx] as i64,
                         });
                     }
+                    if nid != 0
+                        && parent_id != NONE_NODE
+                        && ctx.stop_artifact_names.contains(name_low)
+                    {
+                        let parent_name = tree.node_name(parent_id);
+                        let parent_is_artifact = ctx
+                            .stop_artifact_names
+                            .iter()
+                            .any(|s| s.eq_ignore_ascii_case(parent_name));
+                        if !parent_is_artifact {
+                            if let Some((rule_id, manifest)) =
+                                match_dev_artifact_in_parent(tree, parent_id, name_low, ctx)
+                            {
+                                let idx = nid as usize;
+                                if tree.allocated_size[idx] > 0 || tree.file_count[idx] > 0 {
+                                    tree.derived.dev_artifacts.push(DevArtifactIndexEntry {
+                                        node_id: nid,
+                                        project_dir_id: parent_id,
+                                        rule_id,
+                                        pattern: name_low.to_string(),
+                                        manifest_found: manifest,
+                                        size_bytes: tree.allocated_size[idx],
+                                        file_count: tree.file_count[idx],
+                                        last_write_ts: tree.last_write_ts[idx] as i64,
+                                    });
+                                }
+                            }
+                        }
+                    }
+
+                    let cur_len = path_buf.len();
+                    let mut child = tree.first_child_of(nid);
+                    while child != NONE_NODE {
+                        visit_stack.push(SubOp::Enter(child, cur_len, false));
+                        child = tree.next_sibling_of(child);
+                    }
+                } else if matches!(kind, NodeKind::File | NodeKind::CloudPlaceholder) {
+                    let ext = name_low.rsplit_once('.').map(|(_, e)| e).unwrap_or("");
+                    let tcat = classify_extension(ext, &ctx.rules_config.custom);
+                    tree.set_type_cat(nid, tcat);
                 }
             }
-
-            let mut child = tree.first_child_of(nid);
-            while child != NONE_NODE {
-                let cname = tree.node_name(child).to_ascii_lowercase();
-                let child_path = if full_low.ends_with('\\') {
-                    format!("{full_low}{cname}")
-                } else {
-                    format!(r"{full_low}\{cname}")
-                };
-                visit_stack.push((child, child_path));
-                child = tree.next_sibling_of(child);
-            }
-        } else if matches!(kind, NodeKind::File | NodeKind::CloudPlaceholder) {
-            let ext = name_low.rsplit_once('.').map(|(_, e)| e).unwrap_or("");
-            let tcat = classify_extension(ext, &ctx.rules_config.custom);
-            tree.set_type_cat(nid, tcat);
         }
     }
 
     // Update top_files & top_dirs incrementally (prune deleted/hidden & merge subtree top items)
     let flags_col = &tree.flags;
     let total_nodes = tree.parent.len();
-    let hidden_mask = (NodeFlags::TOMBSTONE | NodeFlags::OPTIMISTIC_HIDDEN).bits();
     tree.derived.top_files.retain(|&id| {
         let i = id as usize;
         i < total_nodes && (flags_col[i] & hidden_mask) == 0 && !subtree_set.contains(&id)
@@ -751,20 +811,190 @@ pub fn refresh_derived_for_subtree(
     tree.derived
         .top_files
         .sort_by(|&a, &b| tree.allocated_size[b as usize].cmp(&tree.allocated_size[a as usize]));
+    tree.derived.top_files.dedup();
     tree.derived.top_files.truncate(TOP_INDEX_LIMIT);
+
     tree.derived
         .top_dirs
         .sort_by(|&a, &b| tree.allocated_size[b as usize].cmp(&tree.allocated_size[a as usize]));
+    tree.derived.top_dirs.dedup();
     tree.derived.top_dirs.truncate(TOP_INDEX_LIMIT);
 
-    // Refresh ancestor global caches sizes if any ancestor is a tracked global cache
-    let mut anc = tree.parent_of(subtree_root);
-    let mut anc_set = HashSet::new();
-    while anc != NONE_NODE {
-        anc_set.insert(anc);
-        anc = tree.parent_of(anc);
+    refresh_ancestors_derived_sizes(tree, subtree_root);
+}
+
+/// O(1) derived refresh for a single created/modified/renamed file node without walking siblings.
+pub fn refresh_derived_for_single_node(
+    tree: &mut ScanTree,
+    nid: NodeId,
+    ctx: &DerivedBuildContext,
+) {
+    let idx = nid as usize;
+    if idx >= tree.len() {
+        return;
     }
+    let flags = tree.flags_of(nid);
+    if flags.contains(NodeFlags::TOMBSTONE) || flags.contains(NodeFlags::OPTIMISTIC_HIDDEN) {
+        return;
+    }
+
+    let full_low = tree
+        .reconstruct_path(nid)
+        .to_string_lossy()
+        .trim_end_matches('\\')
+        .to_ascii_lowercase();
+    let name_low = full_low.rsplit('\\').next().unwrap_or("");
+    let origin = classify_origin_path(&full_low, name_low, &ctx.rules_config);
+    tree.set_origin_cat(nid, origin);
+
+    let parent_id = tree.parent_of(nid);
+    let parent_prot =
+        parent_id != NONE_NODE && tree.flags_of(parent_id).contains(NodeFlags::PROTECTED);
+    let is_prot = if parent_prot && !matches!(origin, OriginCategory::Temp) {
+        true
+    } else {
+        ctx.fast_protection.is_protected_lower(&full_low, name_low)
+    };
+    if is_prot {
+        tree.add_flag(nid, NodeFlags::PROTECTED);
+        let mut anc = parent_id;
+        while anc != NONE_NODE {
+            tree.add_flag(anc, NodeFlags::PROTECTED_DESCENDANT);
+            anc = tree.parent_of(anc);
+        }
+    } else {
+        tree.remove_flag(nid, NodeFlags::PROTECTED);
+    }
+
+    if matches!(tree.kind_of(nid), NodeKind::File | NodeKind::CloudPlaceholder) {
+        let ext = name_low.rsplit_once('.').map(|(_, e)| e).unwrap_or("");
+        let tcat = classify_extension(ext, &ctx.rules_config.custom);
+        tree.set_type_cat(nid, tcat);
+
+        let hidden_mask = (NodeFlags::TOMBSTONE | NodeFlags::OPTIMISTIC_HIDDEN).bits();
+        let len = tree.len();
+        tree.derived
+            .top_files
+            .retain(|&id| (id as usize) < len && (tree.flags[id as usize] & hidden_mask) == 0 && id != nid);
+        let alloc = tree.allocated_size[idx];
+        if alloc > 0 {
+            let qualifies = tree.derived.top_files.len() < TOP_INDEX_LIMIT
+                || tree
+                    .derived
+                    .top_files
+                    .last()
+                    .is_some_and(|&last| alloc > tree.allocated_size[last as usize]);
+            if qualifies {
+                tree.derived.top_files.push(nid);
+                tree.derived.top_files.sort_by(|&a, &b| {
+                    tree.allocated_size[b as usize].cmp(&tree.allocated_size[a as usize])
+                });
+                tree.derived.top_files.truncate(TOP_INDEX_LIMIT);
+            }
+        }
+    }
+}
+
+/// Fast O(direct_children + depth) refresh for a parent directory after file/child churn
+/// (never walks deep unrelated subtrees like `C:\Users\...`).
+pub fn refresh_derived_for_parent_shallow(
+    tree: &mut ScanTree,
+    parent_id: NodeId,
+    ctx: &DerivedBuildContext,
+) {
+    if (parent_id as usize) >= tree.len() {
+        return;
+    }
+    let total_nodes = tree.len();
+    let hidden_mask = (NodeFlags::TOMBSTONE | NodeFlags::OPTIMISTIC_HIDDEN).bits();
+    let is_live = |id: NodeId| -> bool {
+        let i = id as usize;
+        i < total_nodes && (tree.flags[i] & hidden_mask) == 0
+    };
+
+    tree.derived
+        .dev_artifacts
+        .retain(|e| is_live(e.node_id) && is_live(e.project_dir_id));
+    tree.derived.global_caches.retain(|e| is_live(e.node_id));
+    tree.derived.pending_trash_nodes.retain(|&id| is_live(id));
+    tree.derived.top_files.retain(|&id| is_live(id));
+    tree.derived.top_dirs.retain(|&id| is_live(id));
+
+    // Re-check direct artifact children of `parent_id` in case a manifest (`package.json`) was added/deleted
+    if is_live(parent_id) && tree.kind_of(parent_id) == NodeKind::Dir {
+        let parent_name = tree.node_name(parent_id);
+        let parent_is_artifact = ctx
+            .stop_artifact_names
+            .iter()
+            .any(|s| s.eq_ignore_ascii_case(parent_name));
+
+        if !parent_is_artifact {
+            let mut ch = tree.first_child_of(parent_id);
+            while ch != NONE_NODE {
+                if is_live(ch) && tree.kind_of(ch) == NodeKind::Dir {
+                    let cname_low = tree.node_name(ch).to_ascii_lowercase();
+                    if ctx.stop_artifact_names.contains(&cname_low) {
+                        tree.derived.dev_artifacts.retain(|e| e.node_id != ch);
+                        let cidx = ch as usize;
+                        if tree.allocated_size[cidx] > 0 || tree.file_count[cidx] > 0 {
+                            if let Some((rule_id, manifest)) =
+                                match_dev_artifact_in_parent(tree, parent_id, &cname_low, ctx)
+                            {
+                                tree.derived.dev_artifacts.push(DevArtifactIndexEntry {
+                                    node_id: ch,
+                                    project_dir_id: parent_id,
+                                    rule_id,
+                                    pattern: cname_low,
+                                    manifest_found: manifest,
+                                    size_bytes: tree.allocated_size[cidx],
+                                    file_count: tree.file_count[cidx],
+                                    last_write_ts: tree.last_write_ts[cidx] as i64,
+                                });
+                            }
+                        }
+                    }
+                }
+                ch = tree.next_sibling_of(ch);
+            }
+        }
+    }
+
+    refresh_ancestors_derived_sizes(tree, parent_id);
+}
+
+fn refresh_ancestors_derived_sizes(tree: &mut ScanTree, start_node: NodeId) {
+    let mut anc = start_node;
+    let mut anc_set = HashSet::new();
+    let mut guard = 0usize;
+    while anc != NONE_NODE && (anc as usize) < tree.len() && guard < 256 {
+        anc_set.insert(anc);
+        if anc != 0 && tree.kind_of(anc) == NodeKind::Dir {
+            let alloc = tree.allocated_size[anc as usize];
+            if alloc > 0 && !tree.derived.top_dirs.contains(&anc) {
+                let qualifies = tree.derived.top_dirs.len() < TOP_INDEX_LIMIT
+                    || tree
+                        .derived
+                        .top_dirs
+                        .last()
+                        .is_some_and(|&last| alloc > tree.allocated_size[last as usize]);
+                if qualifies {
+                    tree.derived.top_dirs.push(anc);
+                }
+            }
+        }
+        anc = tree.parent_of(anc);
+        guard += 1;
+    }
+
     for entry in &mut tree.derived.global_caches {
+        if anc_set.contains(&entry.node_id) {
+            let idx = entry.node_id as usize;
+            entry.size_bytes = tree.allocated_size[idx];
+            entry.file_count = tree.file_count[idx];
+            entry.last_write_ts = tree.last_write_ts[idx] as i64;
+        }
+    }
+    for entry in &mut tree.derived.dev_artifacts {
         if anc_set.contains(&entry.node_id) {
             let idx = entry.node_id as usize;
             entry.size_bytes = tree.allocated_size[idx];
@@ -774,8 +1004,19 @@ pub fn refresh_derived_for_subtree(
     }
 
     tree.derived
+        .top_dirs
+        .sort_by(|&a, &b| tree.allocated_size[b as usize].cmp(&tree.allocated_size[a as usize]));
+    tree.derived.top_dirs.dedup();
+    tree.derived.top_dirs.truncate(TOP_INDEX_LIMIT);
+
+    tree.derived.dev_artifacts.sort_by_key(|e| e.node_id);
+    tree.derived.dev_artifacts.dedup_by_key(|e| e.node_id);
+    tree.derived
         .dev_artifacts
         .sort_by_key(|e| std::cmp::Reverse(e.size_bytes));
+
+    tree.derived.global_caches.sort_by_key(|e| e.node_id);
+    tree.derived.global_caches.dedup_by_key(|e| e.node_id);
     tree.derived
         .global_caches
         .sort_by_key(|e| std::cmp::Reverse(e.size_bytes));

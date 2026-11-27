@@ -27,7 +27,7 @@ use scancleaner_lib::reconcile::triggers::{
 };
 use scancleaner_lib::scanner::derived::DerivedBuildContext;
 use scancleaner_lib::scanner::fallback_walk::{
-    reconcile_subtree_fallback, walk_tree_work_stealing,
+    reconcile_subtree_fallback, reconcile_watcher_path, walk_tree_work_stealing,
 };
 use scancleaner_lib::scanner::mft::{
     build_tree_from_mft_records, parse_data_runs, parse_mft_record_bytes, ParsedMftRecord,
@@ -1029,4 +1029,94 @@ fn triggers_uninstall_drift_freed_space_and_device_unitmask() {
 
     // Verify NodeKind is accessible
     assert_ne!(NodeKind::File, NodeKind::Dir);
+}
+
+#[test]
+fn memory_regression_slot_recycling_incremental_diff_and_snapshot_compaction() {
+    let dir = TempDir::new().unwrap();
+    let root = dir.path().join("vol");
+    let proj = root.join("proj");
+    let nm = proj.join("node_modules");
+    let sibling_heavy = root.join("heavy_untouched");
+    fs::create_dir_all(nm.join("pkg")).unwrap();
+    fs::create_dir_all(&sibling_heavy).unwrap();
+    fs::write(proj.join("package.json"), br#"{"name":"demo"}"#).unwrap();
+    fs::write(nm.join("pkg").join("index.js"), vec![b'x'; 8192]).unwrap();
+    for i in 0..25 {
+        fs::write(sibling_heavy.join(format!("asset_{i}.bin")), vec![b'z'; 1024]).unwrap();
+    }
+
+    let catalog = scancleaner_lib::dev_cleaner::schema::DevRulesCatalog::load_embedded().ok();
+    let ctx = DerivedBuildContext::new(
+        RulesConfig::load(),
+        ProtectionEngine::load_default(),
+        catalog.as_ref(),
+    );
+    let cancel = Arc::new(AtomicBool::new(false));
+    let mut tree = walk_tree_work_stealing(
+        root.clone(),
+        0x7777,
+        FileSystemType::Ntfs,
+        None,
+        cancel,
+        &ctx,
+        |_| {},
+    );
+
+    let baseline_len = tree.len();
+    let baseline_dev_count = tree.derived.dev_artifacts.len();
+    assert_eq!(baseline_dev_count, 1, "node_modules detected once");
+
+    // 1. Churn a single file 40 times via `reconcile_watcher_path`:
+    //    `tree.len()` must grow by at most 1 slot and NEVER duplicate `dev_artifacts`!
+    let churn_file = root.join("ntuser_sim.dat");
+    for cycle in 0..40u64 {
+        fs::write(&churn_file, vec![b'a'; (1024 + (cycle % 5) * 512) as usize]).unwrap();
+        let _ = reconcile_watcher_path(&mut tree, &churn_file, &ctx);
+    }
+    assert!(
+        tree.len() <= baseline_len + 2,
+        "Expected bounded node table, got {} vs baseline {}",
+        tree.len(),
+        baseline_len
+    );
+    assert_eq!(tree.derived.dev_artifacts.len(), 1);
+
+    // 2.Repeatedly delete & recreate `churn_file` and `proj/temp_build`: slots MUST recycle via `free_list`!
+    let len_after_single = tree.len();
+    for _ in 0..20 {
+        fs::remove_file(&churn_file).unwrap();
+        assert!(reconcile_watcher_path(&mut tree, &churn_file, &ctx));
+        fs::write(&churn_file, vec![b'b'; 4096]).unwrap();
+        assert!(reconcile_watcher_path(&mut tree, &churn_file, &ctx));
+    }
+    assert_eq!(
+        tree.len(),
+        len_after_single,
+        "Recycled free_list slots must prevent Vec growth across delete/create cycles"
+    );
+
+    // 3. Reconciling `proj` multiple times in-place must NOT create tombstones for unchanged files or duplicate dev_artifacts
+    for _ in 0..10 {
+        let _ = reconcile_subtree_fallback(&mut tree, &proj, &ctx);
+    }
+    assert_eq!(tree.derived.dev_artifacts.len(), 1);
+    assert_eq!(tree.tombstone_count(), 0);
+
+    // 4. Delete `sibling_heavy` (26 nodes -> 26 tombstones), save snapshot -> snapshot MUST strip all tombstones!
+    fs::remove_dir_all(&sibling_heavy).unwrap();
+    assert!(reconcile_subtree_fallback(&mut tree, &sibling_heavy, &ctx));
+    assert!(tree.tombstone_count() >= 25);
+
+    let idx_dir = dir.path().join("idx");
+    let snap = save_volume_snapshot(&tree, &idx_dir).unwrap();
+    let (loaded, _) = load_volume_snapshot(&snap, Some(0x7777)).unwrap();
+    assert_eq!(loaded.tombstone_count(), 0);
+    assert!(
+        loaded.len() <= baseline_len - 24,
+        "Compacted snapshot must exclude tombstones: loaded_len={} baseline={}",
+        loaded.len(),
+        baseline_len
+    );
+    assert_eq!(loaded.allocated_size[0], tree.allocated_size[0]);
 }

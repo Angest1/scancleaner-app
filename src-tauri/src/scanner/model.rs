@@ -243,8 +243,13 @@ pub struct ScanTree {
     pub name_pool: Vec<u8>,
     /// Optional interning map (populated during build to deduplicate repeated file names)
     intern_map: HashMap<u64, Vec<(u32, u16)>>,
+    /// Free list of recycled `TOMBSTONE` node IDs so incremental churn never grows the SoA vectors
+    free_list: Vec<NodeId>,
+    tombstone_count: usize,
+    dead_name_bytes: usize,
+    track_frns: bool,
 
-    /// NTFS FRN / FileId -> NodeId lookup for O(1) incremental USN updates
+    /// NTFS FRN / FileId -> NodeId lookup for O(1) incremental USN updates (populated lazily when needed)
     pub frn_to_node: HashMap<u64, NodeId>,
     pub access_denied: Vec<PathBuf>,
     pub stats: ScanStats,
@@ -285,6 +290,10 @@ impl ScanTree {
             file_ref: Vec::with_capacity(cap),
             name_pool: Vec::with_capacity(cap.saturating_mul(14)),
             intern_map: HashMap::new(),
+            free_list: Vec::new(),
+            tombstone_count: 0,
+            dead_name_bytes: 0,
+            track_frns: false,
             frn_to_node: HashMap::new(),
             access_denied: Vec::new(),
             stats: ScanStats::default(),
@@ -316,10 +325,53 @@ impl ScanTree {
         self.parent.is_empty()
     }
 
-    /// Drops the temporary build-time string interning hash table to reclaim RAM after scanning.
+    #[inline]
+    pub fn tombstone_count(&self) -> usize {
+        self.tombstone_count
+    }
+
+    #[inline]
+    pub fn dead_name_bytes(&self) -> usize {
+        self.dead_name_bytes
+    }
+
+    /// Enables FRN reverse-lookup population with pre-reserved capacity (for MFT builds & USN sync).
+    pub fn enable_frn_tracking(&mut self, reserve: usize) {
+        self.track_frns = true;
+        if reserve > 0 {
+            self.frn_to_node.reserve(reserve);
+        }
+    }
+
+    /// Lazily populates `frn_to_node` on demand when USN incremental sync actually runs.
+    pub fn ensure_frn_index(&mut self) {
+        if !self.track_frns || (self.frn_to_node.is_empty() && self.len() > 1) {
+            self.track_frns = true;
+            self.rebuild_frn_index();
+        }
+    }
+
+    /// Drops build-time caches and shrinks excess `Vec` / `HashMap` capacity across all SoA columns.
     pub fn shrink_build_caches(&mut self) {
         self.intern_map = HashMap::new();
+        self.parent.shrink_to_fit();
+        self.first_child.shrink_to_fit();
+        self.next_sibling.shrink_to_fit();
+        self.name_offset.shrink_to_fit();
+        self.name_len.shrink_to_fit();
+        self.logical_size.shrink_to_fit();
+        self.allocated_size.shrink_to_fit();
+        self.file_count.shrink_to_fit();
+        self.last_write_ts.shrink_to_fit();
+        self.kind.shrink_to_fit();
+        self.flags.shrink_to_fit();
+        self.type_cat.shrink_to_fit();
+        self.origin_cat.shrink_to_fit();
+        self.file_ref.shrink_to_fit();
         self.name_pool.shrink_to_fit();
+        self.free_list.shrink_to_fit();
+        self.access_denied.shrink_to_fit();
+        self.frn_to_node.shrink_to_fit();
     }
 
     #[inline]
@@ -434,26 +486,45 @@ impl ScanTree {
         flags: NodeFlags,
         file_ref: u64,
     ) -> NodeId {
-        let id = self.parent.len() as NodeId;
-        self.parent.push(parent);
-        self.first_child.push(NONE_NODE);
-        self.next_sibling.push(NONE_NODE);
-        self.name_offset.push(name_offset);
-        self.name_len.push(name_len);
-        self.logical_size.push(logical_size);
-        self.allocated_size.push(allocated_size);
-        self.file_count.push(u32::from(matches!(
-            kind,
-            NodeKind::File | NodeKind::CloudPlaceholder
-        )));
-        self.last_write_ts
-            .push(last_write_ts.clamp(0, u32::MAX as i64) as u32);
-        self.kind.push(kind as u8);
-        self.flags.push(flags.bits());
-        self.type_cat.push(TypeCategory::Other as u8);
-        self.origin_cat.push(OriginCategory::UserOther as u8);
-        self.file_ref.push(file_ref);
-        if file_ref != 0 {
+        let fcount = u32::from(matches!(kind, NodeKind::File | NodeKind::CloudPlaceholder));
+        let ts_u32 = last_write_ts.clamp(0, u32::MAX as i64) as u32;
+        let id = if let Some(reused) = self.free_list.pop() {
+            self.tombstone_count = self.tombstone_count.saturating_sub(1);
+            let idx = reused as usize;
+            self.parent[idx] = parent;
+            self.first_child[idx] = NONE_NODE;
+            self.next_sibling[idx] = NONE_NODE;
+            self.name_offset[idx] = name_offset;
+            self.name_len[idx] = name_len;
+            self.logical_size[idx] = logical_size;
+            self.allocated_size[idx] = allocated_size;
+            self.file_count[idx] = fcount;
+            self.last_write_ts[idx] = ts_u32;
+            self.kind[idx] = kind as u8;
+            self.flags[idx] = flags.bits();
+            self.type_cat[idx] = TypeCategory::Other as u8;
+            self.origin_cat[idx] = OriginCategory::UserOther as u8;
+            self.file_ref[idx] = file_ref;
+            reused
+        } else {
+            let new_id = self.parent.len() as NodeId;
+            self.parent.push(parent);
+            self.first_child.push(NONE_NODE);
+            self.next_sibling.push(NONE_NODE);
+            self.name_offset.push(name_offset);
+            self.name_len.push(name_len);
+            self.logical_size.push(logical_size);
+            self.allocated_size.push(allocated_size);
+            self.file_count.push(fcount);
+            self.last_write_ts.push(ts_u32);
+            self.kind.push(kind as u8);
+            self.flags.push(flags.bits());
+            self.type_cat.push(TypeCategory::Other as u8);
+            self.origin_cat.push(OriginCategory::UserOther as u8);
+            self.file_ref.push(file_ref);
+            new_id
+        };
+        if self.track_frns && file_ref != 0 {
             self.frn_to_node.entry(file_ref).or_insert(id);
         }
         id
@@ -512,14 +583,25 @@ impl ScanTree {
         id
     }
 
-    /// Rebuilds the `frn_to_node` HashMap from the flat `file_ref` column (e.g. after snapshot load).
+    /// Rebuilds the `frn_to_node` HashMap from the flat `file_ref` column with exact capacity.
     pub fn rebuild_frn_index(&mut self) {
+        self.track_frns = true;
         self.frn_to_node.clear();
+        let live_frns = self
+            .file_ref
+            .iter()
+            .enumerate()
+            .filter(|&(idx, &frn)| {
+                frn != 0 && (self.flags[idx] & NodeFlags::TOMBSTONE.bits()) == 0
+            })
+            .count();
+        self.frn_to_node.reserve(live_frns);
         for (idx, &frn) in self.file_ref.iter().enumerate() {
-            if frn != 0 && !self.flags_of(idx as NodeId).contains(NodeFlags::TOMBSTONE) {
+            if frn != 0 && (self.flags[idx] & NodeFlags::TOMBSTONE.bits()) == 0 {
                 self.frn_to_node.entry(frn).or_insert(idx as NodeId);
             }
         }
+        self.frn_to_node.shrink_to_fit();
     }
 
     pub fn reconstruct_path(&self, id: NodeId) -> PathBuf {
@@ -703,15 +785,17 @@ impl ScanTree {
             self.unlink_child(pid, nid);
         }
 
-        // Mark entire subtree as TOMBSTONE and remove FRN entries
+        // Mark entire subtree as TOMBSTONE, remove FRN entries, and collect slots for recycling
         let mut stack = vec![nid];
         let mut removed_dirs = 0u64;
+        let mut newly_recycled: Vec<NodeId> = Vec::new();
         while let Some(cur) = stack.pop() {
             let cidx = cur as usize;
-            if self.kind_of(cur) == NodeKind::Dir {
+            let was_tomb = (self.flags[cidx] & NodeFlags::TOMBSTONE.bits()) != 0;
+            if !was_tomb && self.kind_of(cur) == NodeKind::Dir {
                 removed_dirs += 1;
             }
-            self.flags[cidx] |= NodeFlags::TOMBSTONE.bits();
+            self.flags[cidx] = NodeFlags::TOMBSTONE.bits();
             let frn = self.file_ref[cidx];
             if frn != 0 && self.frn_to_node.get(&frn).copied() == Some(cur) {
                 self.frn_to_node.remove(&frn);
@@ -724,8 +808,45 @@ impl ScanTree {
             self.first_child[cidx] = NONE_NODE;
             self.next_sibling[cidx] = NONE_NODE;
             self.parent[cidx] = NONE_NODE;
+            self.logical_size[cidx] = 0;
+            self.allocated_size[cidx] = 0;
+            self.file_count[cidx] = 0;
+            self.file_ref[cidx] = 0;
+            if !was_tomb && cur != 0 {
+                self.dead_name_bytes = self
+                    .dead_name_bytes
+                    .saturating_add(self.name_len[cidx] as usize);
+                self.name_len[cidx] = 0;
+                self.name_offset[cidx] = 0;
+                newly_recycled.push(cur);
+            }
         }
         self.stats.total_dirs = self.stats.total_dirs.saturating_sub(removed_dirs);
+
+        // Immediately purge TOMBSTONE entries from derived vectors BEFORE pushing recycled IDs
+        // to `free_list` so a recycled NodeId can never collide with a stale derived reference!
+        if !newly_recycled.is_empty() {
+            let flags_ref = &self.flags;
+            let n_len = flags_ref.len();
+            let tomb_bits = NodeFlags::TOMBSTONE.bits();
+            let is_live = |id: NodeId| (id as usize) < n_len && (flags_ref[id as usize] & tomb_bits) == 0;
+            self.derived.top_files.retain(|&id| is_live(id));
+            self.derived.top_dirs.retain(|&id| is_live(id));
+            if removed_dirs > 0 {
+                self.derived
+                    .dev_artifacts
+                    .retain(|e| is_live(e.node_id) && is_live(e.project_dir_id));
+                self.derived.global_caches.retain(|e| is_live(e.node_id));
+                self.derived.pending_trash_nodes.retain(|&id| is_live(id));
+            }
+            self.tombstone_count += newly_recycled.len();
+            self.free_list.extend(newly_recycled);
+        }
+
+        if self.dead_name_bytes > 4 * 1024 * 1024 || self.intern_map.len() > 8_192 {
+            self.compact_name_pool();
+        }
+
         Some(pid)
     }
 
@@ -748,14 +869,326 @@ impl ScanTree {
         }
     }
 
-    /// Renames a node in place (interning the new name).
+    /// Renames a node in place (no-op if name is identical; tracks dead string bytes).
     pub fn rename_node(&mut self, nid: NodeId, new_name: &str) {
         if nid == 0 || (nid as usize) >= self.len() {
             return;
         }
+        if self.node_name(nid) == new_name {
+            return;
+        }
+        let old_len = self.name_len[nid as usize] as usize;
+        self.dead_name_bytes = self.dead_name_bytes.saturating_add(old_len);
         let (off, len) = self.intern_name(new_name);
         self.name_offset[nid as usize] = off;
         self.name_len[nid as usize] = len;
+        if self.dead_name_bytes > 4 * 1024 * 1024 || self.intern_map.len() > 8_192 {
+            self.compact_name_pool();
+        }
+    }
+
+    /// Rebuilds `name_pool` in-place from live nodes (deduplicating names <= 32 bytes)
+    /// WITHOUT changing any `NodeId`!
+    pub fn compact_name_pool(&mut self) {
+        let n = self.len();
+        let mut new_pool: Vec<u8> = Vec::with_capacity(self.name_pool.len().min(n.saturating_mul(14)));
+        let mut tmp_intern: HashMap<u64, Vec<(u32, u16)>> = HashMap::new();
+        let tomb_bits = NodeFlags::TOMBSTONE.bits();
+
+        for idx in 0..n {
+            if (self.flags[idx] & tomb_bits) != 0 {
+                self.name_offset[idx] = 0;
+                self.name_len[idx] = 0;
+                continue;
+            }
+            let s = self.name_offset[idx] as usize;
+            let len_u16 = self.name_len[idx];
+            let e = s + (len_u16 as usize);
+            if e > self.name_pool.len() || len_u16 == 0 {
+                self.name_offset[idx] = 0;
+                self.name_len[idx] = 0;
+                continue;
+            }
+            let slice = &self.name_pool[s..e];
+            if slice.len() <= 32 {
+                let h = fnv1a_64(slice);
+                let mut found = None;
+                if let Some(bucket) = tmp_intern.get(&h) {
+                    for &(off, l) in bucket {
+                        if &new_pool[off as usize..(off as usize + l as usize)] == slice {
+                            found = Some((off, l));
+                            break;
+                        }
+                    }
+                }
+                if let Some((off, l)) = found {
+                    self.name_offset[idx] = off;
+                    self.name_len[idx] = l;
+                } else {
+                    let off = new_pool.len() as u32;
+                    new_pool.extend_from_slice(slice);
+                    tmp_intern.entry(h).or_default().push((off, len_u16));
+                    self.name_offset[idx] = off;
+                    self.name_len[idx] = len_u16;
+                }
+            } else {
+                let off = new_pool.len() as u32;
+                new_pool.extend_from_slice(slice);
+                self.name_offset[idx] = off;
+                self.name_len[idx] = len_u16;
+            }
+        }
+
+        new_pool.shrink_to_fit();
+        self.name_pool = new_pool;
+        self.intern_map = HashMap::new();
+        self.dead_name_bytes = 0;
+    }
+
+    /// Returns true if the tree contains any `TOMBSTONE` slots or unreachable orphaned nodes
+    /// (e.g. when loading a legacy bloated `.scidx` snapshot).
+    pub fn has_dead_or_unreachable_nodes(&self) -> bool {
+        if self.tombstone_count > 0 || self.dead_name_bytes > 0 {
+            return true;
+        }
+        let tomb_bits = NodeFlags::TOMBSTONE.bits();
+        if self.flags.iter().any(|&f| (f & tomb_bits) != 0) {
+            return true;
+        }
+        if self.len() > 1 {
+            // Quick check: root is parent=NONE_NODE; any other node with parent==NONE_NODE is orphaned
+            if self.parent[1..].contains(&NONE_NODE) {
+                return true;
+            }
+        }
+        false
+    }
+
+    /// Full structural compaction: retains only live nodes reachable from root `0`,
+    /// remapping all links and `derived` indexes and compacting `name_pool` + SoA capacities.
+    pub fn compact(&mut self) -> bool {
+        if self.is_empty() {
+            return false;
+        }
+        if self
+            .flags
+            .iter()
+            .any(|&f| (f & NodeFlags::OPTIMISTIC_HIDDEN.bits()) != 0)
+        {
+            return false;
+        }
+
+        let old_len = self.len();
+        let tomb_bits = NodeFlags::TOMBSTONE.bits();
+        let mut remap = vec![NONE_NODE; old_len];
+        let mut order: Vec<NodeId> =
+            Vec::with_capacity(old_len.saturating_sub(self.tombstone_count));
+
+        remap[0] = 0;
+        order.push(0);
+        let mut qi = 0usize;
+        while qi < order.len() {
+            let old_nid = order[qi];
+            qi += 1;
+            let mut ch = self.first_child[old_nid as usize];
+            while ch != NONE_NODE && (ch as usize) < old_len {
+                let cidx = ch as usize;
+                let next = self.next_sibling[cidx];
+                if (self.flags[cidx] & tomb_bits) == 0 && remap[cidx] == NONE_NODE {
+                    let new_id = order.len() as NodeId;
+                    remap[cidx] = new_id;
+                    order.push(ch);
+                }
+                ch = next;
+            }
+        }
+
+        let live_n = order.len();
+        if live_n == old_len
+            && self.tombstone_count == 0
+            && self.dead_name_bytes == 0
+            && self.name_pool.len() <= live_n.saturating_mul(28)
+        {
+            self.shrink_build_caches();
+            return false;
+        }
+
+        let mut new_parent = vec![NONE_NODE; live_n];
+        let mut new_first_child = vec![NONE_NODE; live_n];
+        let mut new_next_sibling = vec![NONE_NODE; live_n];
+        let mut new_name_offset = vec![0u32; live_n];
+        let mut new_name_len = vec![0u16; live_n];
+        let mut new_logical_size = vec![0u64; live_n];
+        let mut new_allocated_size = vec![0u64; live_n];
+        let mut new_file_count = vec![0u32; live_n];
+        let mut new_last_write_ts = vec![0u32; live_n];
+        let mut new_kind = vec![0u8; live_n];
+        let mut new_flags = vec![0u16; live_n];
+        let mut new_type_cat = vec![0u8; live_n];
+        let mut new_origin_cat = vec![0u8; live_n];
+        let mut new_file_ref = vec![0u64; live_n];
+        let mut new_pool: Vec<u8> = Vec::with_capacity(live_n.saturating_mul(14));
+        let mut tmp_intern: HashMap<u64, Vec<(u32, u16)>> = HashMap::new();
+
+        for (new_idx, &old_nid) in order.iter().enumerate() {
+            let oidx = old_nid as usize;
+            new_parent[new_idx] = if new_idx == 0 {
+                NONE_NODE
+            } else {
+                let op = self.parent[oidx];
+                if (op as usize) < old_len {
+                    remap[op as usize]
+                } else {
+                    NONE_NODE
+                }
+            };
+
+            // Preserve exact live sibling order under `old_nid`
+            let mut prev_mapped = NONE_NODE;
+            let mut ch = self.first_child[oidx];
+            while ch != NONE_NODE && (ch as usize) < old_len {
+                let next = self.next_sibling[ch as usize];
+                let mapped_ch = remap[ch as usize];
+                if mapped_ch != NONE_NODE {
+                    if prev_mapped == NONE_NODE {
+                        new_first_child[new_idx] = mapped_ch;
+                    } else {
+                        new_next_sibling[prev_mapped as usize] = mapped_ch;
+                    }
+                    prev_mapped = mapped_ch;
+                }
+                ch = next;
+            }
+
+            let s = self.name_offset[oidx] as usize;
+            let len_u16 = self.name_len[oidx];
+            let e = s + (len_u16 as usize);
+            if len_u16 > 0 && e <= self.name_pool.len() {
+                let slice = &self.name_pool[s..e];
+                if slice.len() <= 32 {
+                    let h = fnv1a_64(slice);
+                    let mut found = None;
+                    if let Some(bucket) = tmp_intern.get(&h) {
+                        for &(off, l) in bucket {
+                            if &new_pool[off as usize..(off as usize + l as usize)] == slice {
+                                found = Some((off, l));
+                                break;
+                            }
+                        }
+                    }
+                    if let Some((off, l)) = found {
+                        new_name_offset[new_idx] = off;
+                        new_name_len[new_idx] = l;
+                    } else {
+                        let off = new_pool.len() as u32;
+                        new_pool.extend_from_slice(slice);
+                        tmp_intern.entry(h).or_default().push((off, len_u16));
+                        new_name_offset[new_idx] = off;
+                        new_name_len[new_idx] = len_u16;
+                    }
+                } else {
+                    let off = new_pool.len() as u32;
+                    new_pool.extend_from_slice(slice);
+                    new_name_offset[new_idx] = off;
+                    new_name_len[new_idx] = len_u16;
+                }
+            }
+
+            new_logical_size[new_idx] = self.logical_size[oidx];
+            new_allocated_size[new_idx] = self.allocated_size[oidx];
+            new_file_count[new_idx] = self.file_count[oidx];
+            new_last_write_ts[new_idx] = self.last_write_ts[oidx];
+            new_kind[new_idx] = self.kind[oidx];
+            new_flags[new_idx] = self.flags[oidx];
+            new_type_cat[new_idx] = self.type_cat[oidx];
+            new_origin_cat[new_idx] = self.origin_cat[oidx];
+            new_file_ref[new_idx] = self.file_ref[oidx];
+        }
+        drop(tmp_intern);
+        drop(order);
+
+        let map_id = |id: NodeId| -> Option<NodeId> {
+            remap.get(id as usize).copied().filter(|&m| m != NONE_NODE)
+        };
+        self.derived.top_files = self
+            .derived
+            .top_files
+            .iter()
+            .filter_map(|&id| map_id(id))
+            .collect();
+        self.derived.top_files.dedup();
+        self.derived.top_dirs = self
+            .derived
+            .top_dirs
+            .iter()
+            .filter_map(|&id| map_id(id))
+            .collect();
+        self.derived.top_dirs.dedup();
+        self.derived.pending_trash_nodes = self
+            .derived
+            .pending_trash_nodes
+            .iter()
+            .filter_map(|&id| map_id(id))
+            .collect();
+        self.derived.pending_trash_nodes.dedup();
+
+        let mut new_dev = Vec::with_capacity(self.derived.dev_artifacts.len());
+        for mut entry in std::mem::take(&mut self.derived.dev_artifacts) {
+            if let (Some(nid), Some(pid)) = (map_id(entry.node_id), map_id(entry.project_dir_id)) {
+                entry.node_id = nid;
+                entry.project_dir_id = pid;
+                entry.size_bytes = new_allocated_size[nid as usize];
+                entry.file_count = new_file_count[nid as usize];
+                entry.last_write_ts = new_last_write_ts[nid as usize] as i64;
+                new_dev.push(entry);
+            }
+        }
+        new_dev.sort_by_key(|e| e.node_id);
+        new_dev.dedup_by_key(|e| e.node_id);
+        new_dev.sort_by_key(|e| std::cmp::Reverse(e.size_bytes));
+        self.derived.dev_artifacts = new_dev;
+
+        let mut new_caches = Vec::with_capacity(self.derived.global_caches.len());
+        for mut entry in std::mem::take(&mut self.derived.global_caches) {
+            if let Some(nid) = map_id(entry.node_id) {
+                entry.node_id = nid;
+                entry.size_bytes = new_allocated_size[nid as usize];
+                entry.file_count = new_file_count[nid as usize];
+                entry.last_write_ts = new_last_write_ts[nid as usize] as i64;
+                new_caches.push(entry);
+            }
+        }
+        new_caches.sort_by_key(|e| e.node_id);
+        new_caches.dedup_by_key(|e| e.node_id);
+        new_caches.sort_by_key(|e| std::cmp::Reverse(e.size_bytes));
+        self.derived.global_caches = new_caches;
+
+        self.parent = new_parent;
+        self.first_child = new_first_child;
+        self.next_sibling = new_next_sibling;
+        self.name_offset = new_name_offset;
+        self.name_len = new_name_len;
+        self.logical_size = new_logical_size;
+        self.allocated_size = new_allocated_size;
+        self.file_count = new_file_count;
+        self.last_write_ts = new_last_write_ts;
+        self.kind = new_kind;
+        self.flags = new_flags;
+        self.type_cat = new_type_cat;
+        self.origin_cat = new_origin_cat;
+        self.file_ref = new_file_ref;
+        self.name_pool = new_pool;
+        self.free_list = Vec::new();
+        self.tombstone_count = 0;
+        self.dead_name_bytes = 0;
+
+        if self.track_frns {
+            self.rebuild_frn_index();
+        } else {
+            self.frn_to_node = HashMap::new();
+        }
+        self.shrink_build_caches();
+        true
     }
 
     /// Moves a node (and its entire subtree) to a new parent directory, updating aggregates

@@ -27,7 +27,9 @@ pub fn is_inside_index_dir(path: &Path) -> bool {
 /// Returns true if `path` should be ignored by continuous `ReadDirectoryChangesW` watchers
 /// to avoid self-triggering loops (WebView2 cache, logs, `.scidx` index) and noisy OS telemetry churn.
 pub fn is_watcher_ignored_path(path: &Path) -> bool {
-    if is_inside_dir_prefix(path, &default_app_local_dir()) {
+    if is_inside_dir_prefix(path, &default_app_local_dir())
+        || is_inside_dir_prefix(path, &crate::storage::app_data_dir())
+    {
         return true;
     }
     let norm = path

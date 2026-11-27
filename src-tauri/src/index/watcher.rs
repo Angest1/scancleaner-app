@@ -104,14 +104,17 @@ impl VolumeDirWatcher {
                         let rel = OsString::from_wide(name_slice);
                         let full = root_path.join(rel);
                         // Ignore changes inside ScanCleaner's own AppData (index/webview2/logs) and OS churn
-                        if !is_watcher_ignored_path(&full) {
-                            // Reconcile the changed file's parent directory (never the entire volume root!)
-                            let target = full
-                                .parent()
-                                .map(std::path::Path::to_path_buf)
-                                .unwrap_or(full);
-                            if !crate::scanner::is_volume_root(&target) {
-                                changed.push(target);
+                        if !is_watcher_ignored_path(&full) && !crate::scanner::is_volume_root(&full)
+                        {
+                            // Skip directory-only `FILE_ACTION_MODIFIED` (3) mtime bumps: any file added,
+                            // removed, or resized inside a directory already emits its own notification,
+                            // and passing a parent directory like `C:\Users\<user>` would coalesce churn!
+                            let is_dir_mtime_only = info.Action.0 == 3
+                                && std::fs::symlink_metadata(&full)
+                                    .map(|m| m.is_dir())
+                                    .unwrap_or(false);
+                            if !is_dir_mtime_only {
+                                changed.push(full);
                             }
                         }
                         if info.NextEntryOffset == 0 {

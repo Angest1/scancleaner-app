@@ -495,9 +495,14 @@ pub fn build_tree_from_mft_records(
     );
     tree.include_ads = include_ads;
     tree.stats.engine_mode = engine_mode;
+    if engine_mode != ScanEngineMode::MftService {
+        tree.enable_frn_tracking(base_map.len());
+    }
     // Map NTFS root directory FRN (5) to NodeId 0
     tree.file_ref[0] = MFT_ROOT_DIR_FRN;
-    tree.frn_to_node.insert(MFT_ROOT_DIR_FRN, 0);
+    if engine_mode != ScanEngineMode::MftService {
+        tree.frn_to_node.insert(MFT_ROOT_DIR_FRN, 0);
+    }
 
     // Pre-create directory nodes first so parent lookups succeed in a single pass
     // Build parent->children adjacency by FRN, skipping junctions/symlinks as parents
@@ -505,19 +510,18 @@ pub fn build_tree_from_mft_records(
     let mut ordered_frns: Vec<u64> = base_map.keys().copied().collect();
     ordered_frns.sort_unstable();
 
-    // Store resolved preferred names per FRN
+    // Store resolved preferred names per FRN (moving names out of `base_map` to avoid duplicate Strings)
     let mut resolved_names: HashMap<u64, Vec<ParsedFileName>> =
         HashMap::with_capacity(base_map.len());
     for &frn in &ordered_frns {
-        if frn == MFT_ROOT_DIR_FRN {
+        if frn == MFT_ROOT_DIR_FRN || frn < 16 {
             continue;
         }
-        // Skip internal NTFS metafiles ($MFT..$Extend = FRN 0..15 except root 5)
-        if frn < 16 {
+        let Some(rec) = base_map.get_mut(&frn) else {
             continue;
-        }
-        let rec = &base_map[&frn];
-        let chosen: Vec<ParsedFileName> = select_preferred_names(&rec.names)
+        };
+        let raw_names = std::mem::take(&mut rec.names);
+        let chosen: Vec<ParsedFileName> = select_preferred_names(&raw_names)
             .into_iter()
             .cloned()
             .collect();
@@ -532,6 +536,7 @@ pub fn build_tree_from_mft_records(
         }
         resolved_names.insert(frn, chosen);
     }
+    drop(ordered_frns);
 
     // BFS from NTFS root FRN (5) so unreachable/orphaned MFT entries and junction targets are skipped
     let mut queue: Vec<(u64, u32)> = vec![(MFT_ROOT_DIR_FRN, 0)];
@@ -665,6 +670,11 @@ pub fn build_tree_from_mft_records(
             }
         }
     }
+
+    drop(queue);
+    drop(children_by_parent);
+    drop(resolved_names);
+    drop(base_map);
 
     tree.shrink_build_caches();
     finalize_tree_and_derived(&mut tree, ctx);

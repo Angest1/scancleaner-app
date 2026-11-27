@@ -667,198 +667,468 @@ where
     tree
 }
 
-/// Targeted subtree rescan helper used by the Section 9 reconciliation queue.
-/// Replaces the children of `target_dir` inside `tree` without rescanning the rest of the volume.
+/// Queries metadata for a single entry by exact path (`NtQueryDirectoryFile` single-entry filter on NTFS/ReFS,
+/// falling back to `FindFirstFileExW`) without enumerating sibling files or hydrating cloud placeholders.
+fn query_single_entry_fast(target_path: &Path, use_nt: bool) -> Option<RawEntry> {
+    let file_name_os = target_path.file_name()?;
+    let parent_dir = target_path.parent()?;
+
+    if use_nt {
+        if let Some(nt_query) = get_nt_query_directory_file() {
+            let wide_dir = to_extended_wide(parent_dir);
+            if let Ok(handle) = unsafe {
+                CreateFileW(
+                    PCWSTR(wide_dir.as_ptr()),
+                    FILE_LIST_DIRECTORY.0,
+                    FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+                    None,
+                    OPEN_EXISTING,
+                    FILE_FLAG_BACKUP_SEMANTICS,
+                    None,
+                )
+            } {
+                if handle != INVALID_HANDLE_VALUE {
+                    let mut filter_utf16: Vec<u16> =
+                        file_name_os.to_string_lossy().encode_utf16().collect();
+                    let byte_len = (filter_utf16.len() * 2).min(u16::MAX as usize) as u16;
+                    let us = UNICODE_STRING {
+                        Length: byte_len,
+                        MaximumLength: byte_len,
+                        Buffer: windows::core::PWSTR(filter_utf16.as_mut_ptr()),
+                    };
+                    let mut buf = vec![0u64; 256];
+                    let mut io_status = IO_STATUS_BLOCK::default();
+                    let status = unsafe {
+                        nt_query(
+                            handle,
+                            HANDLE::default(),
+                            std::ptr::null(),
+                            std::ptr::null(),
+                            &mut io_status,
+                            buf.as_mut_ptr().cast(),
+                            (buf.len() * 8) as u32,
+                            FILE_ID_BOTH_DIRECTORY_INFORMATION_CLASS,
+                            1,
+                            &us,
+                            1,
+                        )
+                    };
+                    unsafe {
+                        let _ = CloseHandle(handle);
+                    }
+                    if status.0 == STATUS_SUCCESS_RAW {
+                        let info = unsafe { &*(buf.as_ptr().cast::<FileIdBothDirInfo>()) };
+                        let name_len_chars = (info.FileNameLength as usize) / 2;
+                        let name_slice = unsafe {
+                            std::slice::from_raw_parts(info.FileName.as_ptr(), name_len_chars)
+                        };
+                        let name = OsString::from_wide(name_slice)
+                            .to_string_lossy()
+                            .into_owned();
+                        let attrs = info.FileAttributes;
+                        let is_dir = (attrs & FILE_ATTRIBUTE_DIRECTORY.0) != 0;
+                        let is_reparse = (attrs & FILE_ATTRIBUTE_REPARSE_POINT.0) != 0;
+                        let reparse_tag = if is_reparse { info.EaSize } else { 0 };
+                        let is_compressed = (attrs & FILE_ATTRIBUTE_COMPRESSED.0) != 0;
+                        let is_sparse = (attrs & FILE_ATTRIBUTE_SPARSE_FILE.0) != 0;
+                        let is_recall_data = (attrs & FILE_ATTRIBUTE_RECALL_ON_DATA_ACCESS.0) != 0;
+                        let is_recall_open = (attrs & FILE_ATTRIBUTE_RECALL_ON_OPEN.0) != 0;
+                        let is_offline = (attrs & FILE_ATTRIBUTE_OFFLINE.0) != 0;
+                        let logical = info.EndOfFile.max(0) as u64;
+                        let allocated = if is_dir {
+                            0
+                        } else {
+                            info.AllocationSize.max(0) as u64
+                        };
+                        let is_cloud_only =
+                            !is_dir && (is_recall_data || is_recall_open || is_offline);
+                        return Some(RawEntry {
+                            name,
+                            is_dir,
+                            is_reparse,
+                            reparse_tag,
+                            is_compressed,
+                            is_sparse,
+                            is_cloud_only,
+                            is_recall_open,
+                            is_offline,
+                            logical_size: logical,
+                            allocated_size: allocated,
+                            last_write_ts: filetime_to_unix_secs(info.LastWriteTime),
+                            file_id: info.FileId.max(0) as u64,
+                        });
+                    }
+                }
+            }
+        }
+    }
+
+    let wide = to_extended_wide(target_path);
+    let mut find_data = WIN32_FIND_DATAW::default();
+    let handle = unsafe {
+        FindFirstFileExW(
+            PCWSTR(wide.as_ptr()),
+            FindExInfoBasic,
+            (&mut find_data as *mut WIN32_FIND_DATAW).cast(),
+            FindExSearchNameMatch,
+            None,
+            FIND_FIRST_EX_LARGE_FETCH,
+        )
+    }
+    .ok()?;
+    unsafe {
+        let _ = FindClose(handle);
+    }
+
+    let end = find_data
+        .cFileName
+        .iter()
+        .position(|&c| c == 0)
+        .unwrap_or(find_data.cFileName.len());
+    let name = OsString::from_wide(&find_data.cFileName[..end])
+        .to_string_lossy()
+        .into_owned();
+    let attrs = find_data.dwFileAttributes;
+    let is_dir = (attrs & FILE_ATTRIBUTE_DIRECTORY.0) != 0;
+    let is_reparse = (attrs & FILE_ATTRIBUTE_REPARSE_POINT.0) != 0;
+    let reparse_tag = if is_reparse { find_data.dwReserved0 } else { 0 };
+    let is_compressed = (attrs & FILE_ATTRIBUTE_COMPRESSED.0) != 0;
+    let is_sparse = (attrs & FILE_ATTRIBUTE_SPARSE_FILE.0) != 0;
+    let is_recall_data = (attrs & FILE_ATTRIBUTE_RECALL_ON_DATA_ACCESS.0) != 0;
+    let is_recall_open = (attrs & FILE_ATTRIBUTE_RECALL_ON_OPEN.0) != 0;
+    let is_offline = (attrs & FILE_ATTRIBUTE_OFFLINE.0) != 0;
+    let logical = ((find_data.nFileSizeHigh as u64) << 32) | (find_data.nFileSizeLow as u64);
+    let ft = ((find_data.ftLastWriteTime.dwHighDateTime as i64) << 32)
+        | (find_data.ftLastWriteTime.dwLowDateTime as i64);
+    let is_cloud_only = !is_dir && (is_recall_data || is_recall_open || is_offline);
+    let allocated = if is_dir || is_cloud_only { 0 } else { logical };
+
+    Some(RawEntry {
+        name,
+        is_dir,
+        is_reparse,
+        reparse_tag,
+        is_compressed,
+        is_sparse,
+        is_cloud_only,
+        is_recall_open,
+        is_offline,
+        logical_size: logical,
+        allocated_size: allocated,
+        last_write_ts: filetime_to_unix_secs(ft),
+        file_id: 0,
+    })
+}
+
+fn entry_node_flags_and_kind(entry: &RawEntry) -> (NodeFlags, NodeKind) {
+    let mut flags = NodeFlags::empty();
+    if entry.is_compressed {
+        flags |= NodeFlags::COMPRESSED;
+    }
+    if entry.is_sparse {
+        flags |= NodeFlags::SPARSE;
+    }
+    if entry.is_cloud_only {
+        flags |= NodeFlags::CLOUD_ONLY;
+    }
+    if entry.is_recall_open {
+        flags |= NodeFlags::RECALL_ON_OPEN;
+    }
+    if entry.is_offline {
+        flags |= NodeFlags::OFFLINE;
+    }
+    let kind = if entry.is_reparse && entry.reparse_tag == IO_REPARSE_TAG_SYMLINK {
+        NodeKind::Symlink
+    } else if entry.is_reparse && entry.reparse_tag == IO_REPARSE_TAG_MOUNT_POINT {
+        NodeKind::Junction
+    } else if entry.is_dir {
+        NodeKind::Dir
+    } else if entry.is_cloud_only {
+        NodeKind::CloudPlaceholder
+    } else {
+        NodeKind::File
+    };
+    (flags, kind)
+}
+
+/// Fast path for `VolumeDirWatcher` notifications: updates single files in O(1) and diffs only
+/// direct children (plus brand-new subdirectories) on directory events without re-walking huge subtrees.
+pub fn reconcile_watcher_path(
+    tree: &mut ScanTree,
+    target_path: &Path,
+    ctx: &DerivedBuildContext,
+) -> bool {
+    reconcile_path_incremental(tree, target_path, false, ctx)
+}
+
+/// Targeted subtree reconciliation helper used by the Section 9 reconciliation queue.
+/// Performs an in-place, non-destructive diff against disk: keeps unchanged directories & files
+/// untouched (zero unnecessary `TOMBSTONE`s), updates resized files in-place, removes vanished entries
+/// (recycling slots into `free_list`), and walks added entries.
 pub fn reconcile_subtree_fallback(
     tree: &mut ScanTree,
     target_path: &Path,
     ctx: &DerivedBuildContext,
 ) -> bool {
+    reconcile_path_incremental(tree, target_path, true, ctx)
+}
+
+fn reconcile_path_incremental(
+    tree: &mut ScanTree,
+    target_path: &Path,
+    recurse_existing_subdirs: bool,
+    ctx: &DerivedBuildContext,
+) -> bool {
     let use_nt = matches!(tree.fs_type, FileSystemType::Ntfs | FileSystemType::Refs);
 
-    // If the target disappeared on disk, remove it from tree and refresh parent
-    if !target_path.exists() {
+    // 1. If the target disappeared on disk, remove only that node/subtree in-place!
+    let Ok(meta) = std::fs::symlink_metadata(target_path) else {
         if let Some(existing_id) = tree.find_node_by_path(target_path) {
             if existing_id != 0 {
                 if let Some(pid) = tree.remove_subtree(existing_id) {
-                    super::derived::refresh_derived_for_subtree(tree, pid, ctx);
+                    super::derived::refresh_derived_for_parent_shallow(tree, pid, ctx);
                     return true;
                 }
             }
         }
         return false;
-    }
-
-    // Check if target is a single file or a directory
-    let meta = match std::fs::symlink_metadata(target_path) {
-        Ok(m) => m,
-        Err(_) => return false,
     };
 
-    if meta.is_file() {
-        if let Some(parent_path) = target_path.parent() {
-            return reconcile_subtree_fallback(tree, parent_path, ctx);
+    // 2. Single file (or file symlink) fast O(1) path — NEVER wipes or re-walks the parent directory!
+    if !meta.is_dir() {
+        let Some(parent_path) = target_path.parent() else {
+            return false;
+        };
+        let Some(entry) = query_single_entry_fast(target_path, use_nt) else {
+            return false;
+        };
+        let Some(parent_nid) = tree.ensure_dir_path(parent_path) else {
+            return false;
+        };
+        let (flags, kind) = entry_node_flags_and_kind(&entry);
+
+        let mut existing_cid = None;
+        for cid in tree.children_iter(parent_nid) {
+            if tree.node_name(cid).eq_ignore_ascii_case(&entry.name) {
+                existing_cid = Some(cid);
+                break;
+            }
         }
-        return false;
+
+        if let Some(cid) = existing_cid {
+            if tree.kind_of(cid) != kind {
+                tree.remove_subtree(cid);
+            } else {
+                if tree.node_name(cid) != entry.name {
+                    tree.rename_node(cid, &entry.name);
+                }
+                if matches!(kind, NodeKind::Symlink | NodeKind::Junction) {
+                    return false;
+                }
+                let cidx = cid as usize;
+                if tree.logical_size[cidx] == entry.logical_size
+                    && tree.allocated_size[cidx] == entry.allocated_size
+                {
+                    if entry.last_write_ts > tree.last_write_ts_of(cid) {
+                        tree.last_write_ts[cidx] =
+                            entry.last_write_ts.clamp(0, u32::MAX as i64) as u32;
+                    }
+                    return false;
+                }
+                tree.update_file_sizes(
+                    cid,
+                    entry.logical_size,
+                    entry.allocated_size,
+                    entry.last_write_ts,
+                );
+                super::derived::refresh_derived_for_single_node(tree, cid, ctx);
+                super::derived::refresh_derived_for_parent_shallow(tree, parent_nid, ctx);
+                return true;
+            }
+        }
+
+        // Brand-new file (or replaced incompatible node kind)
+        let alloc = if matches!(kind, NodeKind::Symlink | NodeKind::Junction) {
+            0
+        } else {
+            entry.allocated_size
+        };
+        let logical = if matches!(kind, NodeKind::Symlink | NodeKind::Junction) {
+            0
+        } else {
+            entry.logical_size
+        };
+        let cid = tree.add_child_with_frn(
+            parent_nid,
+            &entry.name,
+            kind,
+            logical,
+            alloc,
+            entry.last_write_ts,
+            flags,
+            entry.file_id,
+        );
+        if matches!(kind, NodeKind::File | NodeKind::CloudPlaceholder) {
+            tree.propagate_delta_upwards(parent_nid, alloc as i64, logical as i64, 1);
+            super::derived::refresh_derived_for_single_node(tree, cid, ctx);
+            let tcat = tree.type_cat_of(cid);
+            let ocat = tree.origin_cat_of(cid);
+            tree.derived
+                .apply_file_delta(tcat, ocat, alloc as i64, logical as i64, 1);
+        }
+        super::derived::refresh_derived_for_parent_shallow(tree, parent_nid, ctx);
+        return true;
     }
 
-    // Ensure directory node exists in tree
+    // 3. Directory in-place diff (only touches added/removed/resized entries!)
+    let existed_before = tree.find_node_by_path(target_path).is_some();
     let Some(dir_nid) = tree.ensure_dir_path(target_path) else {
         return false;
     };
 
-    // Remove existing children of `dir_nid` cleanly
-    let existing_kids: Vec<u32> = tree.children_iter(dir_nid).collect();
-    for kid in existing_kids {
-        tree.remove_subtree(kid);
-    }
+    // `(dir_nid, dir_path, is_newly_created_dir)`
+    let mut stack: Vec<(u32, PathBuf, bool)> =
+        vec![(dir_nid, target_path.to_path_buf(), !existed_before)];
+    let mut seen_new_ids: HashSet<u64> = HashSet::new();
+    let mut mutated = !existed_before;
+    let mut added_subdirs_or_deep = !existed_before;
 
-    // Re-walk only this subtree iteratively
-    let mut stack: Vec<(u32, PathBuf)> = vec![(dir_nid, target_path.to_path_buf())];
-    let mut seen_ids: HashSet<u64> = HashSet::new();
-    let mut added_alloc = 0i64;
-    let mut added_logical = 0i64;
-    let mut added_files = 0i64;
-
-    while let Some((pid, cur_path)) = stack.pop() {
+    while let Some((pid, cur_path, is_new_dir)) = stack.pop() {
         let Ok(entries) = read_dir_fast(&cur_path, use_nt) else {
             continue;
         };
+
+        let mut existing_by_name: std::collections::HashMap<String, u32> =
+            std::collections::HashMap::new();
+        if !is_new_dir {
+            for cid in tree.children_iter(pid) {
+                existing_by_name.insert(tree.node_name(cid).to_ascii_lowercase(), cid);
+            }
+        }
+
         for entry in entries {
-            if entry.is_reparse {
-                if entry.reparse_tag == IO_REPARSE_TAG_SYMLINK {
+            let key = entry.name.to_ascii_lowercase();
+            let (mut flags, kind) = entry_node_flags_and_kind(&entry);
+
+            if let Some(existing_cid) = existing_by_name.remove(&key) {
+                let old_kind = tree.kind_of(existing_cid);
+                if old_kind == kind {
+                    if tree.node_name(existing_cid) != entry.name {
+                        tree.rename_node(existing_cid, &entry.name);
+                        mutated = true;
+                    }
+                    match kind {
+                        NodeKind::Symlink | NodeKind::Junction => {}
+                        NodeKind::Dir => {
+                            if recurse_existing_subdirs {
+                                stack.push((existing_cid, cur_path.join(&entry.name), false));
+                            }
+                        }
+                        NodeKind::File | NodeKind::CloudPlaceholder => {
+                            let cidx = existing_cid as usize;
+                            if tree.logical_size[cidx] != entry.logical_size
+                                || tree.allocated_size[cidx] != entry.allocated_size
+                            {
+                                tree.update_file_sizes(
+                                    existing_cid,
+                                    entry.logical_size,
+                                    entry.allocated_size,
+                                    entry.last_write_ts,
+                                );
+                                mutated = true;
+                            } else if entry.last_write_ts > tree.last_write_ts_of(existing_cid) {
+                                tree.last_write_ts[cidx] =
+                                    entry.last_write_ts.clamp(0, u32::MAX as i64) as u32;
+                            }
+                        }
+                    }
+                    continue;
+                }
+                // Entry changed kind (e.g. file replaced by directory) -> remove old first
+                tree.remove_subtree(existing_cid);
+            }
+
+            // Insert brand-new entry on disk
+            mutated = true;
+            match kind {
+                NodeKind::Symlink | NodeKind::Junction => {
                     tree.add_child_with_frn(
                         pid,
                         &entry.name,
-                        NodeKind::Symlink,
+                        kind,
                         0,
                         0,
                         entry.last_write_ts,
                         NodeFlags::empty(),
                         entry.file_id,
                     );
-                    continue;
                 }
-                if entry.reparse_tag == IO_REPARSE_TAG_MOUNT_POINT {
-                    tree.add_child_with_frn(
+                NodeKind::Dir => {
+                    let cid = tree.add_child_with_frn(
                         pid,
                         &entry.name,
-                        NodeKind::Junction,
+                        NodeKind::Dir,
                         0,
                         0,
                         entry.last_write_ts,
                         NodeFlags::empty(),
                         entry.file_id,
                     );
-                    continue;
+                    tree.stats.total_dirs += 1;
+                    added_subdirs_or_deep = true;
+                    // Always walk brand-new subdirectories even on shallow watcher events!
+                    stack.push((cid, cur_path.join(&entry.name), true));
+                }
+                NodeKind::File | NodeKind::CloudPlaceholder => {
+                    let mut alloc = entry.allocated_size;
+                    if use_nt && entry.file_id != 0 && !seen_new_ids.insert(entry.file_id) {
+                        flags |= NodeFlags::HARDLINK_DUP;
+                        alloc = 0;
+                    }
+                    let cid = tree.add_child_with_frn(
+                        pid,
+                        &entry.name,
+                        kind,
+                        entry.logical_size,
+                        alloc,
+                        entry.last_write_ts,
+                        flags,
+                        entry.file_id,
+                    );
+                    tree.propagate_delta_upwards(pid, alloc as i64, entry.logical_size as i64, 1);
+                    let child_full_low = cur_path
+                        .join(&entry.name)
+                        .to_string_lossy()
+                        .to_ascii_lowercase();
+                    let ext = key.rsplit_once('.').map(|(_, e)| e).unwrap_or("");
+                    let tcat =
+                        crate::categorizer::classify_extension(ext, &ctx.rules_config.custom);
+                    let ocat = crate::categorizer::classify_origin_path(
+                        &child_full_low,
+                        &key,
+                        &ctx.rules_config,
+                    );
+                    tree.set_type_cat(cid, tcat);
+                    tree.set_origin_cat(cid, ocat);
+                    tree.derived
+                        .apply_file_delta(tcat, ocat, alloc as i64, entry.logical_size as i64, 1);
                 }
             }
+        }
 
-            if entry.is_dir {
-                let cid = tree.add_child_with_frn(
-                    pid,
-                    &entry.name,
-                    NodeKind::Dir,
-                    0,
-                    0,
-                    entry.last_write_ts,
-                    NodeFlags::empty(),
-                    entry.file_id,
-                );
-                tree.stats.total_dirs += 1;
-                stack.push((cid, cur_path.join(&entry.name)));
-            } else {
-                let mut flags = NodeFlags::empty();
-                if entry.is_compressed {
-                    flags |= NodeFlags::COMPRESSED;
-                }
-                if entry.is_sparse {
-                    flags |= NodeFlags::SPARSE;
-                }
-                if entry.is_cloud_only {
-                    flags |= NodeFlags::CLOUD_ONLY;
-                }
-                let mut alloc = entry.allocated_size;
-                if use_nt && entry.file_id != 0 && !seen_ids.insert(entry.file_id) {
-                    flags |= NodeFlags::HARDLINK_DUP;
-                    alloc = 0;
-                }
-                let kind = if entry.is_cloud_only {
-                    NodeKind::CloudPlaceholder
-                } else {
-                    NodeKind::File
-                };
-                tree.add_child_with_frn(
-                    pid,
-                    &entry.name,
-                    kind,
-                    entry.logical_size,
-                    alloc,
-                    entry.last_write_ts,
-                    flags,
-                    entry.file_id,
-                );
-                added_alloc += alloc as i64;
-                added_logical += entry.logical_size as i64;
-                added_files += 1;
-            }
+        // Remove any children that disappeared on disk (recycled into `free_list`)
+        for (_, gone_cid) in existing_by_name {
+            tree.remove_subtree(gone_cid);
+            mutated = true;
         }
     }
 
-    // Recompute aggregates bottom-up inside `dir_nid` subtree, then propagate delta to ancestors
-    let old_alloc = tree.allocated_size[dir_nid as usize] as i64;
-    let old_logical = tree.logical_size[dir_nid as usize] as i64;
-    let old_files = tree.file_count[dir_nid as usize] as i64;
-
-    // Post-order aggregate strictly inside `dir_nid`
-    let mut order = Vec::new();
-    let mut s = vec![dir_nid];
-    while let Some(n) = s.pop() {
-        order.push(n);
-        if tree.kind_of(n) == NodeKind::Dir {
-            let idx = n as usize;
-            tree.allocated_size[idx] = 0;
-            tree.logical_size[idx] = 0;
-            tree.file_count[idx] = 0;
-            for ch in tree.children_iter(n) {
-                s.push(ch);
-            }
+    if mutated {
+        if recurse_existing_subdirs || added_subdirs_or_deep {
+            super::derived::refresh_derived_for_subtree(tree, dir_nid, ctx);
+        } else {
+            super::derived::refresh_derived_for_parent_shallow(tree, dir_nid, ctx);
         }
     }
-    for &n in order.iter().rev() {
-        if n == dir_nid {
-            continue;
-        }
-        let idx = n as usize;
-        let pid = tree.parent[idx];
-        if pid != super::model::NONE_NODE {
-            let pidx = pid as usize;
-            tree.allocated_size[pidx] =
-                tree.allocated_size[pidx].saturating_add(tree.allocated_size[idx]);
-            tree.logical_size[pidx] =
-                tree.logical_size[pidx].saturating_add(tree.logical_size[idx]);
-            tree.file_count[pidx] = tree.file_count[pidx].saturating_add(tree.file_count[idx]);
-            if tree.last_write_ts[idx] > tree.last_write_ts[pidx] {
-                tree.last_write_ts[pidx] = tree.last_write_ts[idx];
-            }
-        }
-    }
-
-    let d_alloc = tree.allocated_size[dir_nid as usize] as i64 - old_alloc;
-    let d_logical = tree.logical_size[dir_nid as usize] as i64 - old_logical;
-    let d_files = tree.file_count[dir_nid as usize] as i64 - old_files;
-    let parent_of_dir = tree.parent_of(dir_nid);
-    if parent_of_dir != super::model::NONE_NODE {
-        tree.propagate_delta_upwards(parent_of_dir, d_alloc, d_logical, d_files);
-    } else {
-        tree.stats.total_allocated_bytes = tree.allocated_size[0];
-        tree.stats.total_logical_bytes = tree.logical_size[0];
-        tree.stats.total_files =
-            (tree.stats.total_files as i64 + (added_files - old_files)).max(0) as u64;
-    }
-
-    // Refresh derived indexes strictly for this subtree (and recompute category deltas cleanly)
-    super::derived::refresh_derived_for_subtree(tree, dir_nid, ctx);
-    let _ = (added_alloc, added_logical);
-    true
+    mutated
 }

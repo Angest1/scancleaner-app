@@ -1,5 +1,4 @@
 use chrono::Utc;
-use rayon::prelude::*;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -386,10 +385,11 @@ pub async fn cmd_bootstrap_startup(
     let on_event_snap = on_event.clone();
     let snap_state_clone = snap_progress_state.clone();
     let total_drives_count = drives.len();
-    let loaded_snaps: Vec<(DriveInfo, Option<(crate::scanner::model::ScanTree, i64)>)> =
+    let loaded_snaps: Vec<(DriveInfo, Option<(crate::scanner::model::ScanTree, i64, u64)>)> =
         tauri::async_runtime::spawn_blocking(move || {
+            // Load sequentially (`into_iter`) so only ONE LZ4 decompression buffer exists at a time
             drives_for_load
-                .into_par_iter()
+                .into_iter()
                 .enumerate()
                 .map(|(idx, d)| {
                     if let Ok(mut items) = snap_state_clone.lock() {
@@ -400,16 +400,17 @@ pub async fn cmd_bootstrap_startup(
                     }
 
                     let path = default_snapshot_path(&d.root_path, d.volume_serial);
+                    let disk_bytes = std::fs::metadata(&path).map(|m| m.len()).unwrap_or(0);
                     let loaded = load_volume_snapshot(&path, Some(d.volume_serial))
                         .ok()
                         .filter(|(t, _)| t.include_ads == include_ads)
-                        .map(|(t, meta)| (t, meta.created_ts));
+                        .map(|(t, meta)| (t, meta.created_ts, disk_bytes));
 
                     if let Ok(mut items) = snap_state_clone.lock() {
                         if let Some(it) = items.get_mut(idx) {
                             it.done = true;
                             it.progress_ratio = Some(1.0);
-                            if let Some((ref tree, _)) = loaded {
+                            if let Some((ref tree, _, _)) = loaded {
                                 it.files = tree.stats.total_files;
                                 it.allocated_bytes = tree.stats.total_allocated_bytes;
                                 it.phase = "Listo".to_string();
@@ -459,22 +460,24 @@ pub async fn cmd_bootstrap_startup(
     if any_loaded {
         let mut summaries = Vec::new();
         let mut missing_drives = Vec::new();
-        let mut loaded_roots: Vec<(DriveInfo, i64)> = Vec::new();
+        let mut loaded_roots: Vec<(DriveInfo, i64, bool)> = Vec::new();
         let mut observations = Vec::new();
         let now_unix = Utc::now().timestamp();
 
         for (d, tree_opt) in loaded_snaps {
-            if let Some((mut tree, created_ts)) = tree_opt {
+            if let Some((mut tree, created_ts, disk_bytes)) = tree_opt {
                 let age_secs = now_unix.saturating_sub(created_ts);
                 let stale = !has_fast_usn && age_secs > 6 * 3600;
                 tree.stats.stale = stale;
+                let expected_raw_max = (tree.len() as u64).saturating_mul(90).saturating_add(4 * 1024 * 1024);
+                let was_bloated_on_disk = disk_bytes > expected_raw_max;
                 let summary = ScanSummary {
                     root_path: tree.root_path.to_string_lossy().into_owned(),
                     fs_type: tree.fs_type,
                     stats: tree.stats.clone(),
                     snapshot_id: None,
                 };
-                loaded_roots.push((d.clone(), created_ts));
+                loaded_roots.push((d.clone(), created_ts, was_bloated_on_disk));
                 state.insert_volume(tree, stale);
                 summaries.push(summary);
             } else {
@@ -485,7 +488,7 @@ pub async fn cmd_bootstrap_startup(
         if !has_fast_usn
             && loaded_roots
                 .iter()
-                .any(|(_, ts)| now_unix.saturating_sub(*ts) > 6 * 3600)
+                .any(|(_, ts, _)| now_unix.saturating_sub(*ts) > 6 * 3600)
         {
             observations.push(
                 "Algunos snapshots tienen más de 6 horas sin servicio MFT/USN: se refrescan suavemente en segundo plano."
@@ -534,7 +537,7 @@ pub async fn cmd_bootstrap_startup(
                     || !missing_drives.is_empty()
                     || loaded_roots
                         .iter()
-                        .any(|(_, ts)| now_ts.saturating_sub(*ts) > 6 * 3600);
+                        .any(|(_, ts, bloated)| *bloated || now_ts.saturating_sub(*ts) > 6 * 3600);
 
                 if needs_any_work {
                     if let Ok(mut ss) = st.sync_status.lock() {
@@ -551,7 +554,7 @@ pub async fn cmd_bootstrap_startup(
                 let meta = RealFileMetaLookup;
                 let mut any_updated = false;
 
-                for (d, created_ts) in &loaded_roots {
+                for (d, created_ts, was_bloated) in &loaded_roots {
                     start_watcher_for_drive(&app_bg, &d.root_path);
                     if let Some(slot) = st.get_volume_slot(Some(&d.root_path)) {
                         let needs_full = if d.fs_type == FileSystemType::Ntfs && can_usn {
@@ -572,20 +575,34 @@ pub async fn cmd_bootstrap_startup(
                             };
                             match outcome {
                                 Some(UsnSyncOutcome::UpToDate { applied_events, .. }) => {
-                                    if applied_events > 0 {
+                                    if applied_events > 0 || *was_bloated {
                                         if let Ok(g) = slot.read() {
                                             let _ = save_volume_snapshot(&g.tree, &idx_dir);
                                         }
-                                        any_updated = true;
+                                        if applied_events > 0 {
+                                            any_updated = true;
+                                        }
                                     }
                                     false
                                 }
                                 Some(UsnSyncOutcome::NeedsFullRescan { .. }) => true,
-                                _ => false,
+                                _ => {
+                                    if *was_bloated {
+                                        if let Ok(g) = slot.read() {
+                                            let _ = save_volume_snapshot(&g.tree, &idx_dir);
+                                        }
+                                    }
+                                    false
+                                }
                             }
                         } else {
-                            // Without USN: reuse fresh snapshot (< 6h) without redundant full rescan!
-                            now_ts.saturating_sub(*created_ts) > 6 * 3600
+                            let stale_snap = now_ts.saturating_sub(*created_ts) > 6 * 3600;
+                            if !stale_snap && *was_bloated {
+                                if let Ok(g) = slot.read() {
+                                    let _ = save_volume_snapshot(&g.tree, &idx_dir);
+                                }
+                            }
+                            stale_snap
                         };
 
                         if needs_full {

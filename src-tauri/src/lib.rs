@@ -51,7 +51,7 @@ use reconcile::queue::{BackgroundIoGuard, ReconcileOrigin, ReconcilePriority, Re
 use reconcile::triggers::{evaluate_free_space_drift, WinDiskSpaceProvider};
 use scanner::derived::{normalize_volume_key, DerivedBuildContext};
 use scanner::drives::{list_drives, DriveKind};
-use scanner::fallback_walk::reconcile_subtree_fallback;
+use scanner::fallback_walk::{reconcile_subtree_fallback, reconcile_watcher_path};
 use scanner::model::FileSystemType;
 use scanner::{scan_directory_with_options, ScanOptions};
 use service::client::{ping_service, ServiceUsnJournalReader};
@@ -338,8 +338,12 @@ fn start_background_sync_workers(app_handle: tauri::AppHandle) {
                                 }
 
                                 if run_subtrees {
+                                    let watcher_only = batch
+                                        .origins
+                                        .iter()
+                                        .all(|o| matches!(o, ReconcileOrigin::DirWatcher));
                                     for p in &batch.paths {
-                                        // NEVER run single-threaded `reconcile_subtree_fallback` on a volume root (`C:\`)!
+                                        // NEVER run single-threaded subtree fallback on a volume root (`C:\`)!
                                         if scanner::is_volume_root(p) {
                                             if batch
                                                 .origins
@@ -352,7 +356,12 @@ fn start_background_sync_workers(app_handle: tauri::AppHandle) {
                                             }
                                             continue;
                                         }
-                                        if reconcile_subtree_fallback(&mut g.tree, p, &ctx) {
+                                        let changed = if watcher_only {
+                                            reconcile_watcher_path(&mut g.tree, p, &ctx)
+                                        } else {
+                                            reconcile_subtree_fallback(&mut g.tree, p, &ctx)
+                                        };
+                                        if changed {
                                             mutated = true;
                                         }
                                     }
