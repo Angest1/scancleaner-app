@@ -18,6 +18,7 @@ export type LauncherTarget =
 
 interface LauncherGridProps {
   activeScanRoot: string | null;
+  indexedCount?: number;
   onNavigate: (page: LauncherTarget) => void;
 }
 
@@ -29,13 +30,23 @@ interface LauncherItem {
   icon: ReactNode;
 }
 
-export function LauncherGrid({ activeScanRoot, onNavigate }: LauncherGridProps) {
+export function LauncherGrid({ activeScanRoot, indexedCount = 0, onNavigate }: LauncherGridProps) {
   const items: LauncherItem[] = [
     {
       id: "explorer",
       label: "Explorador",
-      caption: activeScanRoot ? `Activo: ${activeScanRoot}` : "Treemap y ranking",
-      badge: activeScanRoot ? activeScanRoot.replace("\\", "") : undefined,
+      caption:
+        indexedCount > 1
+          ? `${indexedCount} unidades listas`
+          : activeScanRoot
+            ? `Activa: ${activeScanRoot}`
+            : "Treemap y ranking",
+      badge:
+        indexedCount > 1
+          ? `${indexedCount} discos`
+          : activeScanRoot
+            ? activeScanRoot.replace("\\", "")
+            : undefined,
       icon: <ExplorerIcon />,
     },
     {

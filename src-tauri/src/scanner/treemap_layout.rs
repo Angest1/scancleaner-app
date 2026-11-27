@@ -96,7 +96,7 @@ pub fn compute_treemap_layout(
 
     let total_area = width * height;
     let min_area_threshold = min_px * min_px;
-    let prot_engine = ProtectionEngine::load_default();
+    let mut prot_engine: Option<ProtectionEngine> = None;
 
     let mut candidates: Vec<LayoutCandidate> = Vec::new();
     let mut other_bytes = 0u64;
@@ -117,7 +117,10 @@ pub fn compute_treemap_layout(
             let is_prot_flag = flags.contains(NodeFlags::PROTECTED)
                 || flags.contains(NodeFlags::PROTECTED_DESCENDANT);
             let prot_reason = if is_prot_flag {
-                prot_engine.is_protected_for_ui(&full_pb).reason
+                prot_engine
+                    .get_or_insert_with(ProtectionEngine::load_default)
+                    .is_protected_for_ui(&full_pb)
+                    .reason
             } else {
                 None
             };

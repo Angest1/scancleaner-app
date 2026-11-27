@@ -2,7 +2,7 @@ use chrono::Utc;
 use rusqlite::{params, Connection};
 use serde::{Deserialize, Serialize};
 use std::fs::{self, OpenOptions};
-use std::io::{BufRead, BufReader, Write};
+use std::io::Write;
 use std::path::{Path, PathBuf};
 
 use crate::categorizer::CategoryBucket;
@@ -88,6 +88,7 @@ pub fn logs_dir() -> PathBuf {
     app_data_dir().join("logs")
 }
 
+#[derive(Clone)]
 pub struct Storage {
     db_path: PathBuf,
 }
@@ -294,20 +295,20 @@ pub fn read_cleanup_logs(log_dir: &Path, limit: usize) -> Vec<CleanupLogEntry> {
 
     let mut entries = Vec::new();
     for file_path in files {
-        let Ok(file) = fs::File::open(file_path) else {
+        let Ok(content) = fs::read_to_string(file_path) else {
             continue;
         };
-        let reader = BufReader::new(file);
-        let mut day_entries: Vec<CleanupLogEntry> = reader
-            .lines()
-            .map_while(Result::ok)
-            .filter_map(|line| serde_json::from_str::<CleanupLogEntry>(&line).ok())
-            .collect();
-        day_entries.reverse();
-        for item in day_entries {
-            entries.push(item);
-            if entries.len() >= limit {
-                return entries;
+        // Iterate from the newest lines at the end of the file so we only deserialize
+        // up to `limit` entries instead of parsing thousands of older JSONL lines.
+        for line in content.lines().rev() {
+            if line.trim().is_empty() {
+                continue;
+            }
+            if let Ok(item) = serde_json::from_str::<CleanupLogEntry>(line) {
+                entries.push(item);
+                if entries.len() >= limit {
+                    return entries;
+                }
             }
         }
     }

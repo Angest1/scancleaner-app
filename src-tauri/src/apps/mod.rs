@@ -1,3 +1,4 @@
+use rayon::prelude::*;
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 use std::ffi::OsString;
@@ -13,6 +14,7 @@ use windows::Win32::System::Registry::{
 use windows::Win32::UI::Shell::ShellExecuteW;
 use windows::Win32::UI::WindowsAndMessaging::SW_SHOWNORMAL;
 
+use crate::scanner::derived::volume_root_of_path;
 use crate::scanner::model::ScanTree;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -252,7 +254,7 @@ fn is_too_broad_install_dir(path: &Path) -> bool {
     false
 }
 
-fn bounded_dir_size(path: &Path, max_entries: usize) -> Option<u64> {
+fn bounded_dir_size_fast(path: &Path, max_entries: usize) -> Option<u64> {
     if !path.is_dir() {
         return None;
     }
@@ -260,21 +262,23 @@ fn bounded_dir_size(path: &Path, max_entries: usize) -> Option<u64> {
     let mut total = 0u64;
     let mut visited = 0usize;
     while let Some(dir) = stack.pop() {
-        let rd = std::fs::read_dir(&dir).ok()?;
+        let Ok(rd) = std::fs::read_dir(&dir) else {
+            continue;
+        };
         for entry in rd.flatten() {
             visited += 1;
             if visited > max_entries {
                 return Some(total);
             }
-            let Ok(meta) = std::fs::symlink_metadata(entry.path()) else {
+            let Ok(ft) = entry.file_type() else {
                 continue;
             };
-            if meta.file_type().is_symlink() {
+            if ft.is_symlink() {
                 continue;
             }
-            if meta.is_dir() {
+            if ft.is_dir() {
                 stack.push(entry.path());
-            } else {
+            } else if let Ok(meta) = entry.metadata() {
                 total = total.saturating_add(meta.len());
             }
         }
@@ -282,7 +286,36 @@ fn bounded_dir_size(path: &Path, max_entries: usize) -> Option<u64> {
     Some(total)
 }
 
-fn measure_app_dir(path_str: &str, scan_tree: Option<&ScanTree>) -> Option<u64> {
+fn lookup_size_in_trees(path: &Path, trees: &[&ScanTree]) -> Option<u64> {
+    let vol = volume_root_of_path(path)?;
+    for &tree in trees {
+        if tree.root_path.to_string_lossy().eq_ignore_ascii_case(&vol) {
+            if let Some(nid) = tree.find_node_by_path(path) {
+                return Some(tree.allocated_size[nid as usize]);
+            }
+            return None;
+        }
+    }
+    None
+}
+
+fn is_volume_indexed(path: &Path, trees: &[&ScanTree]) -> bool {
+    let Some(vol) = volume_root_of_path(path) else {
+        return false;
+    };
+    trees
+        .iter()
+        .any(|t| t.root_path.to_string_lossy().eq_ignore_ascii_case(&vol))
+}
+
+/// Resolves an app directory size in O(1) from pre-indexed `ScanTree`s across all volumes.
+/// Only falls back to a tightly bounded Win32 walk when `allow_disk_fallback` is true AND
+/// the path's volume isn't already indexed (eliminating the multi-second stall on AppsView).
+fn measure_app_dir_fast(
+    path_str: &str,
+    trees: &[&ScanTree],
+    allow_disk_fallback: bool,
+) -> Option<u64> {
     let clean = path_str.trim().trim_matches('"');
     if clean.is_empty() {
         return None;
@@ -291,15 +324,16 @@ fn measure_app_dir(path_str: &str, scan_tree: Option<&ScanTree>) -> Option<u64> 
     if is_too_broad_install_dir(&path) {
         return None;
     }
-    if let Some(tree) = scan_tree {
-        if let Some(nid) = tree.find_node_by_path(&path) {
-            return Some(tree.allocated_size[nid as usize]);
-        }
+    if let Some(sz) = lookup_size_in_trees(&path, trees) {
+        return Some(sz);
     }
-    bounded_dir_size(&path, 25_000)
+    if allow_disk_fallback && !is_volume_indexed(&path, trees) {
+        return bounded_dir_size_fast(&path, 1_500);
+    }
+    None
 }
 
-pub fn list_installed_apps(scan_tree: Option<&ScanTree>) -> Vec<InstalledApp> {
+pub fn list_installed_apps(scan_trees: &[&ScanTree]) -> Vec<InstalledApp> {
     let mut raw_win32 = Vec::new();
     scan_uninstall_hive(
         HKEY_LOCAL_MACHINE,
@@ -336,31 +370,42 @@ pub fn list_installed_apps(scan_tree: Option<&ScanTree>) -> Vec<InstalledApp> {
     }
 
     let mut seen_win32: HashSet<String> = HashSet::new();
-    let mut apps: Vec<InstalledApp> = Vec::new();
-
+    let mut deduped_win32: Vec<RawWin32App> = Vec::with_capacity(raw_win32.len());
     for raw in raw_win32 {
         let dedup_key = format!(
             "{}|{}",
             raw.name.to_ascii_lowercase(),
             raw.version.to_ascii_lowercase()
         );
-        if !seen_win32.insert(dedup_key) {
-            continue;
+        if seen_win32.insert(dedup_key) {
+            deduped_win32.push(raw);
         }
+    }
 
-        let shared_loc = raw.install_location.as_ref().is_some_and(|loc| {
-            let norm = loc
-                .trim()
-                .trim_matches('"')
-                .trim_end_matches('\\')
-                .to_ascii_lowercase();
-            location_counts.get(&norm).copied().unwrap_or(0) > 1
-        });
+    // Resolve Win32 app sizes in parallel: instant O(1) ScanTree lookup first, then Registry
+    // EstimatedSize, and only a fast bounded Win32 walk if unindexed AND no estimate exists.
+    let mut apps: Vec<InstalledApp> = deduped_win32
+        .into_par_iter()
+        .map(|raw| {
+            let shared_loc = raw.install_location.as_ref().is_some_and(|loc| {
+                let norm = loc
+                    .trim()
+                    .trim_matches('"')
+                    .trim_end_matches('\\')
+                    .to_ascii_lowercase();
+                location_counts.get(&norm).copied().unwrap_or(0) > 1
+            });
 
-        let (size_bytes, size_source) = if !shared_loc {
-            if let Some(ref loc) = raw.install_location {
-                if let Some(measured) = measure_app_dir(loc, scan_tree) {
-                    (measured, SizeSource::Measured)
+            let (size_bytes, size_source) = if !shared_loc {
+                if let Some(ref loc) = raw.install_location {
+                    let allow_fallback = raw.estimated_bytes == 0;
+                    if let Some(measured) = measure_app_dir_fast(loc, scan_trees, allow_fallback) {
+                        (measured, SizeSource::Measured)
+                    } else if raw.estimated_bytes > 0 {
+                        (raw.estimated_bytes, SizeSource::Estimated)
+                    } else {
+                        (0, SizeSource::Unknown)
+                    }
                 } else if raw.estimated_bytes > 0 {
                     (raw.estimated_bytes, SizeSource::Estimated)
                 } else {
@@ -370,36 +415,40 @@ pub fn list_installed_apps(scan_tree: Option<&ScanTree>) -> Vec<InstalledApp> {
                 (raw.estimated_bytes, SizeSource::Estimated)
             } else {
                 (0, SizeSource::Unknown)
+            };
+
+            InstalledApp {
+                id: raw.key_id,
+                name: raw.name,
+                publisher: raw.publisher,
+                version: raw.version,
+                source: AppSource::Win32,
+                install_location: raw.install_location,
+                size_bytes,
+                size_source,
+                uninstall_string: raw.uninstall_string,
+                package_family_name: None,
+                install_date: raw.install_date,
             }
-        } else if raw.estimated_bytes > 0 {
-            (raw.estimated_bytes, SizeSource::Estimated)
-        } else {
-            (0, SizeSource::Unknown)
-        };
+        })
+        .collect();
 
-        apps.push(InstalledApp {
-            id: raw.key_id,
-            name: raw.name,
-            publisher: raw.publisher,
-            version: raw.version,
-            source: AppSource::Win32,
-            install_location: raw.install_location,
-            size_bytes,
-            size_source,
-            uninstall_string: raw.uninstall_string,
-            package_family_name: None,
-            install_date: raw.install_date,
-        });
-    }
-
-    // Store / MSIX packages via WinRT PackageManager
-    collect_msix_packages(scan_tree, &mut apps);
+    // Store / MSIX packages via WinRT PackageManager + parallel O(1) ScanTree resolution
+    collect_msix_packages(scan_trees, &mut apps);
 
     apps.sort_by(|a, b| b.size_bytes.cmp(&a.size_bytes).then(a.name.cmp(&b.name)));
     apps
 }
 
-fn collect_msix_packages(scan_tree: Option<&ScanTree>, out: &mut Vec<InstalledApp>) {
+struct RawMsixPkg {
+    family_name: String,
+    display_name: String,
+    publisher: String,
+    version: String,
+    install_location: Option<String>,
+}
+
+fn collect_msix_packages(scan_trees: &[&ScanTree], out: &mut Vec<InstalledApp>) {
     let Ok(pm) = PackageManager::new() else {
         return;
     };
@@ -407,6 +456,7 @@ fn collect_msix_packages(scan_tree: Option<&ScanTree>, out: &mut Vec<InstalledAp
         return;
     };
 
+    let mut raw_pkgs: Vec<RawMsixPkg> = Vec::new();
     for pkg in packages {
         if pkg.IsFramework().unwrap_or(false)
             || pkg.IsResourcePackage().unwrap_or(false)
@@ -446,42 +496,67 @@ fn collect_msix_packages(scan_tree: Option<&ScanTree>, out: &mut Vec<InstalledAp
             .map(|h| h.to_string())
             .filter(|s| !s.is_empty());
 
-        let mut measured_total = 0u64;
-        let mut any_measured = false;
-        if let Some(ref loc) = install_location {
-            if let Some(sz) = measure_app_dir(loc, scan_tree) {
-                measured_total = measured_total.saturating_add(sz);
-                any_measured = true;
-            }
-        }
-        if !family_name.is_empty() {
-            if let Ok(local_app) = std::env::var("LOCALAPPDATA") {
-                let pkg_data = PathBuf::from(local_app).join("Packages").join(&family_name);
-                if let Some(sz) = bounded_dir_size(&pkg_data, 15_000) {
+        raw_pkgs.push(RawMsixPkg {
+            family_name,
+            display_name,
+            publisher,
+            version,
+            install_location,
+        });
+    }
+
+    let local_app_dir = std::env::var("LOCALAPPDATA").ok().map(PathBuf::from);
+    let allow_unindexed_walk = scan_trees.is_empty();
+
+    let msix_apps: Vec<InstalledApp> = raw_pkgs
+        .into_par_iter()
+        .map(|raw| {
+            let mut measured_total = 0u64;
+            let mut any_measured = false;
+            if let Some(ref loc) = raw.install_location {
+                if let Some(sz) = measure_app_dir_fast(loc, scan_trees, allow_unindexed_walk) {
                     measured_total = measured_total.saturating_add(sz);
                     any_measured = true;
                 }
             }
-        }
+            if !raw.family_name.is_empty() {
+                if let Some(ref local_app) = local_app_dir {
+                    let pkg_data = local_app.join("Packages").join(&raw.family_name);
+                    let data_sz = lookup_size_in_trees(&pkg_data, scan_trees).or_else(|| {
+                        if allow_unindexed_walk {
+                            bounded_dir_size_fast(&pkg_data, 1_500)
+                        } else {
+                            None
+                        }
+                    });
+                    if let Some(sz) = data_sz {
+                        measured_total = measured_total.saturating_add(sz);
+                        any_measured = true;
+                    }
+                }
+            }
 
-        out.push(InstalledApp {
-            id: format!("msix:{family_name}"),
-            name: display_name,
-            publisher,
-            version,
-            source: AppSource::StoreMsix,
-            install_location,
-            size_bytes: measured_total,
-            size_source: if any_measured {
-                SizeSource::Measured
-            } else {
-                SizeSource::Unknown
-            },
-            uninstall_string: None,
-            package_family_name: Some(family_name),
-            install_date: None,
-        });
-    }
+            InstalledApp {
+                id: format!("msix:{}", raw.family_name),
+                name: raw.display_name,
+                publisher: raw.publisher,
+                version: raw.version,
+                source: AppSource::StoreMsix,
+                install_location: raw.install_location,
+                size_bytes: measured_total,
+                size_source: if any_measured {
+                    SizeSource::Measured
+                } else {
+                    SizeSource::Unknown
+                },
+                uninstall_string: None,
+                package_family_name: Some(raw.family_name),
+                install_date: None,
+            }
+        })
+        .collect();
+
+    out.extend(msix_apps);
 }
 
 pub fn parse_uninstall_command(raw: &str) -> Option<(String, String)> {

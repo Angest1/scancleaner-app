@@ -35,6 +35,8 @@ export interface StartupBootstrapResult {
   setServiceStatus: (st: IndexingServiceStatus) => void;
   setDrives: (d: DriveInfo[]) => void;
   setActiveSummary: (s: ScanSummary | null) => void;
+  upsertSummary: (s: ScanSummary) => void;
+  refreshSummaries: () => void;
   mountHomeUnderneath: () => void;
   completeSplash: () => void;
   retryBootstrap: () => void;
@@ -312,6 +314,30 @@ export function useStartupBootstrap(): StartupBootstrapResult {
     setSplashVisible(false);
   }, []);
 
+  const upsertSummary = useCallback((summary: ScanSummary) => {
+    const key = summary.rootPath.toUpperCase();
+    setSummaries((prev) => {
+      const rest = prev.filter((s) => s.rootPath.toUpperCase() !== key);
+      return [...rest, summary].sort((a, b) => a.rootPath.localeCompare(b.rootPath));
+    });
+    setActiveSummary(summary);
+  }, []);
+
+  const refreshSummaries = useCallback(() => {
+    api
+      .listIndexedSummaries()
+      .then((list) => {
+        if (list.length === 0) return;
+        setSummaries(list);
+        setActiveSummary((cur) => {
+          if (!cur) return list[0];
+          const updated = list.find((s) => s.rootPath.toUpperCase() === cur.rootPath.toUpperCase());
+          return updated ?? cur;
+        });
+      })
+      .catch(() => {});
+  }, []);
+
   return {
     startup,
     settings,
@@ -335,6 +361,8 @@ export function useStartupBootstrap(): StartupBootstrapResult {
     setServiceStatus,
     setDrives,
     setActiveSummary,
+    upsertSummary,
+    refreshSummaries,
     mountHomeUnderneath,
     completeSplash,
     retryBootstrap: () => runBootstrap(true),

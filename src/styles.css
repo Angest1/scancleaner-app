@@ -1,5 +1,6 @@
 @import "tailwindcss";
 @import "./styles/tokens.css";
+@import "./styles/motion.css";
 @import "./styles/startup.css";
 
 @theme {
@@ -143,12 +144,6 @@
     ease;
 }
 
-.neu-card-interactive:hover {
-  transform: translateY(-2px);
-  box-shadow: var(--shadow-neu-hover);
-  border-color: var(--border-strong);
-}
-
 .neu-tile {
   background: var(--surface-tile);
   border: 1px solid var(--border-subtle);
@@ -157,170 +152,21 @@
     ease;
 }
 
-.neu-tile:hover {
-  transform: translateY(-5px) scale(1.025);
-  box-shadow: var(--shadow-tile-hover);
-  border-color: var(--accent-border);
+@media (hover: hover) and (pointer: fine) {
+  .neu-card-interactive:hover {
+    transform: translateY(-2px);
+    box-shadow: var(--shadow-neu-hover);
+    border-color: var(--border-strong);
+  }
+
+  .neu-tile:hover {
+    transform: translateY(-5px) scale(1.025);
+    box-shadow: var(--shadow-tile-hover);
+    border-color: var(--accent-border);
+  }
 }
 
 .neu-tile:active {
   transform: translateY(-1px) scale(0.97);
   transition-duration: 110ms;
-}
-
-/* Composited GPU-only keyframes */
-@keyframes sc-modal-in {
-  from {
-    opacity: 0;
-    transform: scale(0.97) translateY(6px);
-  }
-  to {
-    opacity: 1;
-    transform: scale(1) translateY(0);
-  }
-}
-
-@keyframes sc-backdrop-in {
-  from {
-    opacity: 0;
-  }
-  to {
-    opacity: 1;
-  }
-}
-
-@keyframes sc-popover-in {
-  from {
-    opacity: 0;
-    transform: scale(0.96);
-  }
-  to {
-    opacity: 1;
-    transform: scale(1);
-  }
-}
-
-@keyframes sc-fade-up {
-  from {
-    opacity: 0;
-    transform: translateY(10px);
-  }
-  to {
-    opacity: 1;
-    transform: translateY(0);
-  }
-}
-
-@keyframes sc-view-in {
-  from {
-    opacity: 0;
-    transform: translateY(10px) scale(0.992);
-  }
-  to {
-    opacity: 1;
-    transform: translateY(0) scale(1);
-  }
-}
-
-@keyframes sc-drawer-in {
-  from {
-    opacity: 0;
-    transform: translateX(28px);
-  }
-  to {
-    opacity: 1;
-    transform: translateX(0);
-  }
-}
-
-@keyframes sc-skeleton-pulse {
-  0%,
-  100% {
-    opacity: 0.45;
-  }
-  50% {
-    opacity: 0.85;
-  }
-}
-
-@keyframes sc-scan-indeterminate {
-  0% {
-    transform: translateX(-100%);
-  }
-  100% {
-    transform: translateX(260%);
-  }
-}
-
-.animate-modal-in {
-  animation: sc-modal-in 210ms var(--ease-out) both;
-}
-
-.animate-backdrop-in {
-  animation: sc-backdrop-in 170ms var(--ease-out) both;
-}
-
-.animate-popover-in {
-  animation: sc-popover-in 140ms var(--ease-out) both;
-}
-
-.animate-fade-up {
-  animation: sc-fade-up 320ms var(--ease-out) both;
-}
-
-.animate-view-in {
-  animation: sc-view-in 260ms var(--ease-out) both;
-}
-
-.animate-drawer-in {
-  animation: sc-drawer-in 220ms var(--ease-out) both;
-}
-
-.animate-skeleton {
-  animation: sc-skeleton-pulse 1.5s ease-in-out infinite;
-}
-
-.animate-scan-bar {
-  animation: sc-scan-indeterminate 1.4s var(--ease-in-out) infinite;
-}
-
-/* Smooth grid-row accordion collapse */
-.collapse-grid {
-  display: grid;
-  grid-template-rows: 0fr;
-  opacity: 0;
-  transition: grid-template-rows 240ms var(--ease-out), opacity 200ms var(--ease-out);
-}
-
-.collapse-grid[data-open="true"] {
-  grid-template-rows: 1fr;
-  opacity: 1;
-}
-
-.collapse-grid > .collapse-inner {
-  overflow: hidden;
-  min-height: 0;
-}
-
-@media (prefers-reduced-motion: reduce) {
-  .animate-modal-in,
-  .animate-backdrop-in,
-  .animate-popover-in,
-  .animate-fade-up,
-  .animate-view-in,
-  .animate-skeleton,
-  .animate-scan-bar {
-    animation: none !important;
-  }
-
-  .neu-tile:hover,
-  .neu-card-interactive:hover {
-    transform: none !important;
-  }
-
-  *,
-  *::before,
-  *::after {
-    transition-duration: 0.01ms !important;
-  }
 }

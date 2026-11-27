@@ -119,3 +119,14 @@ export interface UninstallLeftoverSuggestion {
   nivel: string;
   reason: string;
 }
+
+export interface CleanupProgressEvent {
+  planId: string;
+  phase: string;
+  currentLabel: string;
+  currentPath: string;
+  completedItems: number;
+  totalItems: number;
+  freedBytesSoFar: number;
+  failedCount: number;
+}

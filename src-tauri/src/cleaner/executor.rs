@@ -395,6 +395,19 @@ pub fn execute_cleanup_plan(
     .map(|(res, _)| res)
 }
 
+#[derive(Debug, Clone, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CleanupProgressEvent {
+    pub plan_id: String,
+    pub phase: String,
+    pub current_label: String,
+    pub current_path: String,
+    pub completed_items: usize,
+    pub total_items: usize,
+    pub freed_bytes_so_far: u64,
+    pub failed_count: usize,
+}
+
 pub fn execute_cleanup_plan_with_options(
     plan: &CleanupPlan,
     confirmed_permanent: bool,
@@ -403,9 +416,54 @@ pub fn execute_cleanup_plan_with_options(
     sandbox_root: Option<&Path>,
     defer_trash_drain: bool,
 ) -> Result<(CleanupResult, Vec<PathBuf>), String> {
+    execute_cleanup_plan_with_progress(
+        plan,
+        confirmed_permanent,
+        log_dir_override,
+        sandbox_guard,
+        sandbox_root,
+        defer_trash_drain,
+        None,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn execute_cleanup_plan_with_progress(
+    plan: &CleanupPlan,
+    confirmed_permanent: bool,
+    log_dir_override: Option<&Path>,
+    sandbox_guard: Option<&SandboxGuard>,
+    sandbox_root: Option<&Path>,
+    defer_trash_drain: bool,
+    on_progress: Option<&(dyn Fn(CleanupProgressEvent) + Sync)>,
+) -> Result<(CleanupResult, Vec<PathBuf>), String> {
     if plan.mode == CleanupMode::Permanent && !confirmed_permanent {
         return Err("El borrado permanente requiere confirmación explícita.".to_string());
     }
+
+    let total_items = plan.items.len().max(1);
+    let emit = |phase: &str, label: &str, path: &str, done: usize, freed: u64, failed: usize| {
+        if let Some(cb) = on_progress {
+            cb(CleanupProgressEvent {
+                plan_id: plan.plan_id.clone(),
+                phase: phase.to_string(),
+                current_label: label.to_string(),
+                current_path: path.to_string(),
+                completed_items: done,
+                total_items,
+                freed_bytes_so_far: freed,
+                failed_count: failed,
+            });
+        }
+    };
+    emit(
+        "preparing",
+        "Validando guardrails de limpieza…",
+        "",
+        0,
+        0,
+        0,
+    );
 
     let log_dir = log_dir_override.map(PathBuf::from).unwrap_or_else(logs_dir);
     let space_provider = WinDiskSpaceProvider;
@@ -421,6 +479,14 @@ pub fn execute_cleanup_plan_with_options(
     }
 
     if plan.mode == CleanupMode::EmptyRecycleBin {
+        emit(
+            "deleting",
+            "Vaciando Papelera de reciclaje…",
+            "$Recycle.Bin",
+            0,
+            0,
+            0,
+        );
         let sys_drive = format!(
             "{}\\",
             std::env::var("SystemDrive").unwrap_or_else(|_| "C:".to_string())
@@ -541,10 +607,18 @@ pub fn execute_cleanup_plan_with_options(
     let mut staged_paths_to_drain: Vec<PathBuf> = Vec::new();
 
     if plan.mode == CleanupMode::RecycleBin {
+        emit(
+            "deleting",
+            &format!("Enviando {} elementos a la Papelera…", valid_items.len()),
+            valid_items.first().map(|i| i.path.as_str()).unwrap_or(""),
+            skipped_count,
+            0,
+            0,
+        );
         let paths: Vec<PathBuf> = valid_items.iter().map(|i| PathBuf::from(&i.path)).collect();
         let results = delete_to_recycle_bin_sta(&paths);
 
-        for (item, res) in valid_items.into_iter().zip(results) {
+        for (idx, (item, res)) in valid_items.into_iter().zip(results).enumerate() {
             let (status, detail, bytes) = match res {
                 Ok(()) => {
                     succeeded_count += 1;
@@ -562,9 +636,27 @@ pub fn execute_cleanup_plan_with_options(
                 status: status.to_string(),
                 detail,
             });
+            if idx % 10 == 0 || idx + 1 == paths.len() {
+                emit(
+                    "deleting",
+                    "Registrando elementos en Papelera…",
+                    &item.path,
+                    skipped_count + idx + 1,
+                    freed_bytes,
+                    failed_count,
+                );
+            }
         }
     } else {
-        for item in valid_items {
+        for (idx, item) in valid_items.into_iter().enumerate() {
+            emit(
+                "deleting",
+                "Eliminando de forma segura…",
+                &item.path,
+                skipped_count + idx,
+                freed_bytes,
+                failed_count,
+            );
             let p = PathBuf::from(&item.path);
             let res = if let Ok(staged) =
                 stage_to_same_volume_trash(&p, &plan.plan_id, sandbox_guard, sandbox_root)
@@ -597,8 +689,24 @@ pub fn execute_cleanup_plan_with_options(
                 status: status.to_string(),
                 detail,
             });
+            emit(
+                "deleting",
+                "Procesando lote de limpieza…",
+                &item.path,
+                skipped_count + idx + 1,
+                freed_bytes,
+                failed_count,
+            );
         }
     }
+    emit(
+        "finalizing",
+        "Midiendo espacio liberado y guardando auditoría…",
+        "",
+        total_items,
+        freed_bytes,
+        failed_count,
+    );
 
     // Measure real freed space delta across affected volumes
     let mut total_real_freed = 0u64;

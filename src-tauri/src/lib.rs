@@ -246,30 +246,41 @@ fn start_background_sync_workers(app_handle: tauri::AppHandle) {
         .name("reconcile-worker".to_string())
         .spawn(move || {
             let mut last_ui_emit = Instant::now() - Duration::from_secs(1);
+            let mut last_snap_save: std::collections::HashMap<String, Instant> =
+                std::collections::HashMap::new();
             let mut pending_emit = false;
             let meta_lookup = RealFileMetaLookup;
 
             loop {
                 std::thread::sleep(Duration::from_millis(80));
                 let state = handle_recon.state::<AppState>();
-                let batch_opt = state
+                let (batch_opt, remaining) = state
                     .reconcile_queue
                     .lock()
                     .ok()
-                    .and_then(|mut q| q.pop_ready(Instant::now()));
+                    .map(|mut q| {
+                        let b = q.pop_ready(Instant::now());
+                        let rem = q.pending_count();
+                        (b, rem)
+                    })
+                    .unwrap_or((None, 0));
 
                 if let Some(batch) = batch_opt {
-                    if let Ok(mut st) = state.sync_status.lock() {
-                        st.syncing = true;
-                        st.last_origin = batch
-                            .origins
-                            .first()
-                            .map(|o| format!("{o:?}").to_ascii_lowercase());
+                    let is_user_or_drift = batch.priority != ReconcilePriority::Low;
+                    if is_user_or_drift {
+                        if let Ok(mut st) = state.sync_status.lock() {
+                            st.syncing = true;
+                            st.pending_batches = remaining;
+                            st.last_origin = batch
+                                .origins
+                                .first()
+                                .map(|o| format!("{o:?}").to_ascii_lowercase());
+                        }
+                        let _ = handle_recon.emit(
+                            "sync-status-changed",
+                            state.sync_status.lock().map(|g| g.clone()).ok(),
+                        );
                     }
-                    let _ = handle_recon.emit(
-                        "sync-status-changed",
-                        state.sync_status.lock().map(|g| g.clone()).ok(),
-                    );
 
                     // Enter low-priority I/O mode for Medium/Low background batches
                     let _io_guard = BackgroundIoGuard::enter_if_low_priority(batch.priority);
@@ -277,77 +288,160 @@ fn start_background_sync_workers(app_handle: tauri::AppHandle) {
                     let use_service = !is_elevated() && ping_service();
 
                     let mut ok = true;
+                    let mut needs_parallel_full_rescan = false;
+                    let mut mutated = false;
+
                     if let Some(slot) = state.get_volume_slot(Some(&batch.volume)) {
-                        if let Ok(mut g) = slot.write() {
-                            // Try USN first for NTFS WindowFocus / UsnJournal / Drift events
-                            let tried_usn = g.tree.fs_type == FileSystemType::Ntfs
-                                && (is_elevated() || use_service)
-                                && batch.origins.iter().all(|o| {
-                                    matches!(
-                                        o,
-                                        ReconcileOrigin::UsnJournal
-                                            | ReconcileOrigin::WindowFocus
-                                            | ReconcileOrigin::FreeSpaceDrift
-                                    )
-                                });
+                        let should_save = {
+                            if let Ok(mut g) = slot.write() {
+                                // Try USN first for NTFS WindowFocus / UsnJournal / Drift events
+                                let usn_eligible = g.tree.fs_type == FileSystemType::Ntfs
+                                    && (is_elevated() || use_service)
+                                    && batch.origins.iter().all(|o| {
+                                        matches!(
+                                            o,
+                                            ReconcileOrigin::UsnJournal
+                                                | ReconcileOrigin::WindowFocus
+                                                | ReconcileOrigin::FreeSpaceDrift
+                                        )
+                                    });
 
-                            let mut fell_back_to_subtree = !tried_usn;
-                            if tried_usn {
-                                let reader: Box<dyn UsnJournalReader> = if is_elevated() {
-                                    Box::new(WinUsnJournalReader)
-                                } else {
-                                    Box::new(ServiceUsnJournalReader)
-                                };
-                                match sync_tree_with_usn(
-                                    &mut g.tree,
-                                    reader.as_ref(),
-                                    &meta_lookup,
-                                    &ctx,
-                                ) {
-                                    UsnSyncOutcome::UpToDate { .. } => {
-                                        g.stale = false;
-                                    }
-                                    UsnSyncOutcome::NeedsFullRescan { reason } => {
-                                        diagnostics::log_warn(&format!(
-                                            "USN rescan needed on {}: {reason}",
-                                            batch.volume
-                                        ));
-                                        fell_back_to_subtree = true;
-                                    }
-                                    UsnSyncOutcome::Unavailable { .. } => {
-                                        fell_back_to_subtree = true;
+                                let mut run_subtrees = !usn_eligible;
+                                if usn_eligible {
+                                    let reader: Box<dyn UsnJournalReader> = if is_elevated() {
+                                        Box::new(WinUsnJournalReader)
+                                    } else {
+                                        Box::new(ServiceUsnJournalReader)
+                                    };
+                                    match sync_tree_with_usn(
+                                        &mut g.tree,
+                                        reader.as_ref(),
+                                        &meta_lookup,
+                                        &ctx,
+                                    ) {
+                                        UsnSyncOutcome::UpToDate { applied_events, .. } => {
+                                            g.stale = false;
+                                            mutated = applied_events > 0;
+                                        }
+                                        UsnSyncOutcome::NeedsFullRescan { reason } => {
+                                            diagnostics::log_warn(&format!(
+                                                "USN rescan needed on {}: {reason}",
+                                                batch.volume
+                                            ));
+                                            needs_parallel_full_rescan = true;
+                                            run_subtrees = false;
+                                        }
+                                        UsnSyncOutcome::Unavailable { .. } => {
+                                            run_subtrees = false;
+                                        }
                                     }
                                 }
-                            }
 
-                            if fell_back_to_subtree {
-                                for p in &batch.paths {
-                                    reconcile_subtree_fallback(&mut g.tree, p, &ctx);
+                                if run_subtrees {
+                                    for p in &batch.paths {
+                                        // NEVER run single-threaded `reconcile_subtree_fallback` on a volume root (`C:\`)!
+                                        if scanner::is_volume_root(p) {
+                                            if batch
+                                                .origins
+                                                .contains(&ReconcileOrigin::FreeSpaceDrift)
+                                                || batch
+                                                    .origins
+                                                    .contains(&ReconcileOrigin::SystemFileAdjust)
+                                            {
+                                                needs_parallel_full_rescan = true;
+                                            }
+                                            continue;
+                                        }
+                                        if reconcile_subtree_fallback(&mut g.tree, p, &ctx) {
+                                            mutated = true;
+                                        }
+                                    }
                                 }
-                            }
 
-                            let _ = save_volume_snapshot(&g.tree, &default_index_dir());
-                        } else {
-                            ok = false;
+                                // Persist snapshot immediately for High priority ops, or at most every 30s for Low background churn
+                                mutated
+                                    && !needs_parallel_full_rescan
+                                    && (batch.priority == ReconcilePriority::High
+                                        || last_snap_save
+                                            .get(&batch.volume)
+                                            .is_none_or(|t| t.elapsed() >= Duration::from_secs(30)))
+                            } else {
+                                ok = false;
+                                false
+                            }
+                        };
+
+                        // Save snapshot under READ lock (NOT write lock!) so UI queries never stall
+                        if should_save {
+                            if let Ok(g) = slot.read() {
+                                let _ = save_volume_snapshot(&g.tree, &default_index_dir());
+                                last_snap_save.insert(batch.volume.clone(), Instant::now());
+                            }
+                        }
+                    }
+
+                    // Run any required full-volume rescan in parallel OUTSIDE the volume write lock
+                    if needs_parallel_full_rescan {
+                        let include_ads = state
+                            .settings
+                            .read()
+                            .map(|s| s.include_ads)
+                            .unwrap_or(false);
+                        let cancel = Arc::new(AtomicBool::new(false));
+                        let new_tree = scan_directory_with_options(
+                            PathBuf::from(&batch.volume),
+                            ScanOptions {
+                                include_ads,
+                                prefer_mft: true,
+                            },
+                            cancel,
+                            |_| {},
+                        );
+                        if !new_tree.stats.cancelled {
+                            let _ = save_volume_snapshot(&new_tree, &default_index_dir());
+                            last_snap_save.insert(batch.volume.clone(), Instant::now());
+                            state.insert_volume(new_tree, false);
+                            mutated = true;
                         }
                     }
 
                     if ok {
-                        if let Ok(mut q) = state.reconcile_queue.lock() {
-                            q.clear_retry(&batch.volume);
-                        }
+                        let rem_after = state
+                            .reconcile_queue
+                            .lock()
+                            .map(|mut q| {
+                                q.clear_retry(&batch.volume);
+                                q.pending_count()
+                            })
+                            .unwrap_or(0);
                         if let Ok(mut st) = state.sync_status.lock() {
                             st.syncing = false;
+                            st.pending_batches = rem_after;
                             st.last_synced_ts = Some(Utc::now().timestamp());
-                            st.revision += 1;
+                            if mutated {
+                                st.revision += 1;
+                            }
                         }
-                        pending_emit = true;
+                        // Always emit `syncing: false` immediately so the topbar pill never gets stuck!
+                        if is_user_or_drift || mutated {
+                            let dto = state.sync_status.lock().map(|g| g.clone()).ok();
+                            let _ = handle_recon.emit("sync-status-changed", dto);
+                        }
+                        if mutated {
+                            pending_emit = true;
+                        }
                     } else {
-                        if let Ok(mut q) = state.reconcile_queue.lock() {
-                            q.schedule_retry(batch.clone(), Instant::now());
-                        }
+                        let rem_after = state
+                            .reconcile_queue
+                            .lock()
+                            .map(|mut q| {
+                                q.schedule_retry(batch.clone(), Instant::now());
+                                q.pending_count()
+                            })
+                            .unwrap_or(0);
                         if let Ok(mut st) = state.sync_status.lock() {
                             st.syncing = false;
+                            st.pending_batches = rem_after;
                             st.observations.push(format!(
                                 "Reconciliación diferida en {} (reintento automático).",
                                 batch.volume
@@ -356,15 +450,15 @@ fn start_background_sync_workers(app_handle: tauri::AppHandle) {
                                 st.observations.remove(0);
                             }
                         }
+                        let dto = state.sync_status.lock().map(|g| g.clone()).ok();
+                        let _ = handle_recon.emit("sync-status-changed", dto);
                     }
                 }
 
-                // Coalesce UI refresh emissions to <= 4 Hz (every >= 250ms)
+                // Coalesce UI tree refresh emissions to <= 4 Hz (every >= 250ms)
                 if pending_emit && last_ui_emit.elapsed() >= Duration::from_millis(250) {
                     last_ui_emit = Instant::now();
                     pending_emit = false;
-                    let dto = state.sync_status.lock().map(|g| g.clone()).ok();
-                    let _ = handle_recon.emit("sync-status-changed", dto);
                     let _ = handle_recon.emit("sync-updated", "reconciled");
                 }
             }
@@ -458,10 +552,18 @@ fn start_background_sync_workers(app_handle: tauri::AppHandle) {
                     for slot in slots {
                         if let Ok(g) = slot.read() {
                             let vol = normalize_volume_key(&g.tree.root_path.to_string_lossy());
-                            let idx_used = g.tree.stats.total_allocated_bytes;
-                            if let Some(drift) =
-                                evaluate_free_space_drift(&vol, idx_used, &provider, pct, min_gb)
-                            {
+                            // Compare against real volume used bytes recorded at scan time so Access Denied
+                            // folders (without admin) don't cause permanent false-positive drift every 60s!
+                            let baseline_used = g
+                                .real_used_at_scan_bytes
+                                .unwrap_or(g.tree.stats.total_allocated_bytes);
+                            if let Some(drift) = evaluate_free_space_drift(
+                                &vol,
+                                baseline_used,
+                                &provider,
+                                pct,
+                                min_gb,
+                            ) {
                                 if drift.drifted {
                                     if let Ok(mut q) = state.reconcile_queue.lock() {
                                         q.enqueue(
@@ -606,6 +708,7 @@ pub fn run() {
             commands::cmd_show_main_window,
             commands::cmd_bootstrap_startup,
             commands::cmd_list_drives,
+            commands::cmd_list_indexed_summaries,
             commands::cmd_set_active_drive,
             commands::cmd_start_scan,
             commands::cmd_cancel_scan,

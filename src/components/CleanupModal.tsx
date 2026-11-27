@@ -1,7 +1,9 @@
+import { listen } from "@tauri-apps/api/event";
 import { ShieldBan, Trash2 } from "lucide-react";
-import { useState } from "react";
+import { useEffect, useState } from "react";
 import { formatBytes } from "../lib/format";
-import type { CleanupMode, CleanupPlan, CleanupResult } from "../lib/ipc";
+import type { CleanupMode, CleanupPlan, CleanupProgressEvent, CleanupResult } from "../lib/ipc";
+import { ActionProgressStage } from "./ui/ActionMotion";
 import { Badge } from "./ui/Badge";
 import { Button } from "./ui/Button";
 import { AlertBanner } from "./ui/Feedback";
@@ -26,13 +28,40 @@ export function CleanupModal({
   onClose,
 }: CleanupModalProps) {
   const [confirmPermanent, setConfirmPermanent] = useState(false);
+  const [liveProgress, setLiveProgress] = useState<CleanupProgressEvent | null>(null);
   const canExecute =
     plan.items.length > 0 && !executing && (plan.mode !== "permanent" || confirmPermanent);
+
+  useEffect(() => {
+    if (!executing) {
+      setLiveProgress(null);
+      return;
+    }
+    let unsub: (() => void) | null = null;
+    let active = true;
+    listen<CleanupProgressEvent>("cleanup-progress", (ev) => {
+      if (active && ev.payload && ev.payload.planId === plan.planId) {
+        setLiveProgress(ev.payload);
+      }
+    })
+      .then((fn) => {
+        if (active) unsub = fn;
+        else fn();
+      })
+      .catch(() => {});
+
+    return () => {
+      active = false;
+      unsub?.();
+    };
+  }, [executing, plan.planId]);
 
   const footer = result ? (
     <Button variant="primary" onClick={onClose}>
       Cerrar
     </Button>
+  ) : executing ? (
+    <div className="text-[12px] text-fg-muted">Procesando limpieza de forma segura…</div>
   ) : (
     <>
       <Button onClick={onClose}>Cancelar</Button>
@@ -42,19 +71,40 @@ export function CleanupModal({
         onClick={() => onExecute(confirmPermanent)}
       >
         <Trash2 size={14} />
-        {executing ? "Eliminando..." : "Confirmar y ejecutar limpieza"}
+        Confirmar y ejecutar limpieza
       </Button>
     </>
   );
 
   return (
     <Modal
-      title={result ? "Resultado de limpieza" : "Vista previa de limpieza (Dry-run)"}
-      onClose={onClose}
+      title={
+        result
+          ? "Resultado de limpieza"
+          : executing
+            ? "Ejecutando limpieza…"
+            : "Vista previa de limpieza (Dry-run)"
+      }
+      onClose={executing ? () => {} : onClose}
       footer={footer}
     >
-      {result ? (
-        <>
+      {executing && !result ? (
+        <div key="executing" className="animate-stage-swap">
+          <ActionProgressStage
+            title={
+              plan.mode === "recycle_bin"
+                ? "Enviando elementos a la Papelera…"
+                : plan.mode === "empty_recycle_bin"
+                  ? "Vaciando Papelera de reciclaje…"
+                  : "Eliminando elementos de forma permanente…"
+            }
+            progress={liveProgress}
+            totalItemsFallback={Math.max(1, plan.items.length)}
+            totalBytesFallback={plan.totalBytes}
+          />
+        </div>
+      ) : result ? (
+        <div key="result" className="animate-stage-swap flex flex-col gap-3.5">
           <AlertBanner tone="success">
             <div className="font-semibold text-fg-primary">
               Espacio liberado real:{" "}
@@ -96,9 +146,9 @@ export function CleanupModal({
               </div>
             ))}
           </div>
-        </>
+        </div>
       ) : (
-        <>
+        <div key="preview" className="animate-stage-swap flex flex-col gap-3.5">
           {plan.mode !== "empty_recycle_bin" && (
             <div className="flex items-center justify-between gap-3 flex-wrap">
               <span className="text-[12.5px] text-fg-secondary">Método de eliminación</span>
@@ -188,7 +238,7 @@ export function CleanupModal({
               </span>
             </label>
           )}
-        </>
+        </div>
       )}
     </Modal>
   );

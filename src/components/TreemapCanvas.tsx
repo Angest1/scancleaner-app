@@ -1,26 +1,21 @@
 import { FolderOpen, Lock, ShieldPlus, Trash2 } from "lucide-react";
 import { useEffect, useMemo, useRef, useState } from "react";
 import { createPortal } from "react-dom";
-import { colorForCategory, formatBytes } from "../lib/format";
+import { formatBytes } from "../lib/format";
 import type { TreemapLayoutRectDto, TreemapNodeDto } from "../lib/ipc";
 import { type TreemapRect, layoutSquarifiedTreemap } from "../lib/treemapLayout";
+import { type PositionedTreemapNode, renderTreemapCanvas } from "./treemapRenderer";
 
 interface TreemapCanvasProps {
   nodes?: TreemapNodeDto[];
   nativeRects?: TreemapLayoutRectDto[];
+  loading?: boolean;
   colorBy: "type" | "origin";
   onViewportChange?: (width: number, height: number) => void;
   onDrillDown: (nodeId: number) => void;
   onOpenExplorer: (path: string) => void;
   onSendToCleanup: (node: TreemapNodeDto) => void;
   onProtectPath: (node: TreemapNodeDto) => void;
-}
-
-interface PositionedNode extends TreemapNodeDto {
-  id: string;
-  value: number;
-  isCloudOnly?: boolean;
-  isPendingTrash?: boolean;
 }
 
 const TOOLTIP_MAX_W = 264;
@@ -32,6 +27,7 @@ const MENU_EST_H = 132;
 export function TreemapCanvas({
   nodes = [],
   nativeRects,
+  loading = false,
   colorBy,
   onViewportChange,
   onDrillDown,
@@ -44,7 +40,7 @@ export function TreemapCanvas({
   const [size, setSize] = useState({ width: 800, height: 400 });
   const [themeTick, setThemeTick] = useState(0);
   const [hovered, setHovered] = useState<{
-    rect: TreemapRect<PositionedNode>;
+    rect: TreemapRect<PositionedTreemapNode>;
     localX: number;
     localY: number;
   } | null>(null);
@@ -89,20 +85,31 @@ export function TreemapCanvas({
     };
   }, []);
 
-  const rects = useMemo<TreemapRect<PositionedNode>[]>(() => {
+  const rects = useMemo<TreemapRect<PositionedTreemapNode>[]>(() => {
     if (nativeRects && nativeRects.length > 0) {
+      // Proportionally fit native layout rects to current canvas dimensions so
+      // resizes or initial measurements NEVER leave an empty gap on any edge.
+      let maxRight = 0;
+      let maxBottom = 0;
+      for (const r of nativeRects) {
+        if (r.x + r.w > maxRight) maxRight = r.x + r.w;
+        if (r.y + r.h > maxBottom) maxBottom = r.y + r.h;
+      }
+      const scaleX = maxRight > 0 ? size.width / maxRight : 1;
+      const scaleY = maxBottom > 0 ? size.height / maxBottom : 1;
+
       return nativeRects.map((r) => ({
         item: {
           ...r,
           value: r.allocatedBytes,
         },
-        x: r.x,
-        y: r.y,
-        w: r.w,
-        h: r.h,
+        x: r.x * scaleX,
+        y: r.y * scaleY,
+        w: r.w * scaleX,
+        h: r.h * scaleY,
       }));
     }
-    const input: PositionedNode[] = nodes
+    const input: PositionedTreemapNode[] = nodes
       .filter((n) => n.allocatedBytes > 0)
       .map((n, i) => ({
         ...n,
@@ -116,74 +123,7 @@ export function TreemapCanvas({
     void themeTick;
     const canvas = canvasRef.current;
     if (!canvas) return;
-    const dpr = window.devicePixelRatio || 1;
-    canvas.width = size.width * dpr;
-    canvas.height = size.height * dpr;
-    canvas.style.width = `${size.width}px`;
-    canvas.style.height = `${size.height}px`;
-
-    const ctx = canvas.getContext("2d");
-    if (!ctx) return;
-    const styles = getComputedStyle(document.documentElement);
-    const canvasBg = styles.getPropertyValue("--treemap-bg").trim() || "#0a0c13";
-    const sepStroke = styles.getPropertyValue("--treemap-sep").trim() || "rgba(10, 12, 19, 0.9)";
-    const hoverStroke = styles.getPropertyValue("--treemap-hover-stroke").trim() || "#f1f3fa";
-
-    ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
-    ctx.clearRect(0, 0, size.width, size.height);
-    ctx.fillStyle = canvasBg;
-    ctx.fillRect(0, 0, size.width, size.height);
-
-    for (const r of rects) {
-      const pad = 1.5;
-      const rx = r.x + pad;
-      const ry = r.y + pad;
-      const rw = Math.max(0, r.w - pad * 2);
-      const rh = Math.max(0, r.h - pad * 2);
-      if (rw <= 1 || rh <= 1) continue;
-
-      const isHovered = hovered?.rect.item.id === r.item.id;
-      const catKey = colorBy === "type" ? r.item.typeCat : r.item.originCat;
-      const baseColor = r.item.isOtherBucket ? "#576175" : colorForCategory(catKey);
-
-      ctx.fillStyle = baseColor;
-      ctx.globalAlpha = isHovered ? 0.98 : 0.86;
-      ctx.fillRect(rx, ry, rw, rh);
-
-      ctx.globalAlpha = 1;
-      ctx.strokeStyle = isHovered ? hoverStroke : sepStroke;
-      ctx.lineWidth = isHovered ? 2 : 1;
-      ctx.strokeRect(rx + 0.5, ry + 0.5, Math.max(0, rw - 1), Math.max(0, rh - 1));
-
-      if (r.item.isProtected && rw > 18 && rh > 18) {
-        ctx.fillStyle = "#e09f3e";
-        ctx.beginPath();
-        ctx.moveTo(rx + rw, ry);
-        ctx.lineTo(rx + rw - 10, ry);
-        ctx.lineTo(rx + rw, ry + 10);
-        ctx.closePath();
-        ctx.fill();
-      }
-
-      if (rw > 68 && rh > 28) {
-        ctx.save();
-        ctx.beginPath();
-        ctx.rect(rx + 5, ry + 4, rw - 10, rh - 8);
-        ctx.clip();
-
-        ctx.fillStyle = "#f8fafc";
-        ctx.font = '600 12px "Geist Sans", "Segoe UI", sans-serif';
-        const suffix = r.item.kind === "dir" ? "/" : "";
-        ctx.fillText(`${r.item.name}${suffix}`, rx + 7, ry + 17);
-
-        if (rh > 42) {
-          ctx.fillStyle = "rgba(238, 242, 247, 0.86)";
-          ctx.font = '500 11px "JetBrains Mono", Consolas, monospace';
-          ctx.fillText(formatBytes(r.item.allocatedBytes), rx + 7, ry + 33);
-        }
-        ctx.restore();
-      }
-    }
+    renderTreemapCanvas(canvas, rects, size, hovered?.rect.item.id ?? null, colorBy);
   }, [rects, size, hovered, colorBy, themeTick]);
 
   const hitTest = (clientX: number, clientY: number) => {
@@ -290,6 +230,9 @@ export function TreemapCanvas({
         )
       : null;
 
+  const showSkeleton = rects.length === 0;
+  const isUpdating = loading && rects.length > 0;
+
   return (
     <div
       ref={containerRef}
@@ -302,7 +245,13 @@ export function TreemapCanvas({
         onKeyDown={(e) => {
           if (e.key === "Escape") setContextMenu(null);
         }}
-        className={`block ${hovered ? "cursor-pointer" : "cursor-default"}`}
+        className={`block transition-[opacity,transform] duration-220 ease-out ${
+          showSkeleton
+            ? "opacity-0 scale-[0.992]"
+            : isUpdating
+              ? "opacity-70 scale-100"
+              : "opacity-100 scale-100"
+        } ${hovered ? "cursor-pointer" : "cursor-default"}`}
         onMouseMove={(e) => {
           const hit = hitTest(e.clientX, e.clientY);
           setHovered(hit);
@@ -322,6 +271,40 @@ export function TreemapCanvas({
           }
         }}
       />
+
+      {/* Animated Bento skeleton overlay (prevents blank canvas / abrupt pop-in) */}
+      <div
+        aria-hidden={!showSkeleton}
+        className={`absolute inset-0 p-2 grid grid-cols-12 grid-rows-6 gap-1.5 bg-canvas transition-opacity duration-200 ease-out pointer-events-none ${
+          showSkeleton ? "opacity-100" : "opacity-0"
+        }`}
+      >
+        <div className="col-span-6 row-span-4 rounded-[7px] bg-elevated border border-border-subtle animate-skeleton" />
+        <div
+          className="col-span-6 row-span-2 rounded-[7px] bg-elevated border border-border-subtle animate-skeleton"
+          style={{ animationDelay: "90ms" }}
+        />
+        <div
+          className="col-span-3 row-span-2 rounded-[7px] bg-elevated border border-border-subtle animate-skeleton"
+          style={{ animationDelay: "160ms" }}
+        />
+        <div
+          className="col-span-3 row-span-2 rounded-[7px] bg-elevated border border-border-subtle animate-skeleton"
+          style={{ animationDelay: "220ms" }}
+        />
+        <div
+          className="col-span-4 row-span-2 rounded-[7px] bg-elevated border border-border-subtle animate-skeleton"
+          style={{ animationDelay: "120ms" }}
+        />
+        <div
+          className="col-span-5 row-span-2 rounded-[7px] bg-elevated border border-border-subtle animate-skeleton"
+          style={{ animationDelay: "200ms" }}
+        />
+        <div
+          className="col-span-3 row-span-2 rounded-[7px] bg-elevated border border-border-subtle animate-skeleton"
+          style={{ animationDelay: "260ms" }}
+        />
+      </div>
 
       {hovered && tooltipPos && (
         <div

@@ -1,5 +1,5 @@
 import { X } from "lucide-react";
-import { type ReactNode, useEffect, useId } from "react";
+import { type ReactNode, useCallback, useEffect, useId, useRef, useState } from "react";
 import { createPortal } from "react-dom";
 import { Button } from "./Button";
 
@@ -21,30 +21,50 @@ export function DetailDrawer({
   children,
 }: DetailDrawerProps) {
   const titleId = useId();
+  const [closing, setClosing] = useState(false);
+  const timerRef = useRef<number | undefined>(undefined);
+
+  const requestClose = useCallback(() => {
+    if (closing) return;
+    setClosing(true);
+    timerRef.current = window.setTimeout(() => {
+      onClose();
+    }, 160);
+  }, [closing, onClose]);
+
+  useEffect(() => {
+    return () => {
+      if (timerRef.current !== undefined) window.clearTimeout(timerRef.current);
+    };
+  }, []);
 
   useEffect(() => {
     const onKeyDown = (e: KeyboardEvent) => {
-      if (e.key === "Escape") onClose();
+      if (e.key === "Escape") requestClose();
     };
     window.addEventListener("keydown", onKeyDown);
     return () => window.removeEventListener("keydown", onKeyDown);
-  }, [onClose]);
+  }, [requestClose]);
 
   const content = (
     <div
-      className="fixed inset-0 z-100 flex justify-end bg-black/40 backdrop-blur-[3px] animate-backdrop-in"
+      className={`fixed inset-0 z-100 flex justify-end bg-black/40 backdrop-blur-[3px] ${
+        closing ? "animate-backdrop-out pointer-events-none" : "animate-backdrop-in"
+      }`}
       onClick={(e) => {
-        if (e.target === e.currentTarget) onClose();
+        if (e.target === e.currentTarget) requestClose();
       }}
       onKeyDown={(e) => {
-        if (e.key === "Escape") onClose();
+        if (e.key === "Escape") requestClose();
       }}
     >
       <dialog
         open
         aria-modal="true"
         aria-labelledby={titleId}
-        className="relative m-0 p-0 border-0 border-l border-border-default text-fg-primary w-full max-w-[460px] h-full bg-tile flex flex-col overflow-hidden animate-drawer-in"
+        className={`relative m-0 p-0 border-0 border-l border-border-default text-fg-primary w-full max-w-[460px] h-full bg-tile flex flex-col overflow-hidden ${
+          closing ? "animate-drawer-out" : "animate-drawer-in"
+        }`}
         style={{ boxShadow: "var(--shadow-floating)" }}
       >
         <div className="px-5 py-4 border-b border-border-subtle flex items-start justify-between gap-3">
@@ -60,7 +80,7 @@ export function DetailDrawer({
             </div>
             {subtitle && <p className="m-0 mt-0.5 text-[12px] text-fg-secondary">{subtitle}</p>}
           </div>
-          <Button variant="ghost" size="icon" onClick={onClose} aria-label="Cerrar inspector">
+          <Button variant="ghost" size="icon" onClick={requestClose} aria-label="Cerrar inspector">
             <X size={15} />
           </Button>
         </div>

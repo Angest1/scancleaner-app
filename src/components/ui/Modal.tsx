@@ -1,5 +1,5 @@
 import { X } from "lucide-react";
-import { type ReactNode, useEffect, useId } from "react";
+import { type ReactNode, useCallback, useEffect, useId, useRef, useState } from "react";
 import { createPortal } from "react-dom";
 import { Button } from "./Button";
 
@@ -21,30 +21,50 @@ export function Modal({
   children,
 }: ModalProps) {
   const titleId = useId();
+  const [closing, setClosing] = useState(false);
+  const timerRef = useRef<number | undefined>(undefined);
+
+  const requestClose = useCallback(() => {
+    if (closing) return;
+    setClosing(true);
+    timerRef.current = window.setTimeout(() => {
+      onClose();
+    }, 155);
+  }, [closing, onClose]);
+
+  useEffect(() => {
+    return () => {
+      if (timerRef.current !== undefined) window.clearTimeout(timerRef.current);
+    };
+  }, []);
 
   useEffect(() => {
     const onKeyDown = (e: KeyboardEvent) => {
-      if (e.key === "Escape") onClose();
+      if (e.key === "Escape") requestClose();
     };
     window.addEventListener("keydown", onKeyDown);
     return () => window.removeEventListener("keydown", onKeyDown);
-  }, [onClose]);
+  }, [requestClose]);
 
   const content = (
     <div
-      className="fixed inset-0 z-100 flex items-center justify-center bg-black/50 backdrop-blur-[4px] p-4 sm:p-6 animate-backdrop-in"
+      className={`fixed inset-0 z-100 flex items-center justify-center bg-black/50 backdrop-blur-[4px] p-4 sm:p-6 ${
+        closing ? "animate-backdrop-out pointer-events-none" : "animate-backdrop-in"
+      }`}
       onClick={(e) => {
-        if (e.target === e.currentTarget) onClose();
+        if (e.target === e.currentTarget) requestClose();
       }}
       onKeyDown={(e) => {
-        if (e.key === "Escape") onClose();
+        if (e.key === "Escape") requestClose();
       }}
     >
       <dialog
         open
         aria-modal="true"
         aria-labelledby={titleId}
-        className={`relative mx-auto my-0 p-0 border-0 text-fg-primary w-full ${maxWidthClass} max-h-[86vh] bg-tile rounded-[16px] flex flex-col overflow-hidden animate-modal-in`}
+        className={`relative mx-auto my-0 p-0 border-0 text-fg-primary w-full ${maxWidthClass} max-h-[86vh] bg-tile rounded-[16px] flex flex-col overflow-hidden ${
+          closing ? "animate-modal-out" : "animate-modal-in"
+        }`}
         style={{ boxShadow: "var(--shadow-floating)" }}
       >
         <div className="px-5 py-3.5 border-b border-border-subtle flex items-center justify-between gap-3">
@@ -54,7 +74,7 @@ export function Modal({
             </h2>
             {subtitle && <p className="m-0 mt-0.5 text-[12px] text-fg-secondary">{subtitle}</p>}
           </div>
-          <Button variant="ghost" size="icon" onClick={onClose} aria-label="Cerrar diálogo">
+          <Button variant="ghost" size="icon" onClick={requestClose} aria-label="Cerrar diálogo">
             <X size={15} />
           </Button>
         </div>

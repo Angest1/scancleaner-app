@@ -3,11 +3,12 @@ use std::sync::atomic::AtomicBool;
 use std::sync::{Arc, Mutex, RwLock};
 use std::time::Duration;
 
+use crate::apps::InstalledApp;
 use crate::categorizer::CategoryBreakdown;
 use crate::cleaner::executor::CleanupPlan;
 use crate::deletion::queue::DeletionJobManager;
 use crate::dev_cleaner::schema::DevCleanupPlan;
-use crate::index::default_index_dir;
+use crate::index::default_app_local_dir;
 use crate::index::watcher::VolumeDirWatcher;
 use crate::reconcile::queue::{ReconciliationQueue, SyncStatusDto};
 use crate::reconcile::triggers::UninstallLeftoverSuggestion;
@@ -20,6 +21,9 @@ pub struct VolumeSlot {
     pub tree: ScanTree,
     pub available: bool,
     pub stale: bool,
+    /// Real volume used bytes (`total - free` from `GetDiskFreeSpaceExW`) recorded when this tree was
+    /// scanned, so drift detection compares actual disk deltas without false positives from Access Denied folders.
+    pub real_used_at_scan_bytes: Option<u64>,
 }
 
 pub struct AppState {
@@ -40,6 +44,7 @@ pub struct AppState {
     pub uninstall_leftovers: Arc<Mutex<Vec<UninstallLeftoverSuggestion>>>,
     pub pending_system_file_watch: Arc<Mutex<Option<(String, u64)>>>,
     pub watchers: Mutex<HashMap<String, VolumeDirWatcher>>,
+    pub apps_cache: Arc<Mutex<Option<Vec<InstalledApp>>>>,
 }
 
 impl AppState {
@@ -58,12 +63,13 @@ impl AppState {
             deletion_jobs: Arc::new(DeletionJobManager::new()),
             reconcile_queue: Arc::new(Mutex::new(ReconciliationQueue::new(
                 Duration::from_millis(250),
-                default_index_dir(),
+                default_app_local_dir(),
             ))),
             sync_status: Arc::new(Mutex::new(SyncStatusDto::default())),
             uninstall_leftovers: Arc::new(Mutex::new(Vec::new())),
             pending_system_file_watch: Arc::new(Mutex::new(None)),
             watchers: Mutex::new(HashMap::new()),
+            apps_cache: Arc::new(Mutex::new(None)),
         }
     }
 
@@ -72,6 +78,11 @@ impl AppState {
         let breakdown = tree
             .derived
             .to_category_breakdown(tree.stats.total_allocated_bytes);
+        let real_used_at_scan_bytes = crate::reconcile::triggers::DiskSpaceProvider::query_space(
+            &crate::reconcile::triggers::WinDiskSpaceProvider,
+            &key,
+        )
+        .map(|(total, free)| total.saturating_sub(free));
         if let Ok(mut map) = self.volumes.write() {
             map.insert(
                 key.clone(),
@@ -79,6 +90,7 @@ impl AppState {
                     tree,
                     available: true,
                     stale,
+                    real_used_at_scan_bytes,
                 })),
             );
         }

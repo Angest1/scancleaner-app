@@ -10,10 +10,14 @@ import {
 } from "lucide-react";
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { AppDetailDrawer } from "../components/apps/AppDetailDrawer";
+import { AppLeftoversBanner } from "../components/apps/AppLeftoversBanner";
+import { AppsAnalyticsCard } from "../components/apps/AppsAnalyticsCard";
+import { InlineActivityBanner } from "../components/ui/ActionMotion";
 import { Badge } from "../components/ui/Badge";
 import { Button } from "../components/ui/Button";
 import { Card } from "../components/ui/Card";
-import { AlertBanner, EmptyState, Skeleton } from "../components/ui/Feedback";
+import { Collapse } from "../components/ui/Collapse";
+import { AlertBanner, EmptyState } from "../components/ui/Feedback";
 import { SegmentedControl } from "../components/ui/SegmentedControl";
 import {
   DensityToggle,
@@ -45,10 +49,10 @@ export function AppsView({ syncRevision = 0, onQueueLeftoverCleanup }: AppsViewP
   const [statusMsg, setStatusMsg] = useState<string | null>(null);
   const parentRef = useRef<HTMLDivElement>(null);
 
-  const loadApps = useCallback(() => {
-    setLoading(true);
+  const loadApps = useCallback((forceRefresh = false, silent = false) => {
+    if (!silent) setLoading(true);
     Promise.all([
-      api.listInstalledApps(),
+      api.listInstalledApps(forceRefresh),
       api.getUninstallLeftovers().catch(() => [] as UninstallLeftoverSuggestion[]),
     ])
       .then(([list, lv]) => {
@@ -56,46 +60,57 @@ export function AppsView({ syncRevision = 0, onQueueLeftoverCleanup }: AppsViewP
         setLeftovers(lv);
       })
       .catch((err) => setStatusMsg(String(err)))
-      .finally(() => setLoading(false));
+      .finally(() => !silent && setLoading(false));
   }, []);
 
+  useEffect(() => loadApps(false, false), [loadApps]);
   useEffect(() => {
-    loadApps();
-  }, [loadApps]);
-
-  useEffect(() => {
-    if (syncRevision > 0) {
-      loadApps();
-    }
+    if (syncRevision > 0) loadApps(false, true);
   }, [syncRevision, loadApps]);
 
   const handleSort = (key: SortKey) => {
-    if (sortKey === key) {
-      setSortDir((d) => (d === "asc" ? "desc" : "asc"));
-    } else {
-      setSortKey(key);
-      setSortDir(key === "size" ? "desc" : "asc");
-    }
+    setSortDir((d) =>
+      sortKey === key ? (d === "asc" ? "desc" : "asc") : key === "size" ? "desc" : "asc",
+    );
+    setSortKey(key);
   };
+
+  const stats = useMemo(() => {
+    const win32 = apps.filter((a) => a.source === "win32");
+    const msix = apps.filter((a) => a.source === "store_msix");
+    const win32Bytes = win32.reduce((s, a) => s + a.sizeBytes, 0);
+    const msixBytes = msix.reduce((s, a) => s + a.sizeBytes, 0);
+    return {
+      totalBytes: win32Bytes + msixBytes,
+      win32Bytes,
+      msixBytes,
+      win32Count: win32.length,
+      msixCount: msix.length,
+      topApps: [...apps].sort((a, b) => b.sizeBytes - a.sizeBytes).slice(0, 6),
+    };
+  }, [apps]);
 
   const filtered = useMemo(() => {
     const q = search.trim().toLowerCase();
-    const list = apps.filter((a) => {
-      if (filter !== "all" && a.source !== filter) return false;
-      if (!q) return true;
-      return a.name.toLowerCase().includes(q) || a.publisher.toLowerCase().includes(q);
-    });
     const mult = sortDir === "asc" ? 1 : -1;
-    return list.sort((a, b) => {
-      if (sortKey === "name") return a.name.localeCompare(b.name) * mult;
-      if (sortKey === "source") return a.source.localeCompare(b.source) * mult;
-      return (a.sizeBytes - b.sizeBytes) * mult;
-    });
+    return apps
+      .filter(
+        (a) =>
+          (filter === "all" || a.source === filter) &&
+          (!q || a.name.toLowerCase().includes(q) || a.publisher.toLowerCase().includes(q)),
+      )
+      .sort(
+        (a, b) =>
+          (sortKey === "name"
+            ? a.name.localeCompare(b.name)
+            : sortKey === "source"
+              ? a.source.localeCompare(b.source)
+              : a.sizeBytes - b.sizeBytes) * mult,
+      );
   }, [apps, search, filter, sortKey, sortDir]);
 
   const getAppKey = useCallback((a: InstalledApp) => a.id, []);
   const { items: stableApps, containerProps } = useDeferredReorder(filtered, getAppKey, 1000);
-
   const rowHeight = density === "compact" ? 44 : 58;
 
   const virtualizer = useVirtualizer({
@@ -117,15 +132,15 @@ export function AppsView({ syncRevision = 0, onQueueLeftoverCleanup }: AppsViewP
   };
 
   return (
-    <div className="flex flex-col gap-4">
+    <div className="flex flex-col gap-4 min-h-[calc(100vh-110px)]">
       <div className="flex items-start justify-between flex-wrap gap-3">
         <div>
           <h1 className="m-0 text-[18px] font-semibold tracking-[-0.02em] text-fg-primary">
             Aplicaciones instaladas
           </h1>
           <p className="m-0 mt-1 text-[13px] text-fg-secondary text-pretty">
-            Inventario combinado Win32 (Registro) y Microsoft Store / MSIX. La desinstalación usa
-            siempre el flujo nativo de Windows.
+            Inventario combinado Win32 y Microsoft Store / MSIX resuelto al instante desde el índice
+            en memoria.
           </p>
         </div>
 
@@ -136,45 +151,40 @@ export function AppsView({ syncRevision = 0, onQueueLeftoverCleanup }: AppsViewP
             <ExternalLink size={13} />
             Configuración de Windows
           </Button>
-          <Button variant="primary" onClick={loadApps} disabled={loading}>
+          <Button variant="primary" onClick={() => loadApps(true)} disabled={loading}>
             <RefreshCw size={13} className={loading ? "animate-spin" : ""} />
-            {loading ? "Cargando…" : "Actualizar"}
+            {loading ? "Actualizando…" : "Actualizar"}
           </Button>
         </div>
       </div>
 
-      {statusMsg && <AlertBanner tone="info">{statusMsg}</AlertBanner>}
+      <Collapse open={Boolean(statusMsg)}>
+        {statusMsg && <AlertBanner tone="info">{statusMsg}</AlertBanner>}
+      </Collapse>
 
-      {leftovers.length > 0 && (
-        <AlertBanner tone="warning">
-          <div className="font-semibold text-fg-primary mb-1">
-            Restos detectados tras desinstalar (nivel Revisar — nunca se borran automáticamente)
-          </div>
-          <div className="flex flex-col gap-1.5">
-            {leftovers.map((lv) => (
-              <div
-                key={lv.path}
-                className="flex items-center justify-between gap-2 text-[12px] flex-wrap"
-              >
-                <span className="mono truncate">
-                  {lv.appName}: {lv.path} ({formatBytes(lv.sizeBytes)})
-                </span>
-                {onQueueLeftoverCleanup && (
-                  <Button
-                    size="sm"
-                    variant="warning"
-                    onClick={() => onQueueLeftoverCleanup(lv.path)}
-                  >
-                    Revisar en Dry-run
-                  </Button>
-                )}
-              </div>
-            ))}
-          </div>
-        </AlertBanner>
-      )}
+      <InlineActivityBanner
+        active={loading}
+        variant={apps.length === 0 ? "centered" : "floating"}
+        delayMs={apps.length === 0 ? 180 : 280}
+        title="Consultando inventario de aplicaciones instaladas…"
+        detail="Leyendo Registro Win32, paquetes Store/MSIX y tamaños desde los volúmenes indexados."
+      />
 
-      <Card className="flex items-center justify-between flex-wrap gap-3 py-3">
+      <AppLeftoversBanner leftovers={leftovers} onQueueCleanup={onQueueLeftoverCleanup} />
+
+      <AppsAnalyticsCard
+        apps={apps}
+        totalBytes={stats.totalBytes}
+        win32Bytes={stats.win32Bytes}
+        msixBytes={stats.msixBytes}
+        win32Count={stats.win32Count}
+        msixCount={stats.msixCount}
+        topApps={stats.topApps}
+        onFilterSource={setFilter}
+        onInspectApp={setInspected}
+      />
+
+      <Card className="flex items-center justify-between flex-wrap gap-3 py-2.5">
         <div className="relative flex-1 min-w-[200px] max-w-[360px]">
           <Search
             size={14}
@@ -210,27 +220,21 @@ export function AppsView({ syncRevision = 0, onQueueLeftoverCleanup }: AppsViewP
             onChange={setFilter}
             options={[
               { value: "all", label: "Todas", count: apps.length },
-              { value: "win32", label: "Win32" },
-              { value: "store_msix", label: "Store / MSIX" },
+              { value: "win32", label: "Win32", count: stats.win32Count },
+              { value: "store_msix", label: "Store / MSIX", count: stats.msixCount },
             ]}
           />
           <DensityToggle density={density} onChange={setDensity} />
         </div>
       </Card>
 
-      {loading && apps.length === 0 ? (
-        <Card className="flex flex-col gap-2.5">
-          {[0, 1, 2, 3, 4, 5].map((i) => (
-            <Skeleton key={i} className="h-11 w-full" />
-          ))}
-        </Card>
-      ) : filtered.length === 0 ? (
+      {loading && apps.length === 0 ? null : filtered.length === 0 ? (
         <EmptyState
           icon={<AppWindow size={18} />}
           title="Sin aplicaciones coincidentes"
-          description="Ajusta el término de búsqueda o cambia el filtro de origen para ver más resultados."
+          description="Ajusta el término de búsqueda o cambia el filtro de origen."
           action={
-            search || filter !== "all" ? (
+            (search || filter !== "all") && (
               <Button
                 onClick={() => {
                   setSearch("");
@@ -239,17 +243,19 @@ export function AppsView({ syncRevision = 0, onQueueLeftoverCleanup }: AppsViewP
               >
                 Restablecer filtros
               </Button>
-            ) : undefined
+            )
           }
         />
       ) : (
-        <Card padded={false} className="overflow-hidden">
+        <Card
+          padded={false}
+          className="sc-reveal overflow-hidden flex-1 flex flex-col min-h-[420px]"
+        >
           <div
             ref={parentRef}
             {...containerProps}
-            className="h-[480px] overflow-y-auto overflow-x-hidden"
+            className="flex-1 min-h-[420px] h-[calc(100vh-300px)] overflow-y-auto overflow-x-hidden"
           >
-            {/* Sticky priority-responsive header (zero horizontal scroll) */}
             <div className="sticky top-0 z-10 grid grid-cols-[minmax(0,1fr)_90px_40px] md:grid-cols-[minmax(0,1fr)_84px_124px_142px] items-center gap-2 px-3.5 py-2.5 border-b border-border-default bg-shell backdrop-blur-md">
               <SortHeaderButton
                 label="Aplicación"

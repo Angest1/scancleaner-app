@@ -1,17 +1,23 @@
-import { HardDrive, Network, Play, RefreshCw, Square, Usb } from "lucide-react";
+import { FolderTree, HardDrive, Network, Play, RefreshCw, Square, Usb } from "lucide-react";
 import { formatBytes, formatDurationMs } from "../../lib/format";
-import type { DriveInfo, ScanProgress } from "../../lib/ipc";
+import type { DriveInfo, ScanProgress, ScanSummary } from "../../lib/ipc";
+import { InlineActivityBanner, MiniLeapfrogLoader } from "../ui/ActionMotion";
 import { Badge } from "../ui/Badge";
 import { Button } from "../ui/Button";
 import { Card } from "../ui/Card";
+import { Collapse } from "../ui/Collapse";
 import { EmptyState, Skeleton } from "../ui/Feedback";
+import { GlobalStorageCard } from "./GlobalStorageCard";
 
 interface DrivesBentoProps {
   drives: DriveInfo[];
+  summaries: ScanSummary[];
   loading: boolean;
+  syncing: boolean;
   includeNetwork: boolean;
   scanningDrive: string | null;
   progress: ScanProgress | null;
+  onExploreDrive: (rootPath: string) => void;
   onToggleNetwork: (include: boolean) => void;
   onRefresh: () => void;
   onStartScan: (rootPath: string) => void;
@@ -20,25 +26,20 @@ interface DrivesBentoProps {
 
 export function DrivesBento({
   drives,
+  summaries,
   loading,
+  syncing,
   includeNetwork,
   scanningDrive,
   progress,
+  onExploreDrive,
   onToggleNetwork,
   onRefresh,
   onStartScan,
   onCancelScan,
 }: DrivesBentoProps) {
-  const totalBytes = drives.reduce((acc, d) => acc + d.totalBytes, 0);
-  const usedBytes = drives.reduce((acc, d) => acc + d.usedBytes, 0);
-  const freeBytes = drives.reduce((acc, d) => acc + d.freeBytes, 0);
-  const globalPct = totalBytes > 0 ? Math.min(100, (usedBytes / totalBytes) * 100) : 0;
-  const primaryDrive = drives.find((d) => d.available);
-
-  // SVG Donut ring geometry
-  const radius = 34;
-  const circumference = 2 * Math.PI * radius;
-  const dashOffset = circumference * (1 - globalPct / 100);
+  const isBusy = loading || syncing || Boolean(scanningDrive);
+  const indexedMap = new Map(summaries.map((s) => [s.rootPath.toUpperCase(), s]));
 
   return (
     <section aria-label="Unidades de almacenamiento" className="flex flex-col gap-4">
@@ -62,46 +63,58 @@ export function DrivesBento({
             />
             Incluir unidades de red
           </label>
-          <Button size="sm" onClick={onRefresh} disabled={loading}>
-            <RefreshCw size={13} className={loading ? "animate-spin" : ""} />
-            Actualizar
+          <Button size="sm" onClick={onRefresh} disabled={isBusy}>
+            <RefreshCw size={13} className={loading || syncing ? "animate-spin" : ""} />
+            {syncing ? "Sincronizando…" : loading ? "Actualizando…" : "Actualizar"}
           </Button>
         </div>
       </div>
 
-      {scanningDrive && (
-        <Card className="border-accent-border animate-fade-up">
-          <div className="flex items-center justify-between flex-wrap gap-3 mb-2.5">
-            <div className="min-w-0">
-              <div className="font-semibold text-[14px] text-fg-primary">
-                Escaneando unidad <span className="mono text-accent">{scanningDrive}</span>
-              </div>
-              <div className="mono text-[12px] text-fg-secondary mt-0.5">
-                {progress
-                  ? `${progress.scannedFiles.toLocaleString()} archivos · ${progress.scannedDirs.toLocaleString()} carpetas · ${formatBytes(progress.totalAllocatedBytes)} · ${formatDurationMs(progress.elapsedMs)}`
-                  : "Iniciando enumeración de archivos…"}
-              </div>
-            </div>
-            <Button variant="danger" size="sm" onClick={onCancelScan}>
-              <Square size={12} />
-              Cancelar
-            </Button>
-          </div>
+      <InlineActivityBanner
+        active={syncing && !scanningDrive}
+        delayMs={350}
+        title="Sincronizando unidades e índice en vivo…"
+        detail="Verificando espacio libre real y cambios recientes en tus volúmenes."
+      />
 
-          <div className="w-full h-2 rounded-full bg-elevated overflow-hidden relative">
-            <div className="h-full w-2/5 rounded-full bg-accent animate-scan-bar" />
-          </div>
-
-          {progress?.currentPath && (
-            <div
-              className="mono mt-2 text-[11.5px] text-fg-muted truncate"
-              title={progress.currentPath}
-            >
-              {progress.currentPath}
+      <Collapse open={Boolean(scanningDrive)}>
+        {scanningDrive && (
+          <Card className="border-accent-border">
+            <div className="flex items-center justify-between flex-wrap gap-3 mb-2.5">
+              <div className="flex items-center gap-3 min-w-0">
+                <MiniLeapfrogLoader />
+                <div className="min-w-0">
+                  <div className="font-semibold text-[14px] text-fg-primary">
+                    Escaneando unidad <span className="mono text-accent">{scanningDrive}</span>
+                  </div>
+                  <div className="mono text-[12px] text-fg-secondary mt-0.5">
+                    {progress
+                      ? `${progress.scannedFiles.toLocaleString()} archivos · ${progress.scannedDirs.toLocaleString()} carpetas · ${formatBytes(progress.totalAllocatedBytes)} · ${formatDurationMs(progress.elapsedMs)}`
+                      : "Iniciando enumeración de archivos…"}
+                  </div>
+                </div>
+              </div>
+              <Button variant="danger" size="sm" onClick={onCancelScan}>
+                <Square size={12} />
+                Cancelar
+              </Button>
             </div>
-          )}
-        </Card>
-      )}
+
+            <div className="w-full h-2 rounded-full bg-elevated overflow-hidden relative">
+              <div className="h-full w-2/5 rounded-full bg-accent sc-shimmer-track" />
+            </div>
+
+            {progress?.currentPath && (
+              <div
+                className="mono mt-2 text-[11.5px] text-fg-muted truncate"
+                title={progress.currentPath}
+              >
+                {progress.currentPath}
+              </div>
+            )}
+          </Card>
+        )}
+      </Collapse>
 
       {loading && drives.length === 0 ? (
         <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-4">
@@ -133,79 +146,13 @@ export function DrivesBento({
         />
       ) : (
         <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-12 gap-4">
-          {/* Global storage summary Bento tile */}
-          <Card className="lg:col-span-4 flex flex-col justify-between gap-4 animate-fade-up">
-            <div className="flex items-center justify-between gap-3">
-              <div>
-                <div className="text-[12px] font-medium text-fg-muted">Capacidad global</div>
-                <div className="mono text-[22px] font-semibold text-fg-primary mt-0.5 leading-tight">
-                  {formatBytes(freeBytes)}
-                </div>
-                <div className="text-[12px] text-fg-secondary mt-0.5">
-                  disponibles de <span className="mono">{formatBytes(totalBytes)}</span>
-                </div>
-              </div>
+          <GlobalStorageCard
+            drives={drives}
+            summaries={summaries}
+            scanningDrive={scanningDrive}
+            onExploreDrive={onExploreDrive}
+          />
 
-              <div className="relative w-[84px] h-[84px] shrink-0 grid place-items-center">
-                <svg
-                  width="84"
-                  height="84"
-                  viewBox="0 0 84 84"
-                  aria-hidden="true"
-                  className="-rotate-90"
-                >
-                  <circle
-                    cx="42"
-                    cy="42"
-                    r={radius}
-                    fill="none"
-                    stroke="var(--border-default)"
-                    strokeWidth="7"
-                  />
-                  <circle
-                    cx="42"
-                    cy="42"
-                    r={radius}
-                    fill="none"
-                    stroke={
-                      globalPct > 90
-                        ? "var(--danger)"
-                        : globalPct > 75
-                          ? "var(--warning)"
-                          : "var(--accent)"
-                    }
-                    strokeWidth="7"
-                    strokeLinecap="round"
-                    strokeDasharray={circumference}
-                    strokeDashoffset={dashOffset}
-                    className="transition-[stroke-dashoffset] duration-300 ease-out"
-                  />
-                </svg>
-                <span className="absolute mono text-[13px] font-semibold text-fg-primary">
-                  {globalPct.toFixed(0)}%
-                </span>
-              </div>
-            </div>
-
-            <div className="flex items-center justify-between gap-2 pt-3 border-t border-border-subtle">
-              <span className="text-[12px] text-fg-secondary tabular">
-                {drives.length} {drives.length === 1 ? "unidad detectada" : "unidades detectadas"}
-              </span>
-              {primaryDrive && (
-                <Button
-                  variant="primary"
-                  size="sm"
-                  disabled={Boolean(scanningDrive)}
-                  onClick={() => onStartScan(primaryDrive.rootPath)}
-                >
-                  <Play size={12} />
-                  Escanear {primaryDrive.rootPath}
-                </Button>
-              )}
-            </div>
-          </Card>
-
-          {/* Individual drive Bento cards */}
           <div className="lg:col-span-8 grid grid-cols-1 sm:grid-cols-2 gap-4">
             {drives.map((drive, idx) => {
               const usedPct =
@@ -271,18 +218,47 @@ export function DrivesBento({
                   </div>
 
                   <div className="flex items-center justify-between gap-2 pt-1">
-                    <span className="mono text-[11.5px] text-fg-muted">
-                      {formatBytes(drive.totalBytes)} · {usedPct.toFixed(1)}%
+                    <span className="mono text-[11.5px] text-fg-muted truncate">
+                      {formatBytes(drive.totalBytes)} · {usedPct.toFixed(1)}%{(() => {
+                        const s = indexedMap.get(drive.rootPath.toUpperCase());
+                        return s ? ` · ${s.stats.totalFiles.toLocaleString()} arch.` : "";
+                      })()}
                     </span>
-                    <Button
-                      variant="primary"
-                      size="sm"
-                      disabled={!drive.available || Boolean(scanningDrive)}
-                      onClick={() => onStartScan(drive.rootPath)}
-                    >
-                      <Play size={12} />
-                      {drive.available ? "Escanear" : "No disponible"}
-                    </Button>
+                    <div className="flex items-center gap-1.5 shrink-0">
+                      {indexedMap.has(drive.rootPath.toUpperCase()) ? (
+                        <>
+                          <Button
+                            variant="ghost"
+                            size="icon"
+                            disabled={!drive.available || Boolean(scanningDrive)}
+                            onClick={() => onStartScan(drive.rootPath)}
+                            title={`Reescanear ${drive.rootPath}`}
+                            aria-label={`Reescanear ${drive.rootPath}`}
+                          >
+                            <RefreshCw size={12} />
+                          </Button>
+                          <Button
+                            variant="primary"
+                            size="sm"
+                            disabled={!drive.available}
+                            onClick={() => onExploreDrive(drive.rootPath)}
+                          >
+                            <FolderTree size={12} />
+                            Explorar
+                          </Button>
+                        </>
+                      ) : (
+                        <Button
+                          variant="primary"
+                          size="sm"
+                          disabled={!drive.available || Boolean(scanningDrive)}
+                          onClick={() => onStartScan(drive.rootPath)}
+                        >
+                          <Play size={12} />
+                          {drive.available ? "Escanear" : "No disponible"}
+                        </Button>
+                      )}
+                    </div>
                   </div>
                 </Card>
               );

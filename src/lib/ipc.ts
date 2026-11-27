@@ -49,6 +49,7 @@ export type {
 } from "./ipcDevTypes";
 export type {
   AppSettings,
+  CleanupProgressEvent,
   DeletionJobStatus,
   DriveProgressItem,
   FocusSyncResult,
@@ -149,6 +150,7 @@ export const api = {
   },
   listDrives: (includeNetwork: boolean) =>
     invoke<DriveInfo[]>("cmd_list_drives", { includeNetwork }),
+  listIndexedSummaries: () => invoke<ScanSummary[]>("cmd_list_indexed_summaries"),
   setActiveDrive: (driveRoot: string) => invoke<void>("cmd_set_active_drive", { driveRoot }),
   startScan: (rootPath: string, onProgress: (p: ScanProgress) => void) => {
     const channel = new Channel<ScanProgress>();
@@ -203,7 +205,8 @@ export const api = {
   getAccessDenied: (limit = 200, driveRoot?: string | null) =>
     invoke<string[]>("cmd_get_access_denied", { limit, driveRoot: driveRoot ?? null }),
   openInExplorer: (path: string) => invoke<void>("cmd_open_in_explorer", { path }),
-  listInstalledApps: () => invoke<InstalledApp[]>("cmd_list_installed_apps"),
+  listInstalledApps: (forceRefresh = false) =>
+    invoke<InstalledApp[]>("cmd_list_installed_apps", { forceRefresh }),
   uninstallApp: (
     source: "win32" | "store_msix",
     uninstallString: string | null,

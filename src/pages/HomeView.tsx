@@ -8,12 +8,15 @@ interface HomeViewProps {
   username: string | null;
   isElevated: boolean;
   drives: DriveInfo[];
+  summaries: ScanSummary[];
   loadingDrives: boolean;
+  syncing: boolean;
   includeNetwork: boolean;
   scanningDrive: string | null;
   progress: ScanProgress | null;
   scanSummary: ScanSummary | null;
   onNavigate: (page: LauncherTarget) => void;
+  onExploreDrive: (rootPath: string) => void;
   onToggleNetwork: (include: boolean) => void;
   onRefreshDrives: () => void;
   onStartScan: (rootPath: string) => void;
@@ -24,12 +27,15 @@ export function HomeView({
   username,
   isElevated,
   drives,
+  summaries,
   loadingDrives,
+  syncing,
   includeNetwork,
   scanningDrive,
   progress,
   scanSummary,
   onNavigate,
+  onExploreDrive,
   onToggleNetwork,
   onRefreshDrives,
   onStartScan,
@@ -44,7 +50,7 @@ export function HomeView({
             {username ? `Bienvenido, ${username}` : "Bienvenido a ScanCleaner"}
           </h1>
           <p className="m-0 text-[14px] text-fg-secondary text-pretty">
-            Selecciona una herramienta o escanea una unidad para liberar espacio de forma segura.
+            Todas tus unidades locales están listas para explorar y limpiar al instante.
           </p>
           <div className="flex items-center justify-center gap-2 flex-wrap mt-1">
             <Badge tone="success">
@@ -56,17 +62,24 @@ export function HomeView({
         </div>
 
         <div className="w-full max-w-[920px]">
-          <LauncherGrid activeScanRoot={scanSummary?.rootPath ?? null} onNavigate={onNavigate} />
+          <LauncherGrid
+            activeScanRoot={scanSummary?.rootPath ?? null}
+            indexedCount={summaries.length}
+            onNavigate={onNavigate}
+          />
         </div>
       </div>
 
       {/* Drives Bento Grid */}
       <DrivesBento
         drives={drives}
+        summaries={summaries}
         loading={loadingDrives}
+        syncing={syncing}
         includeNetwork={includeNetwork}
         scanningDrive={scanningDrive}
         progress={progress}
+        onExploreDrive={onExploreDrive}
         onToggleNetwork={onToggleNetwork}
         onRefresh={onRefreshDrives}
         onStartScan={onStartScan}

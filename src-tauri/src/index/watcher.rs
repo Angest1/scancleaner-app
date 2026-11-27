@@ -14,7 +14,7 @@ use windows::Win32::Storage::FileSystem::{
 };
 use windows::Win32::System::IO::CancelIoEx;
 
-use super::is_inside_index_dir;
+use super::is_watcher_ignored_path;
 
 /// Handle to a running per-volume filesystem watcher (`ReadDirectoryChangesW`).
 pub struct VolumeDirWatcher {
@@ -103,9 +103,16 @@ impl VolumeDirWatcher {
                             unsafe { std::slice::from_raw_parts(info.FileName.as_ptr(), chars) };
                         let rel = OsString::from_wide(name_slice);
                         let full = root_path.join(rel);
-                        // Ignore changes inside ScanCleaner's own index directory to prevent loops
-                        if !is_inside_index_dir(&full) {
-                            changed.push(full);
+                        // Ignore changes inside ScanCleaner's own AppData (index/webview2/logs) and OS churn
+                        if !is_watcher_ignored_path(&full) {
+                            // Reconcile the changed file's parent directory (never the entire volume root!)
+                            let target = full
+                                .parent()
+                                .map(std::path::Path::to_path_buf)
+                                .unwrap_or(full);
+                            if !crate::scanner::is_volume_root(&target) {
+                                changed.push(target);
+                            }
                         }
                         if info.NextEntryOffset == 0 {
                             break;

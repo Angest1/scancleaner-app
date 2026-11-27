@@ -1,19 +1,21 @@
-import { AlertTriangle, FolderTree, Home, RefreshCw, ShieldAlert } from "lucide-react";
-import { useCallback, useEffect, useRef, useState } from "react";
+import { FolderTree, Home, RefreshCw, ShieldAlert } from "lucide-react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { BreadcrumbBar } from "../components/BreadcrumbBar";
 import { CategoryCharts } from "../components/CategoryCharts";
 import { SystemFilesPanel } from "../components/SystemFilesPanel";
 import { TopEntriesTable } from "../components/TopEntriesTable";
 import { TreemapCanvas } from "../components/TreemapCanvas";
-import { Badge } from "../components/ui/Badge";
+import { HorizontalBarChart } from "../components/charts/HorizontalBarChart";
+import { DriveSwitcherCard } from "../components/explorer/DriveSwitcherCard";
 import { Button } from "../components/ui/Button";
 import { Card } from "../components/ui/Card";
 import { Collapse } from "../components/ui/Collapse";
 import { EmptyState } from "../components/ui/Feedback";
 import { SegmentedControl } from "../components/ui/SegmentedControl";
-import { formatBytes, formatDurationMs } from "../lib/format";
+import { colorForCategory, formatBytes } from "../lib/format";
 import {
   type CategoryBreakdown,
+  type DriveInfo,
   type ScanSummary,
   type TopEntryDto,
   type TreemapLayoutDto,
@@ -23,9 +25,14 @@ import {
 
 interface ExplorerViewProps {
   scanSummary: ScanSummary | null;
+  summaries: ScanSummary[];
+  drives: DriveInfo[];
+  scanningDrive: string | null;
   rulesPath: string;
   isElevated: boolean;
   syncRevision: number;
+  onSelectDrive: (rootPath: string) => void;
+  onRescanDrive: (rootPath: string) => void;
   onGoHome: () => void;
   onRelaunchAdmin: () => void;
   onQueueCleanup: (path: string, category: string) => void;
@@ -34,9 +41,14 @@ interface ExplorerViewProps {
 
 export function ExplorerView({
   scanSummary,
+  summaries,
+  drives,
+  scanningDrive,
   rulesPath,
   isElevated,
   syncRevision,
+  onSelectDrive,
+  onRescanDrive,
   onGoHome,
   onRelaunchAdmin,
   onQueueCleanup,
@@ -44,7 +56,8 @@ export function ExplorerView({
 }: ExplorerViewProps) {
   const [nodeId, setNodeId] = useState(0);
   const [treemapLayout, setTreemapLayout] = useState<TreemapLayoutDto | null>(null);
-  const [viewport, setViewport] = useState({ width: 960, height: 420 });
+  const [loadingTreemap, setLoadingTreemap] = useState(true);
+  const [viewport, setViewport] = useState({ width: 0, height: 0 });
   const [rankingKind, setRankingKind] = useState<"dirs" | "files">("dirs");
   const [topEntries, setTopEntries] = useState<TopEntryDto[]>([]);
   const [breakdown, setBreakdown] = useState<CategoryBreakdown | null>(null);
@@ -71,6 +84,8 @@ export function ExplorerView({
   useEffect(() => {
     if (!activeRoot) return;
     setNodeId(0);
+    setTreemapLayout(null);
+    setLoadingTreemap(true);
   }, [activeRoot]);
 
   useEffect(() => {
@@ -107,10 +122,14 @@ export function ExplorerView({
         .catch(() => {});
     }
 
-    api
-      .getTreemapLayout(nodeId, viewport.width, viewport.height, activeRoot, 3, 140)
-      .then(setTreemapLayout)
-      .catch(() => {});
+    if (viewport.width > 0 && viewport.height > 0) {
+      setLoadingTreemap(true);
+      api
+        .getTreemapLayout(nodeId, viewport.width, viewport.height, activeRoot, 3, 140)
+        .then(setTreemapLayout)
+        .catch(() => {})
+        .finally(() => setLoadingTreemap(false));
+    }
     api
       .getTopEntries(nodeId, rankingKind, 100, activeRoot)
       .then(setTopEntries)
@@ -124,6 +143,12 @@ export function ExplorerView({
     viewport.width,
     viewport.height,
   ]);
+
+  const indexedSet = useMemo(
+    () => new Set(summaries.map((s) => s.rootPath.toUpperCase())),
+    [summaries],
+  );
+  const availableDrives = useMemo(() => drives.filter((d) => d.available), [drives]);
 
   if (!scanSummary) {
     return (
@@ -169,46 +194,17 @@ export function ExplorerView({
 
   return (
     <div className="flex flex-col gap-4">
-      {/* Scan summary strip */}
-      <Card className="flex items-center justify-between flex-wrap gap-3">
-        <div>
-          <div className="text-[12px] text-fg-muted">
-            Escaneo de <span className="mono text-fg-secondary">{scanSummary.rootPath}</span> (
-            {scanSummary.fsType.toUpperCase()})
-          </div>
-          <div className="flex items-center gap-4 flex-wrap mt-1 text-[13px] tabular">
-            <span>
-              <strong className="mono font-semibold text-fg-primary">
-                {formatBytes(scanSummary.stats.totalAllocatedBytes)}
-              </strong>{" "}
-              <span className="text-fg-secondary">en disco</span>
-            </span>
-            <span className="text-fg-secondary">
-              {scanSummary.stats.totalFiles.toLocaleString()} archivos
-            </span>
-            <span className="text-fg-secondary">
-              {scanSummary.stats.totalDirs.toLocaleString()} carpetas
-            </span>
-            <span className="text-fg-secondary">
-              Duración:{" "}
-              <span className="mono">{formatDurationMs(scanSummary.stats.durationMs)}</span>
-            </span>
-            {scanSummary.stats.hardlinksDeduplicated > 0 && (
-              <Badge tone="accent">
-                {scanSummary.stats.hardlinksDeduplicated.toLocaleString()} hardlinks deduplicados
-              </Badge>
-            )}
-            {skippedLinks > 0 && <Badge>{skippedLinks.toLocaleString()} enlaces omitidos</Badge>}
-          </div>
-        </div>
-
-        {scanSummary.stats.accessDeniedCount > 0 && (
-          <Button variant="warning" size="sm" onClick={() => setShowDenied((v) => !v)}>
-            <AlertTriangle size={13} />
-            Omitidas por permisos ({scanSummary.stats.accessDeniedCount})
-          </Button>
-        )}
-      </Card>
+      {/* Multi-drive switcher + Scan summary strip */}
+      <DriveSwitcherCard
+        scanSummary={scanSummary}
+        availableDrives={availableDrives}
+        indexedSet={indexedSet}
+        scanningDrive={scanningDrive}
+        skippedLinks={skippedLinks}
+        onSelectDrive={onSelectDrive}
+        onRescanDrive={onRescanDrive}
+        onToggleDenied={() => setShowDenied((v) => !v)}
+      />
 
       <Collapse open={showDenied && deniedPaths.length > 0}>
         <Card className="border-warning-border bg-warning-soft/50">
@@ -256,6 +252,7 @@ export function ExplorerView({
 
         <TreemapCanvas
           nativeRects={treemapLayout?.rects ?? []}
+          loading={loadingTreemap}
           colorBy={colorBy}
           onViewportChange={handleViewportChange}
           onDrillDown={(id) => setNodeId(id)}
@@ -304,14 +301,39 @@ export function ExplorerView({
 
         <div key={tab} className="animate-view-in">
           {tab === "ranking" ? (
-            <TopEntriesTable
-              entries={topEntries}
-              kind={rankingKind}
-              onDrillDown={(id) => setNodeId(id)}
-              onOpenExplorer={handleOpenExplorer}
-              onSendToCleanup={(entry) => onQueueCleanup(entry.fullPath, entry.originCat)}
-              onProtectPath={(entry) => handleProtectPath(entry.fullPath, rankingKind === "dirs")}
-            />
+            <div className="flex flex-col gap-4">
+              {topEntries.length > 0 && (
+                <div className="p-3 rounded-[10px] bg-canvas/60 border border-border-subtle">
+                  <div className="text-[11.5px] font-medium text-fg-muted mb-2">
+                    Top 6 {rankingKind === "dirs" ? "carpetas" : "archivos"} por tamaño en este
+                    nivel
+                  </div>
+                  <HorizontalBarChart
+                    maxItems={6}
+                    onSelectItem={rankingKind === "dirs" ? (k) => setNodeId(Number(k)) : undefined}
+                    items={topEntries.slice(0, 6).map((e) => ({
+                      key: String(e.nodeId),
+                      label: e.name,
+                      sublabel:
+                        rankingKind === "dirs"
+                          ? `${e.fileCount.toLocaleString()} arch.`
+                          : undefined,
+                      value: e.allocatedBytes,
+                      valueLabel: formatBytes(e.allocatedBytes),
+                      color: colorForCategory(colorBy === "type" ? e.typeCat : e.originCat),
+                    }))}
+                  />
+                </div>
+              )}
+              <TopEntriesTable
+                entries={topEntries}
+                kind={rankingKind}
+                onDrillDown={(id) => setNodeId(id)}
+                onOpenExplorer={handleOpenExplorer}
+                onSendToCleanup={(entry) => onQueueCleanup(entry.fullPath, entry.originCat)}
+                onProtectPath={(entry) => handleProtectPath(entry.fullPath, rankingKind === "dirs")}
+              />
+            </div>
           ) : tab === "categories" ? (
             <CategoryCharts breakdown={breakdown} />
           ) : (

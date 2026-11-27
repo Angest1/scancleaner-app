@@ -261,7 +261,13 @@ impl DerivedBuildContext {
                             .map(|m| m.to_ascii_lowercase())
                             .collect(),
                     });
-                } else {
+                } else if rule.ubicacion.special_detector.is_none()
+                    || rule.ubicacion.special_detector.as_deref() == Some("dir_contents")
+                {
+                    // CRITICAL: Rules with a specialized detector (e.g. `jetbrains_caches`,
+                    // `android_studio_old`, `gradle_old_dists`, `vscode_orphan_ws`) list a PARENT
+                    // directory in `env_fallback` (such as `%LOCALAPPDATA%\Google`). Never register
+                    // those parent roots directly as deletable global caches!
                     for (idx, tmpl) in rule.ubicacion.env_fallback.iter().enumerate() {
                         if let Some(expanded) = expand_env_vars(tmpl) {
                             let s = expanded.to_string_lossy().into_owned();

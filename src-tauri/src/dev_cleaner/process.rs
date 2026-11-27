@@ -89,6 +89,8 @@ fn spawn_and_wait(
     cwd: Option<&Path>,
     timeout: Duration,
 ) -> Option<CommandOutput> {
+    const MAX_PIPE_BYTES: usize = 2 * 1024 * 1024;
+
     let mut cmd = Command::new(program);
     cmd.args(args)
         .stdin(Stdio::null())
@@ -114,24 +116,44 @@ fn spawn_and_wait(
         }
     };
 
+    // Drain stdout and stderr concurrently on dedicated threads so Windows pipe buffers (~4 KB)
+    // can NEVER fill and deadlock verbose CLIs like `pnpm store prune` or `npm cache clean`.
+    let stdout_pipe = child.stdout.take();
+    let stderr_pipe = child.stderr.take();
+
+    let stdout_handle = std::thread::spawn(move || read_pipe_bounded(stdout_pipe, MAX_PIPE_BYTES));
+    let stderr_handle = std::thread::spawn(move || read_pipe_bounded(stderr_pipe, MAX_PIPE_BYTES));
+
     let start = Instant::now();
     loop {
         match child.try_wait() {
-            Ok(Some(_status)) => {
-                let output = child.wait_with_output().ok()?;
+            Ok(Some(status)) => {
+                let stdout_bytes = stdout_handle.join().unwrap_or_default();
+                let stderr_bytes = stderr_handle.join().unwrap_or_default();
                 return Some(CommandOutput {
-                    success: output.status.success(),
-                    exit_code: output.status.code(),
-                    stdout: String::from_utf8_lossy(&output.stdout).into_owned(),
-                    stderr: String::from_utf8_lossy(&output.stderr).into_owned(),
+                    success: status.success(),
+                    exit_code: status.code(),
+                    stdout: String::from_utf8_lossy(&stdout_bytes).into_owned(),
+                    stderr: String::from_utf8_lossy(&stderr_bytes).into_owned(),
                     timed_out: false,
                     not_found: false,
                 });
             }
             Ok(None) => {
                 if start.elapsed() >= timeout {
+                    // Kill entire process tree (important when `cmd.exe /C` spawned node/pnpm)
+                    let pid = child.id();
+                    let _ = Command::new("taskkill")
+                        .args(["/F", "/T", "/PID", &pid.to_string()])
+                        .stdin(Stdio::null())
+                        .stdout(Stdio::null())
+                        .stderr(Stdio::null())
+                        .creation_flags(CREATE_NO_WINDOW)
+                        .status();
                     let _ = child.kill();
                     let _ = child.wait();
+                    let _ = stdout_handle.join();
+                    let _ = stderr_handle.join();
                     return Some(CommandOutput {
                         success: false,
                         exit_code: None,
@@ -147,6 +169,10 @@ fn spawn_and_wait(
                 std::thread::sleep(Duration::from_millis(25));
             }
             Err(e) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                let _ = stdout_handle.join();
+                let _ = stderr_handle.join();
                 return Some(CommandOutput {
                     success: false,
                     exit_code: None,
@@ -158,6 +184,27 @@ fn spawn_and_wait(
             }
         }
     }
+}
+
+fn read_pipe_bounded<R: std::io::Read>(pipe: Option<R>, max_bytes: usize) -> Vec<u8> {
+    let Some(mut reader) = pipe else {
+        return Vec::new();
+    };
+    let mut out = Vec::new();
+    let mut buf = [0u8; 8192];
+    loop {
+        match reader.read(&mut buf) {
+            Ok(0) | Err(_) => break,
+            Ok(n) => {
+                if out.len() < max_bytes {
+                    let take = n.min(max_bytes - out.len());
+                    out.extend_from_slice(&buf[..take]);
+                }
+                // Keep draining even after cap so the child process never blocks on WriteFile!
+            }
+        }
+    }
+    out
 }
 
 pub fn list_running_process_names() -> HashSet<String> {

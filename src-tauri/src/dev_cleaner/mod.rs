@@ -129,6 +129,12 @@ pub fn scan_dev_cleanup_from_trees(
             if rule.nivel == SafetyLevel::Nunca {
                 continue;
             }
+            // Safety guard (protects even against older cached .idx snapshots):
+            // Never treat a special-detector rule's parent env_fallback folder as a direct cache!
+            let special = rule.ubicacion.special_detector.as_deref();
+            if special.is_some() && special != Some("dir_contents") {
+                continue;
+            }
             let idx = cache.node_id as usize;
             if idx >= tree.len() {
                 continue;
@@ -187,6 +193,49 @@ pub fn scan_dev_cleanup_from_trees(
                 }
             }
             candidates.push(cand);
+        }
+    }
+
+    // 1b. Run specialized non-project detectors (Android Studio caches, old Gradle dists,
+    // VS Code orphan workspaces, etc.) so parent roots like `%LOCALAPPDATA%\Google` are NEVER
+    // targeted directly — only their specific safe sub-folders (`AndroidStudio*\caches`, etc.).
+    let special_rules: Vec<DevRule> = catalog
+        .rules
+        .iter()
+        .filter(|r| {
+            r.tipo != RuleKind::ArtefactoProyecto
+                && r.nivel != SafetyLevel::Nunca
+                && !disabled_ids.contains(&r.id)
+                && matches!(
+                    r.ubicacion.special_detector.as_deref(),
+                    Some(
+                        "gradle_daemon_logs"
+                            | "gradle_old_dists"
+                            | "vscode_orphan_ws"
+                            | "vscode_old_exts"
+                            | "jetbrains_caches"
+                            | "android_studio_old"
+                            | "android_avds"
+                    )
+                )
+        })
+        .cloned()
+        .collect();
+    if !special_rules.is_empty() {
+        let mut special_warnings = Vec::new();
+        let special_cands = resolve_non_project_rules(
+            &special_rules,
+            &catalog.blacklist_never,
+            &disabled_ids,
+            &running_procs,
+            &runner,
+            &docker_wsl_info,
+            &mut special_warnings,
+        );
+        for c in special_cands {
+            if seen_paths.insert(c.path.to_ascii_lowercase()) {
+                candidates.push(c);
+            }
         }
     }
 

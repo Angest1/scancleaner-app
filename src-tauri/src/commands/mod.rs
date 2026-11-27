@@ -17,12 +17,14 @@ use crate::apps::{
 use crate::categorizer::{classify_tree, user_rules_path, CategoryBreakdown, RulesConfig};
 use crate::cleaner::detectors::{discover_cleanup_candidates_from_trees, CleanupCandidatesReport};
 use crate::cleaner::executor::{
-    build_cleanup_plan, execute_cleanup_plan_with_options, CleanupMode, CleanupPlan, CleanupResult,
-    PreviewCleanupRequest,
+    build_cleanup_plan, execute_cleanup_plan_with_progress, CleanupMode, CleanupPlan,
+    CleanupResult, PreviewCleanupRequest,
 };
 use crate::deletion::fast_delete::{delete_tree_parallel_fast, resume_pending_trash_drains};
 use crate::deletion::queue::{DeletionJobPhase, DeletionJobStatus};
-use crate::dev_cleaner::executor::{build_dev_cleanup_plan, execute_dev_cleanup_plan};
+use crate::dev_cleaner::executor::{
+    build_dev_cleanup_plan, execute_dev_cleanup_plan_with_progress,
+};
 use crate::dev_cleaner::folder_picker::{pick_file_native, pick_folder_native};
 use crate::dev_cleaner::process::SystemCommandRunner;
 use crate::dev_cleaner::scan_dev_cleanup_from_trees;
@@ -212,16 +214,19 @@ pub fn is_windows_animations_enabled() -> bool {
 }
 
 #[tauri::command]
-pub fn get_startup_context(state: State<'_, AppState>) -> StartupContext {
+pub async fn get_startup_context(state: State<'_, AppState>) -> Result<StartupContext, String> {
     let settings = state.settings.read().map(|g| g.clone()).unwrap_or_default();
-    StartupContext {
+    let startup_drive = state.startup_drive.clone();
+    tauri::async_runtime::spawn_blocking(move || StartupContext {
         elevation: current_elevation_status(),
-        startup_drive: state.startup_drive.clone(),
+        startup_drive,
         rules_path: user_rules_path().to_string_lossy().into_owned(),
         settings,
         service_status: query_service_status(),
         windows_animations_enabled: is_windows_animations_enabled(),
-    }
+    })
+    .await
+    .map_err(|e| e.to_string())
 }
 
 #[tauri::command]
@@ -232,22 +237,56 @@ pub fn cmd_show_main_window(window: tauri::WebviewWindow) -> Result<(), String> 
 }
 
 #[tauri::command]
-pub fn cmd_list_drives(include_network: bool) -> Vec<DriveInfo> {
-    list_drives(include_network)
+pub async fn cmd_list_drives(include_network: bool) -> Result<Vec<DriveInfo>, String> {
+    tauri::async_runtime::spawn_blocking(move || list_drives(include_network))
+        .await
+        .map_err(|e| e.to_string())
 }
 
 #[tauri::command]
-pub fn cmd_set_active_drive(drive_root: String, state: State<'_, AppState>) -> Result<(), String> {
+pub async fn cmd_list_indexed_summaries(
+    state: State<'_, AppState>,
+) -> Result<Vec<ScanSummary>, String> {
+    let slots = state.all_available_volume_slots();
+    tauri::async_runtime::spawn_blocking(move || {
+        let mut out: Vec<ScanSummary> = slots
+            .iter()
+            .filter_map(|s| {
+                s.read().ok().map(|g| ScanSummary {
+                    root_path: g.tree.root_path.to_string_lossy().into_owned(),
+                    fs_type: g.tree.fs_type,
+                    stats: g.tree.stats.clone(),
+                    snapshot_id: None,
+                })
+            })
+            .collect();
+        out.sort_by(|a, b| a.root_path.cmp(&b.root_path));
+        out
+    })
+    .await
+    .map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+pub async fn cmd_set_active_drive(
+    drive_root: String,
+    state: State<'_, AppState>,
+) -> Result<(), String> {
     let key = normalize_volume_key(&drive_root);
     if let Ok(mut ad) = state.active_drive.write() {
         *ad = Some(key.clone());
     }
     if let Some(slot) = state.get_volume_slot(Some(&key)) {
-        if let Ok(g) = slot.read() {
-            let bd = g
-                .tree
-                .derived
-                .to_category_breakdown(g.tree.stats.total_allocated_bytes);
+        let bd_opt = tauri::async_runtime::spawn_blocking(move || {
+            slot.read().ok().map(|g| {
+                g.tree
+                    .derived
+                    .to_category_breakdown(g.tree.stats.total_allocated_bytes)
+            })
+        })
+        .await
+        .map_err(|e| e.to_string())?;
+        if let Some(bd) = bd_opt {
             if let Ok(mut bdg) = state.active_breakdown.lock() {
                 *bdg = Some(bd);
             }
@@ -307,20 +346,23 @@ pub async fn cmd_bootstrap_startup(
         .unwrap_or(false);
     let idx_dir = default_index_dir();
 
-    // Try loading persisted binary snapshots in parallel
-    let _ = on_event.send(StartupBootstrapEvent::Progress {
-        global_ratio: Some(0.08),
-        phase: "Leyendo índice…".to_string(),
-        total_files: 0,
-        total_allocated_bytes: 0,
-        drives: drives
+    // Try loading persisted binary snapshots in parallel, emitting live per-drive progress
+    // as each volume finishes decompressing (never stuck on a static "Leyendo índice... 8%").
+    let total_snap_weight: u64 = drives
+        .iter()
+        .map(|d| d.used_bytes.max(1024 * 1024))
+        .sum::<u64>()
+        .max(1);
+
+    let snap_progress_state: Arc<Mutex<Vec<DriveProgressItem>>> = Arc::new(Mutex::new(
+        drives
             .iter()
             .map(|d| DriveProgressItem {
                 drive_root: d.root_path.clone(),
                 label: d.label.clone(),
                 used_bytes: d.used_bytes,
-                progress_ratio: Some(0.08),
-                phase: "Leyendo índice…".to_string(),
+                progress_ratio: Some(0.15),
+                phase: "Abriendo snapshot…".to_string(),
                 files: 0,
                 allocated_bytes: 0,
                 done: false,
@@ -328,19 +370,82 @@ pub async fn cmd_bootstrap_startup(
                 engine_mode: ScanEngineMode::SnapshotCached,
             })
             .collect(),
-    });
+    ));
+
+    if let Ok(items) = snap_progress_state.lock() {
+        let _ = on_event.send(StartupBootstrapEvent::Progress {
+            global_ratio: Some(0.12),
+            phase: format!("Cargando índices locales (0/{})…", drives.len()),
+            total_files: 0,
+            total_allocated_bytes: 0,
+            drives: items.clone(),
+        });
+    }
 
     let drives_for_load = drives.clone();
-    let loaded_snaps: Vec<(DriveInfo, Option<crate::scanner::model::ScanTree>)> =
+    let on_event_snap = on_event.clone();
+    let snap_state_clone = snap_progress_state.clone();
+    let total_drives_count = drives.len();
+    let loaded_snaps: Vec<(DriveInfo, Option<(crate::scanner::model::ScanTree, i64)>)> =
         tauri::async_runtime::spawn_blocking(move || {
             drives_for_load
                 .into_par_iter()
-                .map(|d| {
+                .enumerate()
+                .map(|(idx, d)| {
+                    if let Ok(mut items) = snap_state_clone.lock() {
+                        if let Some(it) = items.get_mut(idx) {
+                            it.phase = "Descomprimiendo…".to_string();
+                            it.progress_ratio = Some(0.45);
+                        }
+                    }
+
                     let path = default_snapshot_path(&d.root_path, d.volume_serial);
                     let loaded = load_volume_snapshot(&path, Some(d.volume_serial))
                         .ok()
                         .filter(|(t, _)| t.include_ads == include_ads)
-                        .map(|(t, _)| t);
+                        .map(|(t, meta)| (t, meta.created_ts));
+
+                    if let Ok(mut items) = snap_state_clone.lock() {
+                        if let Some(it) = items.get_mut(idx) {
+                            it.done = true;
+                            it.progress_ratio = Some(1.0);
+                            if let Some((ref tree, _)) = loaded {
+                                it.files = tree.stats.total_files;
+                                it.allocated_bytes = tree.stats.total_allocated_bytes;
+                                it.phase = "Listo".to_string();
+                            } else {
+                                it.phase = "Requiere escaneo".to_string();
+                            }
+                        }
+
+                        let done_count = items.iter().filter(|i| i.done).count();
+                        let total_files: u64 = items.iter().map(|i| i.files).sum();
+                        let total_alloc: u64 = items.iter().map(|i| i.allocated_bytes).sum();
+                        let weighted_done: f64 = items
+                            .iter()
+                            .map(|i| {
+                                let w = i.used_bytes.max(1024 * 1024) as f64;
+                                w * i.progress_ratio.unwrap_or(0.0)
+                            })
+                            .sum();
+                        let global_ratio =
+                            (0.12 + 0.84 * (weighted_done / total_snap_weight as f64)).min(0.96);
+
+                        let _ = on_event_snap.send(StartupBootstrapEvent::Progress {
+                            global_ratio: Some(global_ratio),
+                            phase: if done_count < total_drives_count {
+                                format!(
+                                    "Cargando índices locales ({done_count}/{total_drives_count})…"
+                                )
+                            } else {
+                                "Preparando espacio de trabajo…".to_string()
+                            },
+                            total_files,
+                            total_allocated_bytes: total_alloc,
+                            drives: items.clone(),
+                        });
+                    }
+
                     (d, loaded)
                 })
                 .collect()
@@ -354,12 +459,14 @@ pub async fn cmd_bootstrap_startup(
     if any_loaded {
         let mut summaries = Vec::new();
         let mut missing_drives = Vec::new();
-        let mut loaded_roots = Vec::new();
+        let mut loaded_roots: Vec<(DriveInfo, i64)> = Vec::new();
         let mut observations = Vec::new();
+        let now_unix = Utc::now().timestamp();
 
         for (d, tree_opt) in loaded_snaps {
-            if let Some(mut tree) = tree_opt {
-                let stale = !has_fast_usn || tree.fs_type != FileSystemType::Ntfs;
+            if let Some((mut tree, created_ts)) = tree_opt {
+                let age_secs = now_unix.saturating_sub(created_ts);
+                let stale = !has_fast_usn && age_secs > 6 * 3600;
                 tree.stats.stale = stale;
                 let summary = ScanSummary {
                     root_path: tree.root_path.to_string_lossy().into_owned(),
@@ -367,7 +474,7 @@ pub async fn cmd_bootstrap_startup(
                     stats: tree.stats.clone(),
                     snapshot_id: None,
                 };
-                loaded_roots.push(d.clone());
+                loaded_roots.push((d.clone(), created_ts));
                 state.insert_volume(tree, stale);
                 summaries.push(summary);
             } else {
@@ -375,9 +482,13 @@ pub async fn cmd_bootstrap_startup(
             }
         }
 
-        if !has_fast_usn {
+        if !has_fast_usn
+            && loaded_roots
+                .iter()
+                .any(|(_, ts)| now_unix.saturating_sub(*ts) > 6 * 3600)
+        {
             observations.push(
-                "Sin permisos de administrador ni servicio de indexación: los snapshots se muestran de inmediato y se actualizan en segundo plano con la ruta de respaldo."
+                "Algunos snapshots tienen más de 6 horas sin servicio MFT/USN: se refrescan suavemente en segundo plano."
                     .to_string(),
             );
         }
@@ -395,53 +506,86 @@ pub async fn cmd_bootstrap_startup(
 
         let _ = on_event.send(StartupBootstrapEvent::Ready {
             warm: true,
-            partial: !has_fast_usn || !missing_drives.is_empty(),
+            partial: !missing_drives.is_empty(),
             has_previous_index: true,
             observations,
             summaries,
             elapsed_ms: elapsed,
         });
 
-        // Spawn background incremental USN sync (or fallback rescan) for loaded drives & missing drives
+        // Spawn lightweight background startup sync:
+        // - Always attaches live `ReadDirectoryChangesW` watchers.
+        // - If USN is available (admin or service), applies instant incremental USN deltas.
+        // - Without USN, NEVER redundantly rescans fresh snapshots (< 6h old)! Only refreshes
+        //   genuinely old snapshots or missing drives at low background I/O priority.
         let app_bg = app.clone();
         std::thread::Builder::new()
             .name("startup-bg-sync".to_string())
             .spawn(move || {
+                let _io_guard = crate::reconcile::queue::BackgroundIoGuard::enter_if_low_priority(
+                    ReconcilePriority::Low,
+                );
                 let st = app_bg.state::<AppState>();
+                let use_service_usn = !is_elevated() && ping_service();
+                let can_usn = is_elevated() || use_service_usn;
+                let now_ts = Utc::now().timestamp();
+
+                let needs_any_work = can_usn
+                    || !missing_drives.is_empty()
+                    || loaded_roots
+                        .iter()
+                        .any(|(_, ts)| now_ts.saturating_sub(*ts) > 6 * 3600);
+
+                if needs_any_work {
+                    if let Ok(mut ss) = st.sync_status.lock() {
+                        ss.syncing = true;
+                        ss.last_origin = Some("startup_sync".to_string());
+                    }
+                    let _ = app_bg.emit(
+                        "sync-status-changed",
+                        st.sync_status.lock().map(|g| g.clone()).ok(),
+                    );
+                }
+
                 let ctx = DerivedBuildContext::load_default();
                 let meta = RealFileMetaLookup;
-                let use_service_usn = !is_elevated() && ping_service();
+                let mut any_updated = false;
 
-                for d in &loaded_roots {
+                for (d, created_ts) in &loaded_roots {
                     start_watcher_for_drive(&app_bg, &d.root_path);
                     if let Some(slot) = st.get_volume_slot(Some(&d.root_path)) {
-                        let needs_full = if d.fs_type == FileSystemType::Ntfs
-                            && (is_elevated() || use_service_usn)
-                        {
+                        let needs_full = if d.fs_type == FileSystemType::Ntfs && can_usn {
                             let reader: Box<dyn UsnJournalReader> = if is_elevated() {
                                 Box::new(WinUsnJournalReader)
                             } else {
                                 Box::new(ServiceUsnJournalReader)
                             };
-                            if let Ok(mut g) = slot.write() {
-                                match sync_tree_with_usn(&mut g.tree, reader.as_ref(), &meta, &ctx)
-                                {
-                                    UsnSyncOutcome::UpToDate { applied_events, .. } => {
-                                        g.stale = false;
-                                        if applied_events > 0 {
+                            let outcome = if let Ok(mut g) = slot.write() {
+                                Some(sync_tree_with_usn(
+                                    &mut g.tree,
+                                    reader.as_ref(),
+                                    &meta,
+                                    &ctx,
+                                ))
+                            } else {
+                                None
+                            };
+                            match outcome {
+                                Some(UsnSyncOutcome::UpToDate { applied_events, .. }) => {
+                                    if applied_events > 0 {
+                                        if let Ok(g) = slot.read() {
                                             let _ = save_volume_snapshot(&g.tree, &idx_dir);
                                         }
-                                        false
+                                        any_updated = true;
                                     }
-                                    UsnSyncOutcome::NeedsFullRescan { .. }
-                                    | UsnSyncOutcome::Unavailable { .. } => true,
+                                    false
                                 }
-                            } else {
-                                false
+                                Some(UsnSyncOutcome::NeedsFullRescan { .. }) => true,
+                                _ => false,
                             }
                         } else {
-                            // No admin/journal: mark stale and rescan in background with fallback
-                            true
+                            // Without USN: reuse fresh snapshot (< 6h) without redundant full rescan!
+                            now_ts.saturating_sub(*created_ts) > 6 * 3600
                         };
 
                         if needs_full {
@@ -458,6 +602,7 @@ pub async fn cmd_bootstrap_startup(
                             if !new_tree.stats.cancelled {
                                 let _ = save_volume_snapshot(&new_tree, &idx_dir);
                                 st.insert_volume(new_tree, false);
+                                any_updated = true;
                                 let _ = app_bg.emit("sync-updated", &d.root_path);
                             }
                         }
@@ -479,8 +624,29 @@ pub async fn cmd_bootstrap_startup(
                     if !tree.stats.cancelled {
                         let _ = save_volume_snapshot(&tree, &idx_dir);
                         st.insert_volume(tree, false);
+                        any_updated = true;
                         let _ = app_bg.emit("sync-updated", &d.root_path);
                     }
+                }
+
+                if let Ok(mut ss) = st.sync_status.lock() {
+                    ss.syncing = false;
+                    ss.pending_batches = st
+                        .reconcile_queue
+                        .lock()
+                        .map(|q| q.pending_count())
+                        .unwrap_or(0);
+                    ss.last_synced_ts = Some(Utc::now().timestamp());
+                    if any_updated {
+                        ss.revision += 1;
+                    }
+                }
+                let _ = app_bg.emit(
+                    "sync-status-changed",
+                    st.sync_status.lock().map(|g| g.clone()).ok(),
+                );
+                if any_updated {
+                    let _ = app_bg.emit("sync-updated", "startup-sync-complete");
                 }
             })
             .ok();
@@ -675,7 +841,7 @@ pub fn start_watcher_for_drive(app: &tauri::AppHandle, drive_root: &str) {
                     volume: vol_for_cb.clone(),
                     paths,
                     origin: ReconcileOrigin::DirWatcher,
-                    priority: ReconcilePriority::Medium,
+                    priority: ReconcilePriority::Low,
                 },
                 Instant::now(),
             );
@@ -788,7 +954,7 @@ pub fn cmd_cancel_scan(state: State<'_, AppState>) -> Result<(), String> {
 }
 
 #[tauri::command]
-pub fn cmd_get_treemap_layout(
+pub async fn cmd_get_treemap_layout(
     drive_root: Option<String>,
     node_id: NodeId,
     width: f64,
@@ -800,20 +966,18 @@ pub fn cmd_get_treemap_layout(
     let slot = state
         .get_volume_slot(drive_root.as_deref())
         .ok_or_else(|| "No hay ningún escaneo activo.".to_string())?;
-    let guard = slot.read().map_err(|e| e.to_string())?;
     let limit = max_items.unwrap_or(140).clamp(10, 400);
-    compute_treemap_layout(
-        &guard.tree,
-        node_id,
-        width,
-        height,
-        min_px.unwrap_or(3.0),
-        limit,
-    )
+    let min_p = min_px.unwrap_or(3.0);
+    tauri::async_runtime::spawn_blocking(move || {
+        let guard = slot.read().map_err(|e| e.to_string())?;
+        compute_treemap_layout(&guard.tree, node_id, width, height, min_p, limit)
+    })
+    .await
+    .map_err(|e| e.to_string())?
 }
 
 #[tauri::command]
-pub fn cmd_get_treemap_children(
+pub async fn cmd_get_treemap_children(
     node_id: NodeId,
     max_items: Option<usize>,
     drive_root: Option<String>,
@@ -823,119 +987,128 @@ pub fn cmd_get_treemap_children(
     let slot = state
         .get_volume_slot(drive_root.as_deref())
         .ok_or_else(|| "No hay ningún escaneo activo.".to_string())?;
-    let guard = slot.read().map_err(|e| e.to_string())?;
-    let tree = &guard.tree;
 
-    let idx = node_id as usize;
-    if idx >= tree.len() {
-        return Err("Nodo fuera de rango.".to_string());
-    }
+    tauri::async_runtime::spawn_blocking(move || {
+        let guard = slot.read().map_err(|e| e.to_string())?;
+        let tree = &guard.tree;
 
-    let total_alloc = tree.allocated_size[idx].max(1);
-
-    let mut breadcrumbs = Vec::new();
-    let mut cur = node_id;
-    let mut depth_guard = 0usize;
-    while cur != crate::scanner::model::NONE_NODE && depth_guard < 256 {
-        breadcrumbs.push(BreadcrumbItem {
-            node_id: cur,
-            name: tree.node_name(cur).to_string(),
-        });
-        cur = tree.parent_of(cur);
-        depth_guard += 1;
-    }
-    breadcrumbs.reverse();
-
-    let mut raw_children: Vec<NodeId> = tree.children_iter(node_id).collect();
-    raw_children
-        .sort_by(|&a, &b| tree.allocated_size[b as usize].cmp(&tree.allocated_size[a as usize]));
-
-    let mut children = Vec::new();
-    let prot_engine = ProtectionEngine::load_default();
-    let mut other_bytes = 0u64;
-    let mut other_logical = 0u64;
-    let mut other_files = 0u32;
-    let mut other_count = 0usize;
-
-    for (pos, cid) in raw_children.into_iter().enumerate() {
-        let cidx = cid as usize;
-        let alloc = tree.allocated_size[cidx];
-        if alloc == 0 && pos >= 30 {
-            continue;
+        let idx = node_id as usize;
+        if idx >= tree.len() {
+            return Err("Nodo fuera de rango.".to_string());
         }
-        if pos < limit {
-            let full_pb = tree.reconstruct_path(cid);
-            let flags = tree.flags_of(cid);
-            let is_prot = flags.contains(NodeFlags::PROTECTED)
-                || flags.contains(NodeFlags::PROTECTED_DESCENDANT);
-            let reason = if is_prot {
-                prot_engine.is_protected_for_ui(&full_pb).reason
-            } else {
-                None
-            };
-            children.push(TreemapNodeDto {
-                node_id: Some(cid),
-                name: tree.node_name(cid).to_string(),
-                full_path: full_pb.to_string_lossy().into_owned(),
-                kind: format!("{:?}", tree.kind_of(cid)).to_ascii_lowercase(),
-                allocated_bytes: alloc,
-                logical_bytes: tree.logical_size[cidx],
-                file_count: tree.file_count[cidx],
-                type_cat: format!("{:?}", tree.type_cat_of(cid)).to_ascii_lowercase(),
-                origin_cat: format!("{:?}", tree.origin_cat_of(cid)).to_ascii_lowercase(),
-                percentage: (alloc as f64 / total_alloc as f64) * 100.0,
-                is_other_bucket: false,
-                is_protected: is_prot,
-                is_cloud_only: flags.contains(NodeFlags::CLOUD_ONLY),
-                is_pending_trash: flags.contains(NodeFlags::PENDING_TRASH),
-                protection_reason: reason,
+
+        let total_alloc = tree.allocated_size[idx].max(1);
+
+        let mut breadcrumbs = Vec::new();
+        let mut cur = node_id;
+        let mut depth_guard = 0usize;
+        while cur != crate::scanner::model::NONE_NODE && depth_guard < 256 {
+            breadcrumbs.push(BreadcrumbItem {
+                node_id: cur,
+                name: tree.node_name(cur).to_string(),
             });
-        } else {
-            other_bytes = other_bytes.saturating_add(alloc);
-            other_logical = other_logical.saturating_add(tree.logical_size[cidx]);
-            other_files = other_files.saturating_add(tree.file_count[cidx]);
-            other_count += 1;
+            cur = tree.parent_of(cur);
+            depth_guard += 1;
         }
-    }
+        breadcrumbs.reverse();
 
-    if other_count > 0 && other_bytes > 0 {
-        children.push(TreemapNodeDto {
-            node_id: None,
-            name: format!("Otros ({other_count} elementos)"),
+        let mut raw_children: Vec<NodeId> = tree.children_iter(node_id).collect();
+        raw_children.sort_by(|&a, &b| {
+            tree.allocated_size[b as usize].cmp(&tree.allocated_size[a as usize])
+        });
+
+        let mut children = Vec::new();
+        let mut prot_engine: Option<ProtectionEngine> = None;
+        let mut other_bytes = 0u64;
+        let mut other_logical = 0u64;
+        let mut other_files = 0u32;
+        let mut other_count = 0usize;
+
+        for (pos, cid) in raw_children.into_iter().enumerate() {
+            let cidx = cid as usize;
+            let alloc = tree.allocated_size[cidx];
+            if alloc == 0 && pos >= 30 {
+                continue;
+            }
+            if pos < limit {
+                let full_pb = tree.reconstruct_path(cid);
+                let flags = tree.flags_of(cid);
+                let is_prot = flags.contains(NodeFlags::PROTECTED)
+                    || flags.contains(NodeFlags::PROTECTED_DESCENDANT);
+                let reason = if is_prot {
+                    prot_engine
+                        .get_or_insert_with(ProtectionEngine::load_default)
+                        .is_protected_for_ui(&full_pb)
+                        .reason
+                } else {
+                    None
+                };
+                children.push(TreemapNodeDto {
+                    node_id: Some(cid),
+                    name: tree.node_name(cid).to_string(),
+                    full_path: full_pb.to_string_lossy().into_owned(),
+                    kind: format!("{:?}", tree.kind_of(cid)).to_ascii_lowercase(),
+                    allocated_bytes: alloc,
+                    logical_bytes: tree.logical_size[cidx],
+                    file_count: tree.file_count[cidx],
+                    type_cat: format!("{:?}", tree.type_cat_of(cid)).to_ascii_lowercase(),
+                    origin_cat: format!("{:?}", tree.origin_cat_of(cid)).to_ascii_lowercase(),
+                    percentage: (alloc as f64 / total_alloc as f64) * 100.0,
+                    is_other_bucket: false,
+                    is_protected: is_prot,
+                    is_cloud_only: flags.contains(NodeFlags::CLOUD_ONLY),
+                    is_pending_trash: flags.contains(NodeFlags::PENDING_TRASH),
+                    protection_reason: reason,
+                });
+            } else {
+                other_bytes = other_bytes.saturating_add(alloc);
+                other_logical = other_logical.saturating_add(tree.logical_size[cidx]);
+                other_files = other_files.saturating_add(tree.file_count[cidx]);
+                other_count += 1;
+            }
+        }
+
+        if other_count > 0 && other_bytes > 0 {
+            children.push(TreemapNodeDto {
+                node_id: None,
+                name: format!("Otros ({other_count} elementos)"),
+                full_path: tree
+                    .reconstruct_path(node_id)
+                    .to_string_lossy()
+                    .into_owned(),
+                kind: "other".to_string(),
+                allocated_bytes: other_bytes,
+                logical_bytes: other_logical,
+                file_count: other_files,
+                type_cat: "other".to_string(),
+                origin_cat: "userother".to_string(),
+                percentage: (other_bytes as f64 / total_alloc as f64) * 100.0,
+                is_other_bucket: true,
+                is_protected: false,
+                is_cloud_only: false,
+                is_pending_trash: false,
+                protection_reason: None,
+            });
+        }
+
+        Ok(TreemapViewDto {
+            node_id,
             full_path: tree
                 .reconstruct_path(node_id)
                 .to_string_lossy()
                 .into_owned(),
-            kind: "other".to_string(),
-            allocated_bytes: other_bytes,
-            logical_bytes: other_logical,
-            file_count: other_files,
-            type_cat: "other".to_string(),
-            origin_cat: "userother".to_string(),
-            percentage: (other_bytes as f64 / total_alloc as f64) * 100.0,
-            is_other_bucket: true,
-            is_protected: false,
-            is_cloud_only: false,
-            is_pending_trash: false,
-            protection_reason: None,
-        });
-    }
-
-    Ok(TreemapViewDto {
-        node_id,
-        full_path: tree
-            .reconstruct_path(node_id)
-            .to_string_lossy()
-            .into_owned(),
-        total_allocated_bytes: tree.allocated_size[idx],
-        file_count: tree.file_count[idx],
-        breadcrumbs,
-        children,
+            total_allocated_bytes: tree.allocated_size[idx],
+            file_count: tree.file_count[idx],
+            breadcrumbs,
+            children,
+        })
     })
+    .await
+    .map_err(|e| e.to_string())?
 }
 
 #[tauri::command]
-pub fn cmd_get_top_entries(
+pub async fn cmd_get_top_entries(
     scope_node_id: Option<NodeId>,
     kind: String,
     limit: Option<usize>,
@@ -946,89 +1119,97 @@ pub fn cmd_get_top_entries(
     let slot = state
         .get_volume_slot(drive_root.as_deref())
         .ok_or_else(|| "No hay ningún escaneo activo.".to_string())?;
-    let guard = slot.read().map_err(|e| e.to_string())?;
-    let tree = &guard.tree;
 
-    let scope = scope_node_id.unwrap_or(0);
-    let want_dirs = kind == "dirs";
+    tauri::async_runtime::spawn_blocking(move || {
+        let guard = slot.read().map_err(|e| e.to_string())?;
+        let tree = &guard.tree;
 
-    // Fast path: root scope uses precomputed `derived.top_dirs` / `derived.top_files` in O(limit)!
-    let matches: Vec<NodeId> = if scope == 0 {
-        let src = if want_dirs {
-            &tree.derived.top_dirs
+        let scope = scope_node_id.unwrap_or(0);
+        let want_dirs = kind == "dirs";
+
+        // Fast path: root scope uses precomputed `derived.top_dirs` / `derived.top_files` in O(limit)!
+        let matches: Vec<NodeId> = if scope == 0 {
+            let src = if want_dirs {
+                &tree.derived.top_dirs
+            } else {
+                &tree.derived.top_files
+            };
+            src.iter()
+                .copied()
+                .filter(|&nid| {
+                    (nid as usize) < tree.len()
+                        && !tree.flags_of(nid).contains(NodeFlags::TOMBSTONE)
+                        && !tree.flags_of(nid).contains(NodeFlags::OPTIMISTIC_HIDDEN)
+                })
+                .take(max_rows)
+                .collect()
         } else {
-            &tree.derived.top_files
-        };
-        src.iter()
-            .copied()
-            .filter(|&nid| {
-                (nid as usize) < tree.len()
-                    && !tree.flags_of(nid).contains(NodeFlags::TOMBSTONE)
-                    && !tree.flags_of(nid).contains(NodeFlags::OPTIMISTIC_HIDDEN)
-            })
-            .take(max_rows)
-            .collect()
-    } else {
-        let mut collected: Vec<NodeId> = Vec::new();
-        let mut stack = vec![scope];
-        while let Some(nid) = stack.pop() {
-            for cid in tree.children_iter(nid) {
-                let ckind = tree.kind_of(cid);
-                let alloc = tree.allocated_size[cid as usize];
-                if ckind == NodeKind::Dir {
-                    stack.push(cid);
-                    if want_dirs && alloc > 0 {
+            let mut collected: Vec<NodeId> = Vec::new();
+            let mut stack = vec![scope];
+            while let Some(nid) = stack.pop() {
+                for cid in tree.children_iter(nid) {
+                    let ckind = tree.kind_of(cid);
+                    let alloc = tree.allocated_size[cid as usize];
+                    if ckind == NodeKind::Dir {
+                        stack.push(cid);
+                        if want_dirs && alloc > 0 {
+                            collected.push(cid);
+                        }
+                    } else if !want_dirs
+                        && matches!(ckind, NodeKind::File | NodeKind::CloudPlaceholder)
+                        && alloc > 0
+                    {
                         collected.push(cid);
                     }
-                } else if !want_dirs
-                    && matches!(ckind, NodeKind::File | NodeKind::CloudPlaceholder)
-                    && alloc > 0
-                {
-                    collected.push(cid);
                 }
             }
-        }
-        collected.sort_by(|&a, &b| {
-            tree.allocated_size[b as usize].cmp(&tree.allocated_size[a as usize])
-        });
-        collected.truncate(max_rows);
-        collected
-    };
+            collected.sort_by(|&a, &b| {
+                tree.allocated_size[b as usize].cmp(&tree.allocated_size[a as usize])
+            });
+            collected.truncate(max_rows);
+            collected
+        };
 
-    let prot_engine = ProtectionEngine::load_default();
-    Ok(matches
-        .into_iter()
-        .map(|nid| {
-            let idx = nid as usize;
-            let full_pb = tree.reconstruct_path(nid);
-            let flags = tree.flags_of(nid);
-            let is_prot = flags.contains(NodeFlags::PROTECTED)
-                || flags.contains(NodeFlags::PROTECTED_DESCENDANT);
-            let reason = if is_prot {
-                prot_engine.is_protected_for_ui(&full_pb).reason
-            } else {
-                None
-            };
-            TopEntryDto {
-                node_id: nid,
-                name: tree.node_name(nid).to_string(),
-                full_path: full_pb.to_string_lossy().into_owned(),
-                allocated_bytes: tree.allocated_size[idx],
-                logical_bytes: tree.logical_size[idx],
-                file_count: tree.file_count[idx],
-                last_write_ts: tree.last_write_ts_of(nid),
-                type_cat: format!("{:?}", tree.type_cat_of(nid)).to_ascii_lowercase(),
-                origin_cat: format!("{:?}", tree.origin_cat_of(nid)).to_ascii_lowercase(),
-                is_protected: is_prot,
-                is_cloud_only: flags.contains(NodeFlags::CLOUD_ONLY),
-                protection_reason: reason,
-            }
-        })
-        .collect())
+        let mut prot_engine: Option<ProtectionEngine> = None;
+        Ok(matches
+            .into_iter()
+            .map(|nid| {
+                let idx = nid as usize;
+                let full_pb = tree.reconstruct_path(nid);
+                let flags = tree.flags_of(nid);
+                let is_prot = flags.contains(NodeFlags::PROTECTED)
+                    || flags.contains(NodeFlags::PROTECTED_DESCENDANT);
+                let reason = if is_prot {
+                    prot_engine
+                        .get_or_insert_with(ProtectionEngine::load_default)
+                        .is_protected_for_ui(&full_pb)
+                        .reason
+                } else {
+                    None
+                };
+                TopEntryDto {
+                    node_id: nid,
+                    name: tree.node_name(nid).to_string(),
+                    full_path: full_pb.to_string_lossy().into_owned(),
+                    allocated_bytes: tree.allocated_size[idx],
+                    logical_bytes: tree.logical_size[idx],
+                    file_count: tree.file_count[idx],
+                    last_write_ts: tree.last_write_ts_of(nid),
+                    type_cat: format!("{:?}", tree.type_cat_of(nid)).to_ascii_lowercase(),
+                    origin_cat: format!("{:?}", tree.origin_cat_of(nid)).to_ascii_lowercase(),
+                    is_protected: is_prot,
+                    is_cloud_only: flags.contains(NodeFlags::CLOUD_ONLY),
+                    protection_reason: reason,
+                }
+            })
+            .collect())
+    })
+    .await
+    .map_err(|e| e.to_string())?
 }
 
 #[tauri::command]
-pub fn cmd_search_volume(
+pub async fn cmd_search_volume(
     query: String,
     limit: Option<usize>,
     drive_root: Option<String>,
@@ -1037,48 +1218,61 @@ pub fn cmd_search_volume(
     let slot = state
         .get_volume_slot(drive_root.as_deref())
         .ok_or_else(|| "No hay ningún escaneo activo.".to_string())?;
-    let guard = slot.read().map_err(|e| e.to_string())?;
-    let tree = &guard.tree;
-    let hits = tree.search_by_name(&query, limit.unwrap_or(100).clamp(1, 300));
-    Ok(hits
-        .into_iter()
-        .map(|nid| SearchHitDto {
-            node_id: nid,
-            name: tree.node_name(nid).to_string(),
-            full_path: tree.reconstruct_path(nid).to_string_lossy().into_owned(),
-            kind: format!("{:?}", tree.kind_of(nid)).to_ascii_lowercase(),
-            allocated_bytes: tree.allocated_size[nid as usize],
-            is_protected: tree.flags_of(nid).contains(NodeFlags::PROTECTED),
-        })
-        .collect())
+    let max_hits = limit.unwrap_or(100).clamp(1, 300);
+    tauri::async_runtime::spawn_blocking(move || {
+        let guard = slot.read().map_err(|e| e.to_string())?;
+        let tree = &guard.tree;
+        let hits = tree.search_by_name(&query, max_hits);
+        Ok(hits
+            .into_iter()
+            .map(|nid| SearchHitDto {
+                node_id: nid,
+                name: tree.node_name(nid).to_string(),
+                full_path: tree.reconstruct_path(nid).to_string_lossy().into_owned(),
+                kind: format!("{:?}", tree.kind_of(nid)).to_ascii_lowercase(),
+                allocated_bytes: tree.allocated_size[nid as usize],
+                is_protected: tree.flags_of(nid).contains(NodeFlags::PROTECTED),
+            })
+            .collect())
+    })
+    .await
+    .map_err(|e| e.to_string())?
 }
 
 #[tauri::command]
-pub fn cmd_get_category_breakdown(
+pub async fn cmd_get_category_breakdown(
     drive_root: Option<String>,
     state: State<'_, AppState>,
 ) -> Result<CategoryBreakdown, String> {
     let slot = state
         .get_volume_slot(drive_root.as_deref())
         .ok_or_else(|| "No hay ningún escaneo activo.".to_string())?;
-    let guard = slot.read().map_err(|e| e.to_string())?;
-    Ok(guard
-        .tree
-        .derived
-        .to_category_breakdown(guard.tree.stats.total_allocated_bytes))
+    tauri::async_runtime::spawn_blocking(move || {
+        let guard = slot.read().map_err(|e| e.to_string())?;
+        Ok(guard
+            .tree
+            .derived
+            .to_category_breakdown(guard.tree.stats.total_allocated_bytes))
+    })
+    .await
+    .map_err(|e| e.to_string())?
 }
 
 #[tauri::command]
-pub fn cmd_reload_rules(
+pub async fn cmd_reload_rules(
     drive_root: Option<String>,
     state: State<'_, AppState>,
 ) -> Result<CategoryBreakdown, String> {
     let slot = state
         .get_volume_slot(drive_root.as_deref())
         .ok_or_else(|| "No hay ningún escaneo activo.".to_string())?;
-    let mut guard = slot.write().map_err(|e| e.to_string())?;
-    let rules = RulesConfig::load();
-    let breakdown = classify_tree(&mut guard.tree, &rules);
+    let breakdown = tauri::async_runtime::spawn_blocking(move || {
+        let mut guard = slot.write().map_err(|e| e.to_string())?;
+        let rules = RulesConfig::load();
+        Ok::<CategoryBreakdown, String>(classify_tree(&mut guard.tree, &rules))
+    })
+    .await
+    .map_err(|e| e.to_string())??;
     if let Ok(mut bdg) = state.active_breakdown.lock() {
         *bdg = Some(breakdown.clone());
     }
@@ -1086,7 +1280,7 @@ pub fn cmd_reload_rules(
 }
 
 #[tauri::command]
-pub fn cmd_get_access_denied(
+pub async fn cmd_get_access_denied(
     limit: Option<usize>,
     drive_root: Option<String>,
     state: State<'_, AppState>,
@@ -1095,14 +1289,18 @@ pub fn cmd_get_access_denied(
     let Some(slot) = state.get_volume_slot(drive_root.as_deref()) else {
         return Ok(Vec::new());
     };
-    let guard = slot.read().map_err(|e| e.to_string())?;
-    Ok(guard
-        .tree
-        .access_denied
-        .iter()
-        .take(max_items)
-        .map(|p| p.to_string_lossy().into_owned())
-        .collect())
+    tauri::async_runtime::spawn_blocking(move || {
+        let guard = slot.read().map_err(|e| e.to_string())?;
+        Ok(guard
+            .tree
+            .access_denied
+            .iter()
+            .take(max_items)
+            .map(|p| p.to_string_lossy().into_owned())
+            .collect())
+    })
+    .await
+    .map_err(|e| e.to_string())?
 }
 
 #[tauri::command]
@@ -1120,14 +1318,29 @@ pub fn cmd_open_in_explorer(path: String) -> Result<(), String> {
 
 #[tauri::command]
 pub async fn cmd_list_installed_apps(
+    force_refresh: Option<bool>,
     state: State<'_, AppState>,
 ) -> Result<Vec<InstalledApp>, String> {
-    let tree_opt = state
-        .get_volume_slot(Some(r"C:\"))
-        .and_then(|s| s.read().ok().map(|g| g.tree.clone()));
-    tauri::async_runtime::spawn_blocking(move || list_installed_apps(tree_opt.as_ref()))
-        .await
-        .map_err(|e| format!("Error listando aplicaciones: {e}"))
+    if !force_refresh.unwrap_or(false) {
+        if let Ok(guard) = state.apps_cache.lock() {
+            if let Some(ref cached) = *guard {
+                return Ok(cached.clone());
+            }
+        }
+    }
+    let slots = state.all_available_volume_slots();
+    let cache_arc = state.apps_cache.clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        let guards: Vec<_> = slots.iter().filter_map(|s| s.read().ok()).collect();
+        let refs: Vec<&crate::scanner::model::ScanTree> = guards.iter().map(|g| &g.tree).collect();
+        let apps = list_installed_apps(&refs);
+        if let Ok(mut cg) = cache_arc.lock() {
+            *cg = Some(apps.clone());
+        }
+        apps
+    })
+    .await
+    .map_err(|e| format!("Error listando aplicaciones: {e}"))
 }
 
 #[tauri::command]
@@ -1152,6 +1365,7 @@ pub fn cmd_uninstall_app(
             .unwrap_or(10);
         let queue_arc = state.reconcile_queue.clone();
         let leftovers_arc = state.uninstall_leftovers.clone();
+        let apps_cache_arc = state.apps_cache.clone();
         let app_handle = app.clone();
 
         std::thread::Builder::new()
@@ -1191,6 +1405,9 @@ pub fn cmd_uninstall_app(
                     if let Ok(mut lv) = leftovers_arc.lock() {
                         lv.extend(res.leftovers);
                     }
+                }
+                if let Ok(mut cg) = apps_cache_arc.lock() {
+                    *cg = None;
                 }
                 let _ = app_handle.emit("apps-updated", &id);
             })
@@ -1281,14 +1498,19 @@ pub async fn cmd_execute_cleanup(
 
     let defer_drain = plan.mode == CleanupMode::Permanent;
     let plan_clone = plan.clone();
+    let app_prog = app.clone();
     let (result, staged_paths) = tauri::async_runtime::spawn_blocking(move || {
-        execute_cleanup_plan_with_options(
+        let on_prog = move |ev: crate::cleaner::executor::CleanupProgressEvent| {
+            let _ = app_prog.emit("cleanup-progress", ev);
+        };
+        execute_cleanup_plan_with_progress(
             &plan_clone,
             confirmed_permanent,
             None,
             None,
             None,
             defer_drain,
+            Some(&on_prog),
         )
     })
     .await
@@ -1432,11 +1654,14 @@ pub fn cmd_relaunch_as_admin(
 }
 
 #[tauri::command]
-pub fn cmd_list_snapshots(
+pub async fn cmd_list_snapshots(
     drive_root: Option<String>,
     state: State<'_, AppState>,
 ) -> Result<Vec<ScanSnapshot>, String> {
-    state.storage.list_snapshots(drive_root.as_deref())
+    let storage = state.storage.clone();
+    tauri::async_runtime::spawn_blocking(move || storage.list_snapshots(drive_root.as_deref()))
+        .await
+        .map_err(|e| e.to_string())?
 }
 
 #[tauri::command]
@@ -1449,8 +1674,11 @@ pub fn cmd_diff_snapshots(
 }
 
 #[tauri::command]
-pub fn cmd_list_cleanup_logs(limit: Option<usize>) -> Vec<CleanupLogEntry> {
-    read_cleanup_logs(&logs_dir(), limit.unwrap_or(200))
+pub async fn cmd_list_cleanup_logs(limit: Option<usize>) -> Result<Vec<CleanupLogEntry>, String> {
+    let lim = limit.unwrap_or(200);
+    tauri::async_runtime::spawn_blocking(move || read_cleanup_logs(&logs_dir(), lim))
+        .await
+        .map_err(|e| e.to_string())
 }
 
 #[tauri::command]
@@ -1536,16 +1764,98 @@ pub async fn cmd_dev_execute(
     }
     let _ = app.emit("sync-updated", "optimistic-dev-delete");
 
-    let result =
-        tauri::async_runtime::spawn_blocking(move || -> Result<DevCleanupResult, String> {
+    let app_prog = app.clone();
+    let plan_id_for_bg = plan.plan_id.clone();
+    let (result, staged_paths) = tauri::async_runtime::spawn_blocking(
+        move || -> Result<(DevCleanupResult, Vec<PathBuf>), String> {
             let catalog = DevRulesCatalog::load_embedded()?;
             let runner = SystemCommandRunner;
-            Ok(execute_dev_cleanup_plan(
-                &plan, &catalog, &runner, None, None,
+            let on_prog = move |ev: crate::dev_cleaner::executor::DevCleanupProgressEvent| {
+                let _ = app_prog.emit("dev-cleanup-progress", ev);
+            };
+            Ok(execute_dev_cleanup_plan_with_progress(
+                &plan,
+                &catalog,
+                &runner,
+                None,
+                None,
+                true,
+                Some(&on_prog),
             ))
-        })
-        .await
-        .map_err(|e| format!("Error ejecutando Limpieza Dev: {e}"))??;
+        },
+    )
+    .await
+    .map_err(|e| format!("Error ejecutando Limpieza Dev: {e}"))??;
+
+    // Drain staged `.scancleaner-trash` folders in background so Dev cleanup completes immediately!
+    if !staged_paths.is_empty() {
+        let jobs = state.deletion_jobs.clone();
+        let job_id = plan_id_for_bg;
+        let cancel = jobs.register_job(
+            job_id.clone(),
+            "dev_permanent".to_string(),
+            staged_paths.len(),
+            result.total_estimated_bytes,
+        );
+        let app_bg = app.clone();
+        let queue_arc = state.reconcile_queue.clone();
+
+        std::thread::Builder::new()
+            .name(format!("bg-dev-trash-drain-{job_id}"))
+            .spawn(move || {
+                jobs.update_job(&job_id, |s| s.phase = DeletionJobPhase::DeletingBackground);
+                let _ = app_bg.emit("deletion-job-updated", jobs.get_job(&job_id));
+                let mut completed = 0usize;
+                let mut failed = 0usize;
+                let mut touched_vols = Vec::new();
+
+                for sp in staged_paths {
+                    if cancel.load(Ordering::Relaxed) {
+                        break;
+                    }
+                    if let Some(vol) = volume_root_of_path(&sp) {
+                        touched_vols.push(vol);
+                    }
+                    match delete_tree_parallel_fast(&sp, Some(&cancel), None, false) {
+                        Ok(_) => completed += 1,
+                        Err(e) => {
+                            failed += 1;
+                            jobs.update_job(&job_id, |s| s.errors.push(e));
+                        }
+                    }
+                    jobs.update_job(&job_id, |s| {
+                        s.completed_items = completed;
+                        s.failed_items = failed;
+                    });
+                    let _ = app_bg.emit("deletion-job-updated", jobs.get_job(&job_id));
+                }
+
+                let final_phase = if cancel.load(Ordering::Relaxed) {
+                    DeletionJobPhase::Cancelled
+                } else if failed > 0 && completed == 0 {
+                    DeletionJobPhase::Failed
+                } else {
+                    DeletionJobPhase::Completed
+                };
+                jobs.update_job(&job_id, |s| s.phase = final_phase);
+                let _ = app_bg.emit("deletion-job-updated", jobs.get_job(&job_id));
+
+                if let Ok(mut q) = queue_arc.lock() {
+                    for vol in touched_vols {
+                        q.enqueue(
+                            ReconcileRequest {
+                                volume: vol.clone(),
+                                paths: vec![PathBuf::from(format!(r"{vol}.scancleaner-trash"))],
+                                origin: ReconcileOrigin::OfficialCommand,
+                                priority: ReconcilePriority::High,
+                            },
+                            Instant::now(),
+                        );
+                    }
+                }
+            })
+            .ok();
+    }
 
     // Revert failed/skipped items
     let failed: std::collections::HashSet<String> = result
@@ -1592,8 +1902,10 @@ pub async fn cmd_dev_execute(
 }
 
 #[tauri::command]
-pub fn cmd_protection_list() -> Vec<ProtectedEntry> {
-    ProtectionEngine::load_default().all_entries()
+pub async fn cmd_protection_list() -> Result<Vec<ProtectedEntry>, String> {
+    tauri::async_runtime::spawn_blocking(|| ProtectionEngine::load_default().all_entries())
+        .await
+        .map_err(|e| e.to_string())
 }
 
 #[tauri::command]
@@ -1641,37 +1953,43 @@ pub fn cmd_protection_remove(id: String) -> Result<Vec<ProtectedEntry>, String> 
 }
 
 #[tauri::command]
-pub fn cmd_protection_check(path: String) -> ProtectionResult {
-    is_protected_default(Path::new(&path))
+pub async fn cmd_protection_check(path: String) -> Result<ProtectionResult, String> {
+    tauri::async_runtime::spawn_blocking(move || is_protected_default(Path::new(&path)))
+        .await
+        .map_err(|e| e.to_string())
 }
 
 #[tauri::command]
-pub fn cmd_protection_preview_matches(
+pub async fn cmd_protection_preview_matches(
     patron: String,
     tipo: ProtectionType,
     todas_las_unidades: bool,
     state: State<'_, AppState>,
 ) -> Result<usize, String> {
-    let trimmed = patron.trim();
+    let trimmed = patron.trim().to_string();
     if trimmed.is_empty() {
         return Ok(0);
     }
     let Some(slot) = state.get_volume_slot(None) else {
         return Ok(0);
     };
-    let guard = slot.read().map_err(|e| e.to_string())?;
-    let candidate = ProtectedEntry {
-        id: "preview".to_string(),
-        patron: trimmed.to_string(),
-        tipo,
-        origen: ProtectionOrigin::Usuario,
-        motivo: String::new(),
-        todas_las_unidades,
-    };
-    Ok(ProtectionEngine::preview_matches_in_tree(
-        &guard.tree,
-        &candidate,
-    ))
+    tauri::async_runtime::spawn_blocking(move || {
+        let guard = slot.read().map_err(|e| e.to_string())?;
+        let candidate = ProtectedEntry {
+            id: "preview".to_string(),
+            patron: trimmed,
+            tipo,
+            origen: ProtectionOrigin::Usuario,
+            motivo: String::new(),
+            todas_las_unidades,
+        };
+        Ok(ProtectionEngine::preview_matches_in_tree(
+            &guard.tree,
+            &candidate,
+        ))
+    })
+    .await
+    .map_err(|e| e.to_string())?
 }
 
 #[tauri::command]
@@ -1682,8 +2000,12 @@ pub async fn cmd_pick_file() -> Result<Option<String>, String> {
 }
 
 #[tauri::command]
-pub fn cmd_system_files_report(drive_root: Option<String>) -> SystemFilesReport {
-    inspect_system_files(drive_root.as_deref())
+pub async fn cmd_system_files_report(
+    drive_root: Option<String>,
+) -> Result<SystemFilesReport, String> {
+    tauri::async_runtime::spawn_blocking(move || inspect_system_files(drive_root.as_deref()))
+        .await
+        .map_err(|e| e.to_string())
 }
 
 #[tauri::command]
@@ -1746,8 +2068,10 @@ pub fn cmd_save_app_settings(
 }
 
 #[tauri::command]
-pub fn cmd_service_status() -> IndexingServiceStatus {
-    query_service_status()
+pub async fn cmd_service_status() -> Result<IndexingServiceStatus, String> {
+    tauri::async_runtime::spawn_blocking(query_service_status)
+        .await
+        .map_err(|e| e.to_string())
 }
 
 #[tauri::command]
@@ -1800,76 +2124,111 @@ pub fn cmd_reconcile_paths(
 
 /// Triggered when the window regains focus:
 /// 1. Reconciles pending `hiberfil.sys`/`pagefile.sys` changes (notifying if reboot needed).
-/// 2. Immediately flushes pending USN/reconcile deltas for instant freshness.
+/// 2. Immediately flushes pending USN deltas when USN is available (never blocks UI thread!).
 #[tauri::command]
-pub fn cmd_trigger_focus_sync(state: State<'_, AppState>) -> FocusSyncResult {
-    let mut notice = None;
+pub async fn cmd_trigger_focus_sync(
+    app: tauri::AppHandle,
+    state: State<'_, AppState>,
+) -> Result<FocusSyncResult, String> {
     let pending_sys = state
         .pending_system_file_watch
         .lock()
         .ok()
         .and_then(|mut g| g.take());
 
-    if let Some((path_str, before_bytes)) = pending_sys {
-        let pb = PathBuf::from(&path_str);
-        let after_bytes = locked_file_size(&pb).unwrap_or(0);
-        if path_str.to_ascii_lowercase().ends_with("pagefile.sys") && after_bytes == before_bytes {
-            notice = Some(
-                "El tamaño de pagefile.sys no cambió todavía: los ajustes de memoria virtual suelen requerir reiniciar Windows para aplicarse."
-                    .to_string(),
-            );
-        }
-        if let Some(vol) = volume_root_of_path(&pb) {
-            if let Ok(mut q) = state.reconcile_queue.lock() {
-                q.enqueue(
-                    ReconcileRequest {
-                        volume: vol,
-                        paths: vec![pb],
-                        origin: ReconcileOrigin::SystemFileAdjust,
-                        priority: ReconcilePriority::High,
-                    },
-                    Instant::now(),
-                );
-            }
-        }
-    }
-
-    // Also enqueue High-priority focus check for all loaded volumes
+    let queue_arc = state.reconcile_queue.clone();
+    let sync_arc = state.sync_status.clone();
     let vols: Vec<String> = state
         .volumes
         .read()
         .map(|m| m.keys().cloned().collect())
         .unwrap_or_default();
-    let mut flushed = 0usize;
-    if let Ok(mut q) = state.reconcile_queue.lock() {
-        for v in vols {
-            if q.enqueue(
-                ReconcileRequest {
-                    volume: v.clone(),
-                    paths: vec![PathBuf::from(&v)],
-                    origin: ReconcileOrigin::WindowFocus,
-                    priority: ReconcilePriority::High,
-                },
-                Instant::now() - Duration::from_secs(1),
-            ) {
-                flushed += 1;
+
+    // Mark syncing=true immediately so all UI controls (SyncStatusPill, Home Actualizar) lock cleanly
+    if let Ok(mut st) = sync_arc.lock() {
+        st.syncing = true;
+        let _ = app.emit("sync-status-changed", st.clone());
+    }
+
+    let app_for_done = app.clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        let mut notice = None;
+        if let Some((path_str, before_bytes)) = pending_sys {
+            let pb = PathBuf::from(&path_str);
+            let after_bytes = locked_file_size(&pb).unwrap_or(0);
+            if path_str.to_ascii_lowercase().ends_with("pagefile.sys")
+                && after_bytes == before_bytes
+            {
+                notice = Some(
+                    "El tamaño de pagefile.sys no cambió todavía: los ajustes de memoria virtual suelen requerir reiniciar Windows para aplicarse."
+                        .to_string(),
+                );
+            }
+            if let Some(vol) = volume_root_of_path(&pb) {
+                if let Ok(mut q) = queue_arc.lock() {
+                    q.enqueue(
+                        ReconcileRequest {
+                            volume: vol,
+                            paths: vec![pb],
+                            origin: ReconcileOrigin::SystemFileAdjust,
+                            priority: ReconcilePriority::High,
+                        },
+                        Instant::now(),
+                    );
+                }
             }
         }
-    }
 
-    if let Ok(mut st) = state.sync_status.lock() {
-        st.last_synced_ts = Some(Utc::now().timestamp());
-    }
+        let has_usn = is_elevated() || ping_service();
+        let mut flushed = 0usize;
+        if has_usn {
+            if let Ok(mut q) = queue_arc.lock() {
+                for v in &vols {
+                    if q.enqueue(
+                        ReconcileRequest {
+                            volume: v.clone(),
+                            paths: vec![PathBuf::from(v)],
+                            origin: ReconcileOrigin::WindowFocus,
+                            priority: ReconcilePriority::Medium,
+                        },
+                        Instant::now() - Duration::from_secs(1),
+                    ) {
+                        flushed += 1;
+                    }
+                }
+            }
+        } else {
+            // Even without USN/admin, verify live volume free-space & trigger a UI refresh cycle
+            let _ = list_drives(false);
+            flushed = vols.len();
+        }
 
-    FocusSyncResult {
-        flushed_batches: flushed,
-        system_file_notice: notice,
-    }
+        let pending_now = queue_arc.lock().map(|q| q.pending_count()).unwrap_or(0);
+        if let Ok(mut st) = sync_arc.lock() {
+            st.last_synced_ts = Some(Utc::now().timestamp());
+            st.pending_batches = pending_now;
+            st.revision = st.revision.saturating_add(1);
+            if pending_now == 0 {
+                st.syncing = false;
+            }
+            let _ = app_for_done.emit("sync-status-changed", st.clone());
+        }
+
+        FocusSyncResult {
+            flushed_batches: flushed,
+            system_file_notice: notice,
+        }
+    })
+    .await
+    .map_err(|e| e.to_string())
 }
 
 #[tauri::command]
-pub fn cmd_list_diagnostic_logs(limit: Option<usize>) -> Vec<String> {
-    read_diagnostic_logs(limit.unwrap_or(300))
+pub async fn cmd_list_diagnostic_logs(limit: Option<usize>) -> Result<Vec<String>, String> {
+    let lim = limit.unwrap_or(300);
+    tauri::async_runtime::spawn_blocking(move || read_diagnostic_logs(lim))
+        .await
+        .map_err(|e| e.to_string())
 }
 
 #[tauri::command]
@@ -1885,7 +2244,7 @@ pub fn cmd_open_logs_folder() -> Result<(), String> {
 
 /// Checks if a given path still exists in the indexed volume; if it vanished, returns the nearest existing ancestor node ID.
 #[tauri::command]
-pub fn cmd_resolve_valid_node(
+pub async fn cmd_resolve_valid_node(
     drive_root: Option<String>,
     full_path: String,
     state: State<'_, AppState>,
@@ -1893,21 +2252,25 @@ pub fn cmd_resolve_valid_node(
     let slot = state
         .get_volume_slot(drive_root.as_deref())
         .ok_or_else(|| "No hay ningún escaneo activo.".to_string())?;
-    let guard = slot.read().map_err(|e| e.to_string())?;
-    let pb = Path::new(&full_path);
-    if let Some(nid) = guard.tree.find_node_by_path(pb) {
-        let f = guard.tree.flags_of(nid);
-        if !f.contains(NodeFlags::TOMBSTONE) && !f.contains(NodeFlags::OPTIMISTIC_HIDDEN) {
-            return Ok((nid, true, full_path));
+    tauri::async_runtime::spawn_blocking(move || {
+        let guard = slot.read().map_err(|e| e.to_string())?;
+        let pb = Path::new(&full_path);
+        if let Some(nid) = guard.tree.find_node_by_path(pb) {
+            let f = guard.tree.flags_of(nid);
+            if !f.contains(NodeFlags::TOMBSTONE) && !f.contains(NodeFlags::OPTIMISTIC_HIDDEN) {
+                return Ok((nid, true, full_path));
+            }
         }
-    }
-    let anc = guard.tree.find_nearest_existing_ancestor(pb);
-    let anc_path = guard
-        .tree
-        .reconstruct_path(anc)
-        .to_string_lossy()
-        .into_owned();
-    Ok((anc, false, anc_path))
+        let anc = guard.tree.find_nearest_existing_ancestor(pb);
+        let anc_path = guard
+            .tree
+            .reconstruct_path(anc)
+            .to_string_lossy()
+            .into_owned();
+        Ok((anc, false, anc_path))
+    })
+    .await
+    .map_err(|e| e.to_string())?
 }
 
 // Keep unused import check clean

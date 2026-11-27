@@ -5,6 +5,7 @@ import { type DeletionJobStatus, type SyncStatusDto, api } from "../lib/ipc";
 interface UseAppLiveEventsOptions {
   includeNetwork: boolean;
   fetchDrives: (withNet: boolean) => void;
+  refreshSummaries: () => void;
   setSyncRevision: React.Dispatch<React.SetStateAction<number>>;
   setSyncStatus: React.Dispatch<React.SetStateAction<SyncStatusDto>>;
   setBgJobs: React.Dispatch<React.SetStateAction<DeletionJobStatus[]>>;
@@ -14,6 +15,7 @@ interface UseAppLiveEventsOptions {
 export function useAppLiveEvents({
   includeNetwork,
   fetchDrives,
+  refreshSummaries,
   setSyncRevision,
   setSyncStatus,
   setBgJobs,
@@ -26,6 +28,7 @@ export function useAppLiveEvents({
         unsubs.push(
           await listen("sync-updated", () => {
             setSyncRevision((r) => r + 1);
+            refreshSummaries();
             fetchDrives(includeNetwork);
           }),
         );
@@ -37,6 +40,7 @@ export function useAppLiveEvents({
         unsubs.push(
           await listen("drives-changed", () => {
             fetchDrives(includeNetwork);
+            refreshSummaries();
             setSyncRevision((r) => r + 1);
           }),
         );
@@ -74,5 +78,13 @@ export function useAppLiveEvents({
     return () => {
       for (const fn of unsubs) fn();
     };
-  }, [fetchDrives, includeNetwork, setBgJobs, setSyncRevision, setSyncStatus, showToast]);
+  }, [
+    fetchDrives,
+    includeNetwork,
+    refreshSummaries,
+    setBgJobs,
+    setSyncRevision,
+    setSyncStatus,
+    showToast,
+  ]);
 }
