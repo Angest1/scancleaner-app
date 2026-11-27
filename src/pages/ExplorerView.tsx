@@ -1,5 +1,5 @@
 import { AlertTriangle, FolderTree, Home, RefreshCw, ShieldAlert } from "lucide-react";
-import { useEffect, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import { BreadcrumbBar } from "../components/BreadcrumbBar";
 import { CategoryCharts } from "../components/CategoryCharts";
 import { SystemFilesPanel } from "../components/SystemFilesPanel";
@@ -16,8 +16,8 @@ import {
   type CategoryBreakdown,
   type ScanSummary,
   type TopEntryDto,
+  type TreemapLayoutDto,
   type TreemapNodeDto,
-  type TreemapViewDto,
   api,
 } from "../lib/ipc";
 
@@ -25,21 +25,26 @@ interface ExplorerViewProps {
   scanSummary: ScanSummary | null;
   rulesPath: string;
   isElevated: boolean;
+  syncRevision: number;
   onGoHome: () => void;
   onRelaunchAdmin: () => void;
   onQueueCleanup: (path: string, category: string) => void;
+  onToast: (message: string) => void;
 }
 
 export function ExplorerView({
   scanSummary,
   rulesPath,
   isElevated,
+  syncRevision,
   onGoHome,
   onRelaunchAdmin,
   onQueueCleanup,
+  onToast,
 }: ExplorerViewProps) {
   const [nodeId, setNodeId] = useState(0);
-  const [treemap, setTreemap] = useState<TreemapViewDto | null>(null);
+  const [treemapLayout, setTreemapLayout] = useState<TreemapLayoutDto | null>(null);
+  const [viewport, setViewport] = useState({ width: 960, height: 420 });
   const [rankingKind, setRankingKind] = useState<"dirs" | "files">("dirs");
   const [topEntries, setTopEntries] = useState<TopEntryDto[]>([]);
   const [breakdown, setBreakdown] = useState<CategoryBreakdown | null>(null);
@@ -49,31 +54,76 @@ export function ExplorerView({
   const [showDenied, setShowDenied] = useState(false);
   const [protectionRevision, setProtectionRevision] = useState(0);
 
+  const activeRoot = scanSummary?.rootPath ?? null;
+  const currentPathRef = useRef<string | undefined>(undefined);
+  currentPathRef.current = treemapLayout?.fullPath;
+  const onToastRef = useRef(onToast);
+  onToastRef.current = onToast;
+
+  const handleViewportChange = useCallback((width: number, height: number) => {
+    setViewport((prev) =>
+      Math.abs(prev.width - width) < 4 && Math.abs(prev.height - height) < 4
+        ? prev
+        : { width, height },
+    );
+  }, []);
+
   useEffect(() => {
-    if (!scanSummary) return;
+    if (!activeRoot) return;
     setNodeId(0);
+  }, [activeRoot]);
+
+  useEffect(() => {
+    if (!activeRoot) return;
+    void syncRevision;
     api
-      .getCategoryBreakdown()
+      .getCategoryBreakdown(activeRoot)
       .then(setBreakdown)
       .catch(() => {});
     api
-      .getAccessDenied(200)
+      .getAccessDenied(200, activeRoot)
       .then(setDeniedPaths)
       .catch(() => {});
-  }, [scanSummary]);
+  }, [activeRoot, syncRevision]);
 
   useEffect(() => {
-    if (!scanSummary) return;
+    if (!activeRoot) return;
     void protectionRevision;
+    void syncRevision;
+
+    // If current folder disappeared externally during auto-sync, navigate to nearest ancestor + toast
+    const currentPath = currentPathRef.current;
+    if (syncRevision > 0 && nodeId !== 0 && currentPath) {
+      api
+        .resolveValidNode(currentPath, activeRoot)
+        .then(([resolvedId, stillExists, resolvedPath]) => {
+          if (!stillExists) {
+            setNodeId(resolvedId);
+            onToastRef.current(
+              `La carpeta abierta dejó de existir; se navegó al ancestro más cercano (${resolvedPath}).`,
+            );
+          }
+        })
+        .catch(() => {});
+    }
+
     api
-      .getTreemapChildren(nodeId, 140)
-      .then(setTreemap)
+      .getTreemapLayout(nodeId, viewport.width, viewport.height, activeRoot, 3, 140)
+      .then(setTreemapLayout)
       .catch(() => {});
     api
-      .getTopEntries(nodeId, rankingKind, 100)
+      .getTopEntries(nodeId, rankingKind, 100, activeRoot)
       .then(setTopEntries)
       .catch(() => {});
-  }, [scanSummary, nodeId, rankingKind, protectionRevision]);
+  }, [
+    activeRoot,
+    nodeId,
+    rankingKind,
+    protectionRevision,
+    syncRevision,
+    viewport.width,
+    viewport.height,
+  ]);
 
   if (!scanSummary) {
     return (
@@ -187,7 +237,7 @@ export function ExplorerView({
       <Card className="flex flex-col gap-3">
         <div className="flex items-center justify-between flex-wrap gap-2.5">
           <BreadcrumbBar
-            breadcrumbs={treemap?.breadcrumbs ?? []}
+            breadcrumbs={treemapLayout?.breadcrumbs ?? []}
             onSelectNode={(id) => setNodeId(id)}
           />
           <div className="flex items-center gap-2">
@@ -205,8 +255,9 @@ export function ExplorerView({
         </div>
 
         <TreemapCanvas
-          nodes={treemap?.children ?? []}
+          nativeRects={treemapLayout?.rects ?? []}
           colorBy={colorBy}
+          onViewportChange={handleViewportChange}
           onDrillDown={(id) => setNodeId(id)}
           onOpenExplorer={handleOpenExplorer}
           onSendToCleanup={(n: TreemapNodeDto) => onQueueCleanup(n.fullPath, n.originCat)}

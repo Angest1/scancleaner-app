@@ -17,6 +17,7 @@ import {
 
 interface CleanerViewProps {
   isElevated: boolean;
+  syncRevision?: number;
   onRelaunchAdmin: () => void;
   onStartPreview: (targets: CleanupTargetInput[], mode: CleanupMode) => void;
 }
@@ -30,7 +31,12 @@ const CATEGORY_TITLES: Record<CleanCategory, string> = {
   large_old_file: "Archivos grandes y antiguos",
 };
 
-export function CleanerView({ isElevated, onRelaunchAdmin, onStartPreview }: CleanerViewProps) {
+export function CleanerView({
+  isElevated,
+  syncRevision = 0,
+  onRelaunchAdmin,
+  onStartPreview,
+}: CleanerViewProps) {
   const [report, setReport] = useState<CleanupCandidatesReport | null>(null);
   const [loading, setLoading] = useState(false);
   const [selectedIds, setSelectedIds] = useState<Set<string>>(new Set());
@@ -47,20 +53,40 @@ export function CleanerView({ isElevated, onRelaunchAdmin, onStartPreview }: Cle
     });
   };
 
-  const loadCandidates = useCallback(() => {
-    setLoading(true);
-    api
-      .discoverCleanupCandidates(minLargeMb, minAgeDays)
-      .then((res) => {
-        setReport(res);
-        setSelectedIds(new Set());
-      })
-      .finally(() => setLoading(false));
-  }, [minLargeMb, minAgeDays]);
+  const loadCandidates = useCallback(
+    (preserveSelection = false) => {
+      if (!preserveSelection) setLoading(true);
+      api
+        .discoverCleanupCandidates(minLargeMb, minAgeDays)
+        .then((res) => {
+          setReport(res);
+          if (preserveSelection) {
+            const validIds = new Set(res.candidates.map((c) => c.id));
+            setSelectedIds((prev) => {
+              const kept = new Set<string>();
+              for (const id of prev) {
+                if (validIds.has(id)) kept.add(id);
+              }
+              return kept;
+            });
+          } else {
+            setSelectedIds(new Set());
+          }
+        })
+        .finally(() => setLoading(false));
+    },
+    [minLargeMb, minAgeDays],
+  );
 
   useEffect(() => {
-    loadCandidates();
+    loadCandidates(false);
   }, [loadCandidates]);
+
+  useEffect(() => {
+    if (syncRevision > 0) {
+      loadCandidates(true);
+    }
+  }, [syncRevision, loadCandidates]);
 
   const toggleItem = (item: CleanCandidate) => {
     if (item.requiresAdmin && !isElevated) return;
@@ -135,9 +161,9 @@ export function CleanerView({ isElevated, onRelaunchAdmin, onStartPreview }: Cle
               onChange={(e) => setMinAgeDays(Math.max(1, Number(e.target.value) || 30))}
             />
           </label>
-          <Button onClick={loadCandidates} disabled={loading}>
+          <Button onClick={() => loadCandidates(true)} disabled={loading}>
             <RefreshCw size={13} className={loading ? "animate-spin" : ""} />
-            {loading ? "Analizando..." : "Reanalizar"}
+            {loading ? "Analizando…" : "Reanalizar"}
           </Button>
           <Button
             variant="primary"

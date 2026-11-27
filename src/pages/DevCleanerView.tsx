@@ -1,5 +1,5 @@
 import { ChevronDown, Code2, HardDrive, RefreshCw, ShieldCheck } from "lucide-react";
-import { useCallback, useEffect, useMemo, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { DevCleanupModal } from "../components/DevCleanupModal";
 import { DevCandidateRow } from "../components/dev-cleaner/DevCandidateRow";
 import { DevProjectRootsCard } from "../components/dev-cleaner/DevProjectRootsCard";
@@ -20,6 +20,7 @@ import {
 
 interface DevCleanerViewProps {
   isElevated: boolean;
+  syncRevision?: number;
   onRelaunchAdmin: () => void;
 }
 
@@ -36,7 +37,11 @@ const CATEGORY_ORDER: DevRuleCategory[] = [
 
 type DevScanReportState = Awaited<ReturnType<typeof api.devScan>> | null;
 
-export function DevCleanerView({ isElevated, onRelaunchAdmin }: DevCleanerViewProps) {
+export function DevCleanerView({
+  isElevated,
+  syncRevision = 0,
+  onRelaunchAdmin,
+}: DevCleanerViewProps) {
   const [config, setConfig] = useState<DevCleanerConfig>({
     projectRoots: [],
     minProjectAgeDays: 30,
@@ -63,29 +68,48 @@ export function DevCleanerView({ isElevated, onRelaunchAdmin }: DevCleanerViewPr
   const [activePlan, setActivePlan] = useState<DevCleanupPlan | null>(null);
   const [executing, setExecuting] = useState(false);
   const [result, setResult] = useState<DevCleanupResult | null>(null);
-
-  const runScan = useCallback((cfg: DevCleanerConfig) => {
-    setLoading(true);
+  const runScan = useCallback((cfg: DevCleanerConfig, preserveSelection = false) => {
+    if (!preserveSelection) setLoading(true);
     api
       .devScan(cfg)
       .then((res) => {
         setReport(res);
-        const pre = new Set<string>();
-        for (const c of res.candidates) {
-          if (c.preselected) pre.add(c.id);
+        if (preserveSelection) {
+          const valid = new Set(res.candidates.map((c) => c.id));
+          setSelectedIds((prev) => {
+            const kept = new Set<string>();
+            for (const id of prev) {
+              if (valid.has(id)) kept.add(id);
+            }
+            return kept;
+          });
+        } else {
+          const pre = new Set<string>();
+          for (const c of res.candidates) {
+            if (c.preselected) pre.add(c.id);
+          }
+          setSelectedIds(pre);
         }
-        setSelectedIds(pre);
       })
       .catch((err) => alert(String(err)))
       .finally(() => setLoading(false));
   }, []);
 
+  const configRef = useRef(config);
+  configRef.current = config;
+
   useEffect(() => {
     api.devGetConfig().then((cfg) => {
       setConfig(cfg);
-      runScan(cfg);
+      runScan(cfg, false);
     });
   }, [runScan]);
+
+  useEffect(() => {
+    if (syncRevision > 0) {
+      runScan(configRef.current, true);
+    }
+  }, [syncRevision, runScan]);
 
   const persistConfig = (next: DevCleanerConfig, rescan = false) => {
     setConfig(next);
@@ -229,7 +253,6 @@ export function DevCleanerView({ isElevated, onRelaunchAdmin }: DevCleanerViewPr
           </div>
         </Card>
       </div>
-
       <DevProjectRootsCard
         config={config}
         onPickFolder={handlePickFolder}

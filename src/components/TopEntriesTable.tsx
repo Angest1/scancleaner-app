@@ -1,6 +1,7 @@
 import { useVirtualizer } from "@tanstack/react-virtual";
 import { File, Folder, FolderOpen, Lock, MoreHorizontal, ShieldPlus, Trash2 } from "lucide-react";
-import { useMemo, useRef, useState } from "react";
+import { useCallback, useMemo, useRef, useState } from "react";
+import { useDeferredReorder } from "../hooks/useDeferredReorder";
 import { formatBytes, formatUnixTs } from "../lib/format";
 import type { TopEntryDto } from "../lib/ipc";
 import { Badge } from "./ui/Badge";
@@ -59,10 +60,13 @@ export function TopEntriesTable({
     return list;
   }, [entries, sortKey, sortDir]);
 
+  const getRowKey = useCallback((item: TopEntryDto) => item.nodeId, []);
+  const { items: stableRows, containerProps } = useDeferredReorder(sorted, getRowKey, 1000);
+
   const rowHeight = density === "compact" ? 42 : 54;
 
   const virtualizer = useVirtualizer({
-    count: sorted.length,
+    count: stableRows.length,
     getScrollElement: () => parentRef.current,
     estimateSize: () => rowHeight,
     overscan: 8,
@@ -84,7 +88,11 @@ export function TopEntriesTable({
       </div>
 
       <div className="border border-border-default rounded-[10px] overflow-hidden bg-canvas/40">
-        <div ref={parentRef} className="h-[360px] overflow-y-auto overflow-x-hidden">
+        <div
+          ref={parentRef}
+          {...containerProps}
+          className="h-[360px] overflow-y-auto overflow-x-hidden"
+        >
           {/* Sticky adaptive header (zero horizontal scroll) */}
           <div className="sticky top-0 z-10 grid grid-cols-[minmax(0,1fr)_88px_40px] sm:grid-cols-[minmax(0,1fr)_104px_96px_118px] items-center gap-2 px-3 py-2 border-b border-border-default bg-shell backdrop-blur-md">
             <SortHeaderButton
@@ -116,7 +124,8 @@ export function TopEntriesTable({
 
           <div style={{ height: `${virtualizer.getTotalSize()}px`, position: "relative" }}>
             {virtualizer.getVirtualItems().map((vRow) => {
-              const item = sorted[vRow.index];
+              const item = stableRows[vRow.index];
+              if (!item) return null;
               return (
                 <div
                   key={item.nodeId}

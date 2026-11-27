@@ -11,6 +11,7 @@ use windows::Win32::System::Registry::{
 };
 
 use crate::cleaner::guardrails::{is_reparse_point, normalize_lexical_lower};
+use crate::dev_cleaner::blacklist::matches_simple_glob;
 use crate::dev_cleaner::resolver::expand_env_vars;
 use crate::scanner::model::ScanTree;
 use crate::storage::app_data_dir;
@@ -820,17 +821,22 @@ impl ProtectionEngine {
     }
 
     fn find_protected_glob_in_dir(&self, root_dir: &Path) -> Option<(ProtectedEntry, PathBuf)> {
-        let mut glob_entries: Vec<&ProtectedEntry> = self
+        let mut glob_entries: Vec<(&ProtectedEntry, String, bool)> = self
             .user_entries
             .iter()
             .chain(self.critical_entries.iter())
             .filter(|e| e.tipo == ProtectionType::Glob)
+            .map(|e| {
+                let pat = e.patron.trim().replace('/', "\\").to_ascii_lowercase();
+                let has_sep = pat.contains('\\');
+                (e, pat, has_sep)
+            })
             .collect();
         if glob_entries.is_empty() {
             return None;
         }
         // Keep user globs before critical globs
-        glob_entries.sort_by_key(|e| {
+        glob_entries.sort_by_key(|(e, _, _)| {
             if e.origen == ProtectionOrigin::Usuario {
                 0
             } else {
@@ -844,47 +850,235 @@ impl ProtectionEngine {
         const MAX_VISITED: usize = 5_000;
 
         while let Some((dir, depth)) = stack.pop() {
-            if depth > MAX_DEPTH || visited >= MAX_VISITED || is_reparse_point(&dir) {
+            if depth > MAX_DEPTH || visited >= MAX_VISITED {
                 continue;
             }
-            let Ok(rd) = fs::read_dir(&dir) else {
+            // Zero-stat Win32 directory enumeration (`FindFirstFileExW` + `FIND_FIRST_EX_LARGE_FETCH`)
+            let Ok(entries) = crate::scanner::fallback_walk::read_dir_win32(&dir) else {
                 continue;
             };
-            for entry in rd.flatten() {
+            for entry in entries {
                 visited += 1;
                 if visited >= MAX_VISITED {
                     break;
                 }
-                let p = entry.path();
-                let norm = normalize_lexical_lower(&p);
-                for rule in &glob_entries {
-                    if entry_matches_normalized(rule, &norm) {
-                        return Some(((*rule).clone(), p));
+                let leaf_low = entry.name.to_ascii_lowercase();
+                for (rule, pat, has_sep) in &glob_entries {
+                    let matched = if !*has_sep {
+                        matches_simple_glob(pat, &leaf_low)
+                    } else {
+                        let p = dir.join(&entry.name);
+                        let norm = normalize_lexical_lower(&p);
+                        entry_matches_normalized(rule, &norm)
+                    };
+                    if matched {
+                        return Some(((*rule).clone(), dir.join(&entry.name)));
                     }
                 }
-                if !is_reparse_point(&p) {
-                    if let Ok(meta) = fs::symlink_metadata(&p) {
-                        if meta.is_dir() && !meta.file_type().is_symlink() {
-                            stack.push((p, depth + 1));
-                        }
-                    }
+                if entry.is_dir && !entry.is_reparse && depth < MAX_DEPTH {
+                    stack.push((dir.join(&entry.name), depth + 1));
                 }
             }
         }
         None
     }
 
+    /// Precompiles all protection rules once (expanding all `%ENV%` paths upfront) so tree
+    /// finalization can tag millions of nodes in < 100ms with zero heap allocations per node.
+    pub fn compile_fast_matcher(&self) -> CompiledFastProtection {
+        CompiledFastProtection::from_engine(self)
+    }
+
     /// Counts how many nodes in the active `ScanTree` would match a candidate entry.
     pub fn preview_matches_in_tree(tree: &ScanTree, entry: &ProtectedEntry) -> usize {
         let mut count = 0usize;
-        for idx in 1..tree.nodes.len() {
-            let p = tree.reconstruct_path(idx as u32);
+        for idx in 1..tree.len() {
+            let nid = idx as u32;
+            let flags = tree.flags_of(nid);
+            if flags.contains(crate::scanner::model::NodeFlags::TOMBSTONE)
+                || flags.contains(crate::scanner::model::NodeFlags::OPTIMISTIC_HIDDEN)
+            {
+                continue;
+            }
+            let p = tree.reconstruct_path(nid);
             let norm = normalize_lexical_lower(&p);
             if entry_matches_normalized(entry, &norm) {
                 count += 1;
             }
         }
         count
+    }
+}
+
+/// Precompiled zero-allocation lexical protection matcher used during single-pass `ScanTree`
+/// finalization (millions of nodes). Execution layers still call full `ProtectionEngine::is_protected()`.
+#[derive(Clone, Default)]
+pub struct CompiledFastProtection {
+    user_exact_files: Vec<String>,
+    user_dir_prefixes: Vec<String>,
+    user_all_drive_rel_files: Vec<String>,
+    user_all_drive_rel_dirs: Vec<String>,
+    user_leaf_globs: Vec<String>,
+    sys_exception_prefixes: Vec<String>,
+    crit_exact_files: Vec<String>,
+    crit_dir_prefixes: Vec<String>,
+    crit_all_drive_rel_files: Vec<String>,
+    crit_all_drive_rel_dirs: Vec<String>,
+    crit_leaf_globs: Vec<String>,
+}
+
+impl CompiledFastProtection {
+    pub fn from_engine(engine: &ProtectionEngine) -> Self {
+        let mut out = Self::default();
+        for exc in &engine.system_exceptions {
+            out.sys_exception_prefixes
+                .push(format!(r"{}\", exc.base_dir_norm.trim_end_matches('\\')));
+        }
+        for e in &engine.user_entries {
+            Self::push_entry(
+                e,
+                &mut out.user_exact_files,
+                &mut out.user_dir_prefixes,
+                &mut out.user_all_drive_rel_files,
+                &mut out.user_all_drive_rel_dirs,
+                &mut out.user_leaf_globs,
+            );
+        }
+        for e in &engine.critical_entries {
+            Self::push_entry(
+                e,
+                &mut out.crit_exact_files,
+                &mut out.crit_dir_prefixes,
+                &mut out.crit_all_drive_rel_files,
+                &mut out.crit_all_drive_rel_dirs,
+                &mut out.crit_leaf_globs,
+            );
+        }
+        out
+    }
+
+    fn push_entry(
+        entry: &ProtectedEntry,
+        exact_files: &mut Vec<String>,
+        dir_prefixes: &mut Vec<String>,
+        rel_files: &mut Vec<String>,
+        rel_dirs: &mut Vec<String>,
+        leaf_globs: &mut Vec<String>,
+    ) {
+        match entry.tipo {
+            ProtectionType::Archivo => {
+                if entry.todas_las_unidades {
+                    let rel = entry
+                        .patron
+                        .trim()
+                        .trim_start_matches(['\\', '/'])
+                        .replace('/', "\\")
+                        .to_ascii_lowercase();
+                    if !rel.is_empty() {
+                        rel_files.push(rel);
+                    }
+                } else if let Some(n) = resolve_entry_pattern_norm(&entry.patron) {
+                    exact_files.push(n);
+                }
+            }
+            ProtectionType::CarpetaRecursiva => {
+                if entry.todas_las_unidades {
+                    let rel = entry
+                        .patron
+                        .trim()
+                        .trim_matches(['\\', '/'])
+                        .replace('/', "\\")
+                        .to_ascii_lowercase();
+                    if !rel.is_empty() {
+                        rel_dirs.push(rel);
+                    }
+                } else if let Some(n) = resolve_entry_pattern_norm(&entry.patron) {
+                    dir_prefixes.push(n.trim_end_matches('\\').to_string());
+                }
+            }
+            ProtectionType::Glob => {
+                let pat = entry.patron.trim().replace('/', "\\").to_ascii_lowercase();
+                if !pat.is_empty() && !pat.contains('\\') {
+                    leaf_globs.push(pat);
+                }
+            }
+        }
+    }
+
+    #[inline]
+    fn matches_dir_prefix(norm_lower: &str, base: &str) -> bool {
+        norm_lower == base
+            || (norm_lower.starts_with(base)
+                && norm_lower.as_bytes().get(base.len()) == Some(&b'\\'))
+    }
+
+    #[inline]
+    pub fn is_protected_lower(&self, norm_lower: &str, leaf_lower: &str) -> bool {
+        let rel = strip_drive_prefix(norm_lower);
+
+        // 1. User entries (highest precedence)
+        if self.user_exact_files.iter().any(|f| f == norm_lower)
+            || self
+                .user_dir_prefixes
+                .iter()
+                .any(|d| Self::matches_dir_prefix(norm_lower, d))
+            || self
+                .user_leaf_globs
+                .iter()
+                .any(|g| matches_simple_glob(g, leaf_lower))
+        {
+            return true;
+        }
+        if let Some(r) = rel {
+            if self.user_all_drive_rel_files.iter().any(|f| f == r)
+                || self
+                    .user_all_drive_rel_dirs
+                    .iter()
+                    .any(|d| Self::matches_dir_prefix(r, d))
+            {
+                return true;
+            }
+        }
+
+        // 2. Critical leaf globs always apply (even inside system exceptions)
+        if self
+            .crit_leaf_globs
+            .iter()
+            .any(|g| matches_simple_glob(g, leaf_lower))
+        {
+            return true;
+        }
+
+        // 3. System exceptions override critical roots
+        if self
+            .sys_exception_prefixes
+            .iter()
+            .any(|p| norm_lower.starts_with(p))
+        {
+            return false;
+        }
+
+        // 4. Critical roots/files
+        if self.crit_exact_files.iter().any(|f| f == norm_lower)
+            || self
+                .crit_dir_prefixes
+                .iter()
+                .any(|d| Self::matches_dir_prefix(norm_lower, d))
+        {
+            return true;
+        }
+        if let Some(r) = rel {
+            if self.crit_all_drive_rel_files.iter().any(|f| f == r)
+                || self
+                    .crit_all_drive_rel_dirs
+                    .iter()
+                    .any(|d| Self::matches_dir_prefix(r, d))
+            {
+                return true;
+            }
+        }
+
+        false
     }
 }
 

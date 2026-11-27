@@ -11,7 +11,7 @@ use windows::Win32::System::Diagnostics::ToolHelp::{
 use windows::Win32::UI::Shell::{SHQueryRecycleBinW, SHQUERYRBINFO};
 
 use crate::elevation::is_elevated;
-use crate::scanner::model::{NodeKind, OriginCategory, ScanTree};
+use crate::scanner::model::{NodeFlags, NodeKind, OriginCategory, ScanTree};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -156,174 +156,195 @@ fn dir_stats_bounded(path: &Path, max_entries: usize) -> (u64, u64, i64) {
     (bytes, count, newest_ts)
 }
 
-fn collect_temp_children(
-    temp_dir: &Path,
-    category: CleanCategory,
-    requires_admin: bool,
-    out: &mut Vec<CleanCandidate>,
-) {
-    let Ok(rd) = std::fs::read_dir(temp_dir) else {
-        return;
-    };
-    let mut total_bytes = 0u64;
-    let mut total_items = 0u64;
-    let mut newest_ts = 0i64;
-    let mut child_paths = Vec::new();
+/// Instant, zero-disk-scan candidate builder from precomputed `DerivedIndexes` across all indexed volumes.
+/// Falls back to bounded disk probe ONLY when no indexed volume is loaded yet.
+pub fn discover_cleanup_candidates_from_trees(
+    trees: &[&ScanTree],
+    min_large_mb: u64,
+    min_age_days: u64,
+) -> CleanupCandidatesReport {
+    let running_browsers = detect_running_browsers();
+    let (recycle_bin_bytes, recycle_bin_items) = query_recycle_bin();
+    let elevated = is_elevated();
 
-    for entry in rd.flatten() {
-        let p = entry.path();
-        let Ok(meta) = std::fs::symlink_metadata(&p) else {
-            continue;
-        };
-        if meta.file_type().is_symlink() {
-            continue;
-        }
-        let (b, c, ts) = dir_stats_bounded(&p, 5_000);
-        total_bytes = total_bytes.saturating_add(b);
-        total_items = total_items.saturating_add(c.max(1));
-        newest_ts = newest_ts.max(ts);
-        child_paths.push(p);
+    if trees.is_empty() {
+        // Fallback when no volume snapshot/index is available yet
+        return discover_cleanup_candidates_disk_fallback(
+            &running_browsers,
+            recycle_bin_bytes,
+            recycle_bin_items,
+            elevated,
+        );
     }
 
-    if total_items > 0 {
-        let label = match category {
-            CleanCategory::UserTemp => "Archivos temporales del usuario (%TEMP%)",
-            CleanCategory::SystemTemp => "Archivos temporales del sistema (C:\\Windows\\Temp)",
-            _ => "Temporales",
-        };
-        out.push(CleanCandidate {
-            id: format!("temp:{category:?}"),
-            path: temp_dir.to_string_lossy().into_owned(),
-            display_name: label.to_string(),
-            category,
-            size_bytes: total_bytes,
-            item_count: total_items,
-            last_modified_ts: newest_ts,
-            requires_admin,
-            warning: if requires_admin && !is_elevated() {
+    let now_ts = chrono::Utc::now().timestamp();
+    let seven_days_secs = 7 * 86_400;
+    let min_large_bytes = min_large_mb.saturating_mul(1024 * 1024);
+    let min_age_secs = (min_age_days as i64).saturating_mul(86_400);
+
+    let mut candidates: Vec<CleanCandidate> = Vec::new();
+    let mut seen_paths: HashSet<String> = HashSet::new();
+    let mut dev_dirs: Vec<CleanCandidate> = Vec::new();
+    let mut large_files: Vec<CleanCandidate> = Vec::new();
+
+    for &tree in trees {
+        // 1. Precomputed global caches (UserTemp, SystemTemp, Browser caches, npm/pip/pnpm/composer)
+        for cache in &tree.derived.global_caches {
+            let idx = cache.node_id as usize;
+            if idx >= tree.len() {
+                continue;
+            }
+            let flags = tree.flags_of(cache.node_id);
+            if flags.contains(NodeFlags::TOMBSTONE) || flags.contains(NodeFlags::OPTIMISTIC_HIDDEN)
+            {
+                continue;
+            }
+            let size = tree.allocated_size[idx];
+            let items = tree.file_count[idx] as u64;
+            if size == 0 && items == 0 {
+                continue;
+            }
+
+            let cat = match cache.category.as_str() {
+                "user_temp" => CleanCategory::UserTemp,
+                "system_temp" => CleanCategory::SystemTemp,
+                "browser_cache" => CleanCategory::BrowserCache,
+                "dev_artifact" => CleanCategory::DevArtifact,
+                _ => continue,
+            };
+
+            let path = tree
+                .reconstruct_path(cache.node_id)
+                .to_string_lossy()
+                .into_owned();
+            let norm = path.to_ascii_lowercase();
+            if !seen_paths.insert(norm) {
+                continue;
+            }
+
+            let requires_admin = cat == CleanCategory::SystemTemp;
+            let warning = if requires_admin && !elevated {
                 Some("Requiere permisos de administrador para limpiar.".to_string())
+            } else if cat == CleanCategory::BrowserCache {
+                running_browsers
+                    .iter()
+                    .find(|b| cache.label.starts_with(b.as_str()))
+                    .map(|b| format!("{b} está abierto; ciérralo para liberar todos los archivos."))
             } else {
                 None
-            },
-        });
-    }
-}
+            };
 
-fn collect_browser_caches(running: &[String], out: &mut Vec<CleanCandidate>) {
-    let Ok(local_app) = std::env::var("LOCALAPPDATA") else {
-        return;
-    };
-    let base = PathBuf::from(&local_app);
+            candidates.push(CleanCandidate {
+                id: cache.cache_key.clone(),
+                path,
+                display_name: cache.label.clone(),
+                category: cat,
+                size_bytes: size,
+                item_count: items.max(1),
+                last_modified_ts: tree.last_write_ts_of(cache.node_id),
+                requires_admin,
+                warning,
+            });
+        }
 
-    let chromium_targets = [
-        (
-            "Google Chrome",
-            base.join(r"Google\Chrome\User Data\Default"),
-        ),
-        (
-            "Microsoft Edge",
-            base.join(r"Microsoft\Edge\User Data\Default"),
-        ),
-        (
-            "Brave",
-            base.join(r"BraveSoftware\Brave-Browser\User Data\Default"),
-        ),
-    ];
-
-    for (browser_name, profile_dir) in chromium_targets {
-        for sub in [r"Cache\Cache_Data", "Code Cache", "GPUCache"] {
-            let target = profile_dir.join(sub);
-            if target.is_dir() {
-                let (bytes, count, ts) = dir_stats_bounded(&target, 20_000);
-                if bytes > 0 {
-                    let is_running = running.iter().any(|r| r == browser_name);
-                    out.push(CleanCandidate {
-                        id: format!("browser:{browser_name}:{sub}"),
-                        path: target.to_string_lossy().into_owned(),
-                        display_name: format!("{browser_name} — {sub}"),
-                        category: CleanCategory::BrowserCache,
-                        size_bytes: bytes,
-                        item_count: count,
-                        last_modified_ts: ts,
-                        requires_admin: false,
-                        warning: if is_running {
-                            Some(format!(
-                                "{browser_name} está abierto; ciérralo para liberar todos los archivos."
-                            ))
-                        } else {
-                            None
-                        },
-                    });
-                }
+        // 2. Precomputed Dev artifacts from single-pass derived index
+        for art in &tree.derived.dev_artifacts {
+            let idx = art.node_id as usize;
+            if idx >= tree.len() {
+                continue;
             }
+            let flags = tree.flags_of(art.node_id);
+            if flags.contains(NodeFlags::TOMBSTONE) || flags.contains(NodeFlags::OPTIMISTIC_HIDDEN)
+            {
+                continue;
+            }
+            let size = tree.allocated_size[idx];
+            if size < 1024 * 1024 {
+                continue;
+            }
+            let path = tree
+                .reconstruct_path(art.node_id)
+                .to_string_lossy()
+                .into_owned();
+            if !seen_paths.insert(path.to_ascii_lowercase()) {
+                continue;
+            }
+            let ts = tree.last_write_ts_of(art.node_id);
+            let recent = now_ts - ts < seven_days_secs;
+            dev_dirs.push(CleanCandidate {
+                id: format!("devdir:{}:{}", tree.volume_serial, art.node_id),
+                path,
+                display_name: format!("Artefacto {}", tree.node_name(art.node_id)),
+                category: CleanCategory::DevArtifact,
+                size_bytes: size,
+                item_count: tree.file_count[idx] as u64,
+                last_modified_ts: ts,
+                requires_admin: false,
+                warning: if recent {
+                    Some("Modificado hace menos de 7 días (proyecto activo).".to_string())
+                } else {
+                    None
+                },
+            });
+        }
+
+        // 3. Precomputed Top-N largest files (O(TOP_N) instead of scanning millions of nodes!)
+        for &nid in &tree.derived.top_files {
+            let idx = nid as usize;
+            if idx >= tree.len() {
+                continue;
+            }
+            let flags = tree.flags_of(nid);
+            if flags.contains(NodeFlags::TOMBSTONE) || flags.contains(NodeFlags::OPTIMISTIC_HIDDEN)
+            {
+                continue;
+            }
+            if tree.kind_of(nid) != NodeKind::File {
+                continue;
+            }
+            let alloc = tree.allocated_size[idx];
+            let ts = tree.last_write_ts_of(nid);
+            if alloc < min_large_bytes || ts <= 0 || (now_ts - ts) < min_age_secs {
+                continue;
+            }
+            if matches!(
+                tree.origin_cat_of(nid),
+                OriginCategory::System | OriginCategory::InstalledApps | OriginCategory::RecycleBin
+            ) {
+                continue;
+            }
+            let path = tree.reconstruct_path(nid).to_string_lossy().into_owned();
+            if !seen_paths.insert(path.to_ascii_lowercase()) {
+                continue;
+            }
+            large_files.push(CleanCandidate {
+                id: format!("large:{}:{nid}", tree.volume_serial),
+                path,
+                display_name: tree.node_name(nid).to_string(),
+                category: CleanCategory::LargeOldFile,
+                size_bytes: alloc,
+                item_count: 1,
+                last_modified_ts: ts,
+                requires_admin: false,
+                warning: None,
+            });
         }
     }
 
-    // Firefox profiles cache2/entries
-    let ff_profiles = base.join(r"Mozilla\Firefox\Profiles");
-    if let Ok(rd) = std::fs::read_dir(&ff_profiles) {
-        let is_running = running.iter().any(|r| r == "Mozilla Firefox");
-        for entry in rd.flatten() {
-            let cache_dir = entry.path().join(r"cache2\entries");
-            if cache_dir.is_dir() {
-                let (bytes, count, ts) = dir_stats_bounded(&cache_dir, 20_000);
-                if bytes > 0 {
-                    out.push(CleanCandidate {
-                        id: format!("browser:firefox:{}", entry.file_name().to_string_lossy()),
-                        path: cache_dir.to_string_lossy().into_owned(),
-                        display_name: format!(
-                            "Mozilla Firefox — Caché ({})",
-                            entry.file_name().to_string_lossy()
-                        ),
-                        category: CleanCategory::BrowserCache,
-                        size_bytes: bytes,
-                        item_count: count,
-                        last_modified_ts: ts,
-                        requires_admin: false,
-                        warning: if is_running {
-                            Some(
-                                "Mozilla Firefox está abierto; ciérralo antes de limpiar."
-                                    .to_string(),
-                            )
-                        } else {
-                            None
-                        },
-                    });
-                }
-            }
-        }
-    }
-}
+    dev_dirs.sort_by_key(|a| std::cmp::Reverse(a.size_bytes));
+    dev_dirs.truncate(60);
+    large_files.sort_by_key(|a| std::cmp::Reverse(a.size_bytes));
+    large_files.truncate(80);
 
-fn collect_package_manager_caches(out: &mut Vec<CleanCandidate>) {
-    let Ok(local_app) = std::env::var("LOCALAPPDATA") else {
-        return;
-    };
-    let local = PathBuf::from(local_app);
-    let candidates = [
-        ("Caché de npm", local.join("npm-cache")),
-        ("Caché de pip", local.join(r"pip\Cache")),
-        ("Caché de Composer", local.join(r"Composer\cache")),
-        ("Store de pnpm", local.join("pnpm-store")),
-    ];
+    candidates.extend(dev_dirs);
+    candidates.extend(large_files);
 
-    for (label, path) in candidates {
-        if path.is_dir() {
-            let (bytes, count, ts) = dir_stats_bounded(&path, 25_000);
-            if bytes > 0 {
-                out.push(CleanCandidate {
-                    id: format!("devcache:{label}"),
-                    path: path.to_string_lossy().into_owned(),
-                    display_name: label.to_string(),
-                    category: CleanCategory::DevArtifact,
-                    size_bytes: bytes,
-                    item_count: count,
-                    last_modified_ts: ts,
-                    requires_admin: false,
-                    warning: None,
-                });
-            }
-        }
+    CleanupCandidatesReport {
+        is_elevated: elevated,
+        running_browsers,
+        recycle_bin_bytes,
+        recycle_bin_items,
+        candidates,
     }
 }
 
@@ -332,110 +353,61 @@ pub fn discover_cleanup_candidates(
     min_large_mb: u64,
     min_age_days: u64,
 ) -> CleanupCandidatesReport {
-    let running_browsers = detect_running_browsers();
-    let (recycle_bin_bytes, recycle_bin_items) = query_recycle_bin();
-    let mut candidates = Vec::new();
-
-    if let Ok(user_temp) = std::env::var("TEMP") {
-        collect_temp_children(
-            Path::new(&user_temp),
-            CleanCategory::UserTemp,
-            false,
-            &mut candidates,
-        );
+    match scan_tree {
+        Some(t) => discover_cleanup_candidates_from_trees(&[t], min_large_mb, min_age_days),
+        None => discover_cleanup_candidates_from_trees(&[], min_large_mb, min_age_days),
     }
+}
 
+fn discover_cleanup_candidates_disk_fallback(
+    running_browsers: &[String],
+    recycle_bin_bytes: u64,
+    recycle_bin_items: u64,
+    elevated: bool,
+) -> CleanupCandidatesReport {
+    let mut candidates = Vec::new();
+    if let Ok(user_temp) = std::env::var("TEMP") {
+        let p = Path::new(&user_temp);
+        let (bytes, count, ts) = dir_stats_bounded(p, 2_000);
+        if count > 0 {
+            candidates.push(CleanCandidate {
+                id: "temp:UserTemp".to_string(),
+                path: user_temp,
+                display_name: "Archivos temporales del usuario (%TEMP%)".to_string(),
+                category: CleanCategory::UserTemp,
+                size_bytes: bytes,
+                item_count: count,
+                last_modified_ts: ts,
+                requires_admin: false,
+                warning: None,
+            });
+        }
+    }
     let win_temp = std::env::var("SystemRoot")
         .map(|s| PathBuf::from(s).join("Temp"))
         .unwrap_or_else(|_| PathBuf::from(r"C:\Windows\Temp"));
-    collect_temp_children(&win_temp, CleanCategory::SystemTemp, true, &mut candidates);
-
-    collect_browser_caches(&running_browsers, &mut candidates);
-    collect_package_manager_caches(&mut candidates);
-
-    if let Some(tree) = scan_tree {
-        let now_ts = chrono::Utc::now().timestamp();
-        let seven_days_secs = 7 * 86_400;
-        let min_large_bytes = min_large_mb.saturating_mul(1024 * 1024);
-        let min_age_secs = (min_age_days as i64).saturating_mul(86_400);
-
-        let mut dev_dirs: Vec<CleanCandidate> = Vec::new();
-        let mut large_files: Vec<CleanCandidate> = Vec::new();
-
-        for idx in 1..tree.nodes.len() {
-            let node = &tree.nodes[idx];
-            let name = tree.node_name(idx as u32);
-            let name_lower = name.to_ascii_lowercase();
-
-            if node.kind == NodeKind::Dir
-                && node.allocated_size > 1024 * 1024
-                && matches!(
-                    name_lower.as_str(),
-                    "node_modules" | ".venv" | "venv" | "target" | "vendor"
-                )
-            {
-                // Avoid nested node_modules inside another node_modules
-                let parent_is_dev = node.parent.is_some_and(|pid| {
-                    let pname = tree.node_name(pid).to_ascii_lowercase();
-                    matches!(pname.as_str(), "node_modules" | "target" | "vendor")
-                });
-                if !parent_is_dev {
-                    let path = tree.reconstruct_path(idx as u32);
-                    let recent = now_ts - node.last_write_ts < seven_days_secs;
-                    dev_dirs.push(CleanCandidate {
-                        id: format!("devdir:{idx}"),
-                        path: path.to_string_lossy().into_owned(),
-                        display_name: format!("Artefacto {name}"),
-                        category: CleanCategory::DevArtifact,
-                        size_bytes: node.allocated_size,
-                        item_count: node.file_count as u64,
-                        last_modified_ts: node.last_write_ts,
-                        requires_admin: false,
-                        warning: if recent {
-                            Some("Modificado hace menos de 7 días (proyecto activo).".to_string())
-                        } else {
-                            None
-                        },
-                    });
-                }
-            } else if node.kind == NodeKind::File
-                && node.allocated_size >= min_large_bytes
-                && node.last_write_ts > 0
-                && (now_ts - node.last_write_ts) >= min_age_secs
-                && !matches!(
-                    node.origin_cat,
-                    OriginCategory::System
-                        | OriginCategory::InstalledApps
-                        | OriginCategory::RecycleBin
-                )
-            {
-                let path = tree.reconstruct_path(idx as u32);
-                large_files.push(CleanCandidate {
-                    id: format!("large:{idx}"),
-                    path: path.to_string_lossy().into_owned(),
-                    display_name: name.to_string(),
-                    category: CleanCategory::LargeOldFile,
-                    size_bytes: node.allocated_size,
-                    item_count: 1,
-                    last_modified_ts: node.last_write_ts,
-                    requires_admin: false,
-                    warning: None,
-                });
-            }
-        }
-
-        dev_dirs.sort_by_key(|a| std::cmp::Reverse(a.size_bytes));
-        dev_dirs.truncate(60);
-        large_files.sort_by_key(|a| std::cmp::Reverse(a.size_bytes));
-        large_files.truncate(80);
-
-        candidates.extend(dev_dirs);
-        candidates.extend(large_files);
+    let (bytes, count, ts) = dir_stats_bounded(&win_temp, 2_000);
+    if count > 0 {
+        candidates.push(CleanCandidate {
+            id: "temp:SystemTemp".to_string(),
+            path: win_temp.to_string_lossy().into_owned(),
+            display_name: "Archivos temporales del sistema (C:\\Windows\\Temp)".to_string(),
+            category: CleanCategory::SystemTemp,
+            size_bytes: bytes,
+            item_count: count,
+            last_modified_ts: ts,
+            requires_admin: true,
+            warning: if !elevated {
+                Some("Requiere permisos de administrador para limpiar.".to_string())
+            } else {
+                None
+            },
+        });
     }
 
     CleanupCandidatesReport {
-        is_elevated: is_elevated(),
-        running_browsers,
+        is_elevated: elevated,
+        running_browsers: running_browsers.to_vec(),
         recycle_bin_bytes,
         recycle_bin_items,
         candidates,

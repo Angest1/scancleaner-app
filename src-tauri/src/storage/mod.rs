@@ -67,6 +67,8 @@ pub struct CleanupLogEntry {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub estimated_bytes: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub real_freed_bytes: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub command: Option<String>,
 }
 
@@ -126,11 +128,11 @@ impl Storage {
         let mut top_dirs: Vec<TopDirSnapshot> = tree
             .children_iter(0)
             .filter_map(|cid| {
-                let n = &tree.nodes[cid as usize];
-                if n.allocated_size > 0 {
+                let alloc = tree.allocated_size[cid as usize];
+                if alloc > 0 {
                     Some(TopDirSnapshot {
                         name: tree.node_name(cid).to_string(),
-                        allocated_bytes: n.allocated_size,
+                        allocated_bytes: alloc,
                     })
                 } else {
                     None

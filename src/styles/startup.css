@@ -1,0 +1,189 @@
+/* Startup Loading Screen — GPU-composited motion (transform, opacity, SVG stroke-dashoffset only) */
+
+@keyframes sc-leapfrog-arc {
+  0% {
+    transform: translate3d(0px, 0px, 0) scale(1);
+  }
+  12% {
+    transform: translate3d(10px, -16px, 0) scale(1.1);
+  }
+  50% {
+    transform: translate3d(44px, -28px, 0) scale(1.16);
+  }
+  84% {
+    transform: translate3d(78px, -14px, 0) scale(1.06);
+  }
+  95% {
+    transform: translate3d(88px, 2px, 0) scale(0.95);
+  }
+  100% {
+    transform: translate3d(88px, 0px, 0) scale(1);
+  }
+}
+
+@keyframes sc-leapfrog-shift {
+  0%,
+  16% {
+    transform: translate3d(0px, 0px, 0);
+  }
+  82%,
+  100% {
+    transform: translate3d(-22px, 0px, 0);
+  }
+}
+
+@keyframes sc-splash-converge {
+  0% {
+    transform: scale(1);
+    opacity: 1;
+  }
+  100% {
+    transform: scale(1.08);
+    opacity: 1;
+  }
+}
+
+@keyframes sc-tick-circle-pop {
+  0% {
+    transform: scale(0.9);
+    opacity: 0;
+  }
+  60% {
+    transform: scale(1.04);
+    opacity: 1;
+  }
+  100% {
+    transform: scale(1);
+    opacity: 1;
+  }
+}
+
+@keyframes sc-tick-draw {
+  0% {
+    stroke-dashoffset: 48;
+  }
+  100% {
+    stroke-dashoffset: 0;
+  }
+}
+
+@keyframes sc-ready-label {
+  0% {
+    opacity: 0;
+    transform: translate3d(0, 8px, 0);
+  }
+  100% {
+    opacity: 1;
+    transform: translate3d(0, 0, 0);
+  }
+}
+
+@keyframes sc-splash-exit-zoom {
+  0% {
+    transform: scale(1);
+    opacity: 1;
+  }
+  100% {
+    transform: scale(1.24);
+    opacity: 0;
+  }
+}
+
+@keyframes sc-home-emerge {
+  0% {
+    transform: scale(0.96);
+    opacity: 0;
+  }
+  100% {
+    transform: scale(1);
+    opacity: 1;
+  }
+}
+
+.sc-dot-leaper {
+  animation: sc-leapfrog-arc 1.2s cubic-bezier(0.45, 0.05, 0.55, 0.95) infinite;
+}
+
+.sc-dot-shifter {
+  animation: sc-leapfrog-shift 1.2s cubic-bezier(0.23, 1, 0.32, 1) infinite;
+}
+
+.sc-dot-converging {
+  animation: none !important;
+  transition: transform 280ms var(--ease-out), opacity 240ms var(--ease-out);
+}
+
+.sc-splash-stage-converging {
+  animation: sc-splash-converge 300ms var(--ease-out) forwards;
+}
+
+.sc-tick-circle {
+  animation: sc-tick-circle-pop 320ms var(--ease-out) both;
+}
+
+.sc-tick-stroke {
+  stroke-dasharray: 48;
+  stroke-dashoffset: 48;
+  animation: sc-tick-draw 360ms var(--ease-out) 60ms forwards;
+}
+
+.sc-ready-text {
+  animation: sc-ready-label 280ms var(--ease-out) 90ms both;
+}
+
+.sc-splash-exiting {
+  animation: sc-splash-exit-zoom 350ms var(--ease-out) forwards;
+}
+
+.sc-home-emerging {
+  animation: sc-home-emerge 350ms var(--ease-out) both;
+}
+
+.sc-progress-fill {
+  transform-origin: left center;
+  transition: transform 110ms linear;
+}
+
+/* Reduced motion (both OS prefers-reduced-motion AND Windows SPI_GETCLIENTAREAANIMATION=false) */
+[data-reduced-motion="true"] .sc-dot-leaper,
+[data-reduced-motion="true"] .sc-dot-shifter,
+[data-reduced-motion="true"] .sc-splash-stage-converging,
+[data-reduced-motion="true"] .sc-tick-circle,
+[data-reduced-motion="true"] .sc-tick-stroke,
+[data-reduced-motion="true"] .sc-ready-text,
+[data-reduced-motion="true"] .sc-splash-exiting,
+[data-reduced-motion="true"] .sc-home-emerging {
+  animation: none !important;
+}
+
+[data-reduced-motion="true"] .sc-tick-stroke {
+  stroke-dashoffset: 0;
+}
+
+[data-reduced-motion="true"] .sc-splash-exiting {
+  opacity: 0;
+  transition: opacity 180ms ease;
+}
+
+[data-reduced-motion="true"] .sc-home-emerging {
+  opacity: 1;
+  transform: none;
+  transition: opacity 180ms ease;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .sc-dot-leaper,
+  .sc-dot-shifter,
+  .sc-splash-stage-converging,
+  .sc-tick-circle,
+  .sc-tick-stroke,
+  .sc-ready-text,
+  .sc-splash-exiting,
+  .sc-home-emerging {
+    animation: none !important;
+  }
+
+  .sc-tick-stroke {
+    stroke-dashoffset: 0;
+  }
+}

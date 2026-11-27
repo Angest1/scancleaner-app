@@ -66,6 +66,7 @@
         "preCommands": [],
         "requiresAdmin": false
       },
+      "rutasAfectadas": ["%LOCALAPPDATA%\\npm-cache"],
       "comoRegenerar": "Se regenera automáticamente en el próximo `npm install`."
     },
     {
@@ -94,6 +95,7 @@
         "preCommands": [],
         "requiresAdmin": false
       },
+      "rutasAfectadas": ["%LOCALAPPDATA%\\pnpm\\store", "%LOCALAPPDATA%\\pnpm-store"],
       "comoRegenerar": "Solo elimina paquetes no referenciados; `pnpm install` vuelve a descargar lo necesario."
     },
     {
@@ -228,6 +230,7 @@
         "preCommands": [],
         "requiresAdmin": false
       },
+      "rutasAfectadas": ["%LOCALAPPDATA%\\pip\\Cache"],
       "comoRegenerar": "Se regenera automáticamente al ejecutar `pip install`."
     },
     {
@@ -312,6 +315,7 @@
         "preCommands": [],
         "requiresAdmin": false
       },
+      "rutasAfectadas": ["%LOCALAPPDATA%\\Composer"],
       "comoRegenerar": "Se regenera automáticamente con `composer install`."
     },
     {
@@ -690,6 +694,7 @@
         "preCommands": [],
         "requiresAdmin": false
       },
+      "rutasAfectadas": ["%ANDROID_HOME%", "%ANDROID_SDK_ROOT%", "%LOCALAPPDATA%\\Android\\Sdk"],
       "comoRegenerar": "Reinstalable desde Android Studio SDK Manager o `sdkmanager --install`."
     },
     {
@@ -744,6 +749,10 @@
         "preCommands": [],
         "requiresAdmin": false
       },
+      "rutasAfectadas": [
+        "%LOCALAPPDATA%\\Docker\\wsl\\disk\\docker_data.vhdx",
+        "%LOCALAPPDATA%\\Docker\\wsl\\data\\ext4.vhdx"
+      ],
       "comoRegenerar": "Las capas de caché se reconstruyen en el próximo `docker build`."
     },
     {
@@ -990,6 +999,7 @@
         "preCommands": [],
         "requiresAdmin": true
       },
+      "rutasAfectadas": ["%SystemRoot%\\WinSxS"],
       "comoRegenerar": "Limpia versiones obsoletas del almacén WinSxS de forma oficial (puede tardar varios minutos)."
     },
     {

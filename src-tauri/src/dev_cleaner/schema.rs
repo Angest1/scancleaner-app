@@ -103,6 +103,10 @@ pub struct DevRule {
     pub metodo: RuleMethod,
     #[serde(default)]
     pub precondiciones: RulePreconditions,
+    /// Rutas afectadas por la regla (usadas por la cola de reconciliación post-operación).
+    /// Opcional para no romper reglas existentes.
+    #[serde(default)]
+    pub rutas_afectadas: Vec<String>,
     pub como_regenerar: String,
 }
 
@@ -349,6 +353,12 @@ pub struct DevCleanupResult {
     pub plan_id: String,
     pub total_estimated_bytes: u64,
     pub total_freed_bytes: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub real_freed_bytes: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub discrepancy_explanation: Option<String>,
+    #[serde(default)]
+    pub affected_paths_for_reconcile: Vec<String>,
     pub succeeded_count: usize,
     pub failed_count: usize,
     pub skipped_count: usize,

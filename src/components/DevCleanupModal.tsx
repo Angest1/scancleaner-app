@@ -57,13 +57,20 @@ export function DevCleanupModal({
           >
             <div className="font-semibold text-fg-primary">
               Espacio liberado real:{" "}
-              <span className="mono">{formatBytes(result.totalFreedBytes)}</span>
+              <span className="mono">
+                {formatBytes(result.realFreedBytes ?? result.totalFreedBytes)}
+              </span>
             </div>
             <div className="text-[12px] text-fg-secondary mt-0.5 tabular">
               Estimado previo: {formatBytes(result.totalEstimatedBytes)} · Completados:{" "}
               {result.succeededCount} · Omitidos: {result.skippedCount} · Fallidos:{" "}
               {result.failedCount}
             </div>
+            {result.discrepancyExplanation && (
+              <div className="text-[11.5px] text-warning-text mt-1">
+                {result.discrepancyExplanation}
+              </div>
+            )}
           </AlertBanner>
 
           <div className="max-h-[320px] overflow-auto flex flex-col gap-1.5">

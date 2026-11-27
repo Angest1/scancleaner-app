@@ -129,16 +129,16 @@ fn scanner_handles_hardlinks_sparse_files_and_cyclic_junctions() {
     let j_node = tree
         .find_node_by_path(&junction_path)
         .expect("Junction node should exist");
-    assert_eq!(tree.nodes[j_node as usize].kind, NodeKind::Junction);
-    assert_eq!(tree.nodes[j_node as usize].allocated_size, 0);
+    assert_eq!(tree.kind_of(j_node), NodeKind::Junction);
+    assert_eq!(tree.allocated_size[j_node as usize], 0);
 
     // Sparse file logical size is 10 MB, allocated size must be strictly smaller (0)
     let s_node = tree
         .find_node_by_path(&sparse_path)
         .expect("Sparse node should exist");
-    assert_eq!(tree.nodes[s_node as usize].logical_size, 10 * 1024 * 1024);
+    assert_eq!(tree.logical_size[s_node as usize], 10 * 1024 * 1024);
     assert!(
-        tree.nodes[s_node as usize].allocated_size < tree.nodes[s_node as usize].logical_size,
+        tree.allocated_size[s_node as usize] < tree.logical_size[s_node as usize],
         "Sparse file allocated size should be < logical size"
     );
 

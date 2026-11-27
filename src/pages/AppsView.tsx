@@ -9,12 +9,11 @@ import {
   X,
 } from "lucide-react";
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { AppDetailDrawer } from "../components/apps/AppDetailDrawer";
 import { Badge } from "../components/ui/Badge";
 import { Button } from "../components/ui/Button";
 import { Card } from "../components/ui/Card";
-import { DetailDrawer, DetailField } from "../components/ui/DetailDrawer";
 import { AlertBanner, EmptyState, Skeleton } from "../components/ui/Feedback";
-import { PathDisplay } from "../components/ui/PathDisplay";
 import { SegmentedControl } from "../components/ui/SegmentedControl";
 import {
   DensityToggle,
@@ -22,13 +21,20 @@ import {
   SortHeaderButton,
   type TableDensity,
 } from "../components/ui/TableToolbar";
+import { useDeferredReorder } from "../hooks/useDeferredReorder";
 import { formatBytes } from "../lib/format";
-import { type InstalledApp, api } from "../lib/ipc";
+import { type InstalledApp, type UninstallLeftoverSuggestion, api } from "../lib/ipc";
 
 type SortKey = "name" | "source" | "size";
 
-export function AppsView() {
+interface AppsViewProps {
+  syncRevision?: number;
+  onQueueLeftoverCleanup?: (path: string) => void;
+}
+
+export function AppsView({ syncRevision = 0, onQueueLeftoverCleanup }: AppsViewProps) {
   const [apps, setApps] = useState<InstalledApp[]>([]);
+  const [leftovers, setLeftovers] = useState<UninstallLeftoverSuggestion[]>([]);
   const [loading, setLoading] = useState(false);
   const [search, setSearch] = useState("");
   const [filter, setFilter] = useState<"all" | "win32" | "store_msix">("all");
@@ -41,9 +47,14 @@ export function AppsView() {
 
   const loadApps = useCallback(() => {
     setLoading(true);
-    api
-      .listInstalledApps()
-      .then(setApps)
+    Promise.all([
+      api.listInstalledApps(),
+      api.getUninstallLeftovers().catch(() => [] as UninstallLeftoverSuggestion[]),
+    ])
+      .then(([list, lv]) => {
+        setApps(list);
+        setLeftovers(lv);
+      })
       .catch((err) => setStatusMsg(String(err)))
       .finally(() => setLoading(false));
   }, []);
@@ -51,6 +62,12 @@ export function AppsView() {
   useEffect(() => {
     loadApps();
   }, [loadApps]);
+
+  useEffect(() => {
+    if (syncRevision > 0) {
+      loadApps();
+    }
+  }, [syncRevision, loadApps]);
 
   const handleSort = (key: SortKey) => {
     if (sortKey === key) {
@@ -76,10 +93,13 @@ export function AppsView() {
     });
   }, [apps, search, filter, sortKey, sortDir]);
 
+  const getAppKey = useCallback((a: InstalledApp) => a.id, []);
+  const { items: stableApps, containerProps } = useDeferredReorder(filtered, getAppKey, 1000);
+
   const rowHeight = density === "compact" ? 44 : 58;
 
   const virtualizer = useVirtualizer({
-    count: filtered.length,
+    count: stableApps.length,
     getScrollElement: () => parentRef.current,
     estimateSize: () => rowHeight,
     overscan: 8,
@@ -87,8 +107,12 @@ export function AppsView() {
 
   const handleUninstall = (app: InstalledApp) => {
     api
-      .uninstallApp(app.source, app.uninstallString)
-      .then((msg) => setStatusMsg(msg))
+      .uninstallApp(app.source, app.uninstallString, {
+        appId: app.id,
+        appName: app.name,
+        installLocation: app.installLocation,
+      })
+      .then((msg) => setStatusMsg(`${msg} (vigilando finalización automática en el Registro…)`))
       .catch((err) => setStatusMsg(String(err)));
   };
 
@@ -120,6 +144,35 @@ export function AppsView() {
       </div>
 
       {statusMsg && <AlertBanner tone="info">{statusMsg}</AlertBanner>}
+
+      {leftovers.length > 0 && (
+        <AlertBanner tone="warning">
+          <div className="font-semibold text-fg-primary mb-1">
+            Restos detectados tras desinstalar (nivel Revisar — nunca se borran automáticamente)
+          </div>
+          <div className="flex flex-col gap-1.5">
+            {leftovers.map((lv) => (
+              <div
+                key={lv.path}
+                className="flex items-center justify-between gap-2 text-[12px] flex-wrap"
+              >
+                <span className="mono truncate">
+                  {lv.appName}: {lv.path} ({formatBytes(lv.sizeBytes)})
+                </span>
+                {onQueueLeftoverCleanup && (
+                  <Button
+                    size="sm"
+                    variant="warning"
+                    onClick={() => onQueueLeftoverCleanup(lv.path)}
+                  >
+                    Revisar en Dry-run
+                  </Button>
+                )}
+              </div>
+            ))}
+          </div>
+        </AlertBanner>
+      )}
 
       <Card className="flex items-center justify-between flex-wrap gap-3 py-3">
         <div className="relative flex-1 min-w-[200px] max-w-[360px]">
@@ -191,7 +244,11 @@ export function AppsView() {
         />
       ) : (
         <Card padded={false} className="overflow-hidden">
-          <div ref={parentRef} className="h-[480px] overflow-y-auto overflow-x-hidden">
+          <div
+            ref={parentRef}
+            {...containerProps}
+            className="h-[480px] overflow-y-auto overflow-x-hidden"
+          >
             {/* Sticky priority-responsive header (zero horizontal scroll) */}
             <div className="sticky top-0 z-10 grid grid-cols-[minmax(0,1fr)_90px_40px] md:grid-cols-[minmax(0,1fr)_84px_124px_142px] items-center gap-2 px-3.5 py-2.5 border-b border-border-default bg-shell backdrop-blur-md">
               <SortHeaderButton
@@ -222,7 +279,8 @@ export function AppsView() {
 
             <div style={{ height: `${virtualizer.getTotalSize()}px`, position: "relative" }}>
               {virtualizer.getVirtualItems().map((vRow) => {
-                const app = filtered[vRow.index];
+                const app = stableApps[vRow.index];
+                if (!app) return null;
                 return (
                   <div
                     key={app.id}
@@ -306,67 +364,11 @@ export function AppsView() {
       )}
 
       {inspected && (
-        <DetailDrawer
-          title={inspected.name}
-          subtitle={inspected.publisher || "Editor desconocido"}
-          badge={
-            <Badge tone={inspected.source === "store_msix" ? "accent" : "neutral"}>
-              {inspected.source === "store_msix" ? "Store / MSIX" : "Win32"}
-            </Badge>
-          }
+        <AppDetailDrawer
+          app={inspected}
           onClose={() => setInspected(null)}
-          footer={
-            <>
-              <Button onClick={() => setInspected(null)}>Cerrar</Button>
-              <Button
-                variant="danger"
-                onClick={() => {
-                  handleUninstall(inspected);
-                  setInspected(null);
-                }}
-              >
-                <Trash2 size={13} />
-                Desinstalar (nativo)
-              </Button>
-            </>
-          }
-        >
-          <DetailField label="Tamaño">
-            <span className="mono text-[18px] font-semibold text-accent">
-              {inspected.sizeSource === "unknown"
-                ? "No disponible"
-                : formatBytes(inspected.sizeBytes)}
-            </span>
-            <span className="ml-2 text-[12px] text-fg-muted">
-              (
-              {inspected.sizeSource === "measured"
-                ? "Medido en disco"
-                : inspected.sizeSource === "estimated"
-                  ? "Estimado por Registro"
-                  : "Acceso restringido"}
-              )
-            </span>
-          </DetailField>
-          {inspected.version && (
-            <DetailField label="Versión">
-              <span className="mono">{inspected.version}</span>
-            </DetailField>
-          )}
-          {inspected.installLocation && (
-            <DetailField label="Carpeta de instalación">
-              <div className="p-2.5 rounded-[8px] bg-canvas border border-border-default">
-                <PathDisplay path={inspected.installLocation} maxChars={90} />
-              </div>
-            </DetailField>
-          )}
-          {inspected.uninstallString && (
-            <DetailField label="Comando de desinstalación nativo">
-              <div className="p-2.5 rounded-[8px] bg-canvas border border-border-default mono text-[11.5px] text-fg-secondary break-all">
-                {inspected.uninstallString}
-              </div>
-            </DetailField>
-          )}
-        </DetailDrawer>
+          onUninstall={handleUninstall}
+        />
       )}
     </div>
   );

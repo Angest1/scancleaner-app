@@ -1,5 +1,7 @@
 use chrono::Utc;
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use uuid::Uuid;
 use windows::core::PCWSTR;
@@ -9,12 +11,17 @@ use windows::Win32::UI::Shell::{
 
 use crate::cleaner::executor::{delete_to_recycle_bin_sta, remove_permanently_safe};
 use crate::cleaner::guardrails::{is_reparse_point, SandboxGuard};
+use crate::deletion::fast_delete::{delete_tree_parallel_fast, stage_to_same_volume_trash};
 use crate::elevation::is_elevated;
+use crate::reconcile::triggers::{
+    measure_real_freed_space, DiskSpaceProvider, WinDiskSpaceProvider,
+};
+use crate::scanner::derived::volume_root_of_path;
 use crate::storage::{append_cleanup_log, logs_dir, CleanupLogEntry};
 
 use super::blacklist::{validate_dev_rule_and_command, validate_dev_target_path};
 use super::process::{matching_blocking_processes, CommandRunner};
-use super::resolver::{measure_dir_no_reparse, parse_docker_human_size};
+use super::resolver::{expand_env_vars, measure_dir_no_reparse, parse_docker_human_size};
 use super::schema::{
     CleanMethodKind, DevBlockedItem, DevCleanupPlan, DevCleanupResult, DevExecutionOutcome,
     DevPlannedItem, DevPreviewRequest, DevRulesCatalog, SafetyLevel,
@@ -23,6 +30,7 @@ use super::schema::{
 const OFFICIAL_CMD_TIMEOUT: Duration = Duration::from_secs(120);
 const DISM_TIMEOUT: Duration = Duration::from_secs(600);
 const PRE_CMD_TIMEOUT: Duration = Duration::from_secs(20);
+const MAX_PARALLEL_OFFICIAL_CMDS: usize = 3;
 
 pub fn build_dev_cleanup_plan(
     req: DevPreviewRequest,
@@ -107,7 +115,6 @@ pub fn build_dev_cleanup_plan(
             continue;
         }
 
-        // Validate filesystem paths for direct deletion or cache paths
         let is_virtual_target = cand.path.starts_with("$Recycle.Bin")
             || cand.path.starts_with("Docker")
             || cand.path.starts_with("WinSxS");
@@ -170,6 +177,11 @@ pub fn build_dev_cleanup_plan(
     }
 }
 
+/// Executes a DevCleanupPlan:
+/// - Official commands run concurrently with bounded parallelism (max 3 workers).
+/// - Permanent path deletions use instant same-volume staging + parallel POSIX deletion.
+/// - Recycle Bin deletions use batched `IFileOperation`.
+/// - Measures real volume free-space delta before/after and collects `rutasAfectadas` for reconciliation.
 pub fn execute_dev_cleanup_plan(
     plan: &DevCleanupPlan,
     catalog: &DevRulesCatalog,
@@ -179,34 +191,200 @@ pub fn execute_dev_cleanup_plan(
 ) -> DevCleanupResult {
     let log_dir = log_dir_override.map(PathBuf::from).unwrap_or_else(logs_dir);
     let running = runner.running_processes();
+    let space_provider = WinDiskSpaceProvider;
+
+    // Collect affected volumes & capture free space BEFORE
+    let mut affected_paths: Vec<String> = Vec::new();
+    let mut free_before_by_vol: HashMap<String, u64> = HashMap::new();
+    let mut touched_docker = false;
+
+    for item in &plan.items {
+        if item.rule_id.starts_with("docker-") {
+            touched_docker = true;
+        }
+        if let Some(rule) = catalog.rules.iter().find(|r| r.id == item.rule_id) {
+            for tmpl in &rule.rutas_afectadas {
+                if let Some(exp) = expand_env_vars(tmpl) {
+                    let s = exp.to_string_lossy().into_owned();
+                    if let Some(vol) = volume_root_of_path(&exp) {
+                        free_before_by_vol.entry(vol.clone()).or_insert_with(|| {
+                            space_provider.query_space(&vol).map_or(0, |(_, f)| f)
+                        });
+                    }
+                    affected_paths.push(s);
+                }
+            }
+        }
+        let p = Path::new(&item.path);
+        if let Some(vol) = volume_root_of_path(p) {
+            free_before_by_vol
+                .entry(vol.clone())
+                .or_insert_with(|| space_provider.query_space(&vol).map_or(0, |(_, f)| f));
+            affected_paths.push(item.path.clone());
+        }
+    }
+
+    // Separate official commands (executed concurrently up to MAX_PARALLEL_OFFICIAL_CMDS)
+    // and direct file deletions
+    let outcomes_slots: Arc<Mutex<Vec<Option<DevExecutionOutcome>>>> =
+        Arc::new(Mutex::new(vec![None; plan.items.len()]));
+
+    let mut cmd_indices: Vec<usize> = Vec::new();
+    let mut path_indices: Vec<usize> = Vec::new();
+    for (idx, item) in plan.items.iter().enumerate() {
+        if item.effective_method == CleanMethodKind::ComandoOficial {
+            cmd_indices.push(idx);
+        } else {
+            path_indices.push(idx);
+        }
+    }
+
+    // Execute official commands in parallel chunks of MAX_PARALLEL_OFFICIAL_CMDS
+    for chunk in cmd_indices.chunks(MAX_PARALLEL_OFFICIAL_CMDS) {
+        std::thread::scope(|scope| {
+            for &idx in chunk {
+                let item = &plan.items[idx];
+                let slots = outcomes_slots.clone();
+                let running_ref = &running;
+                scope.spawn(move || {
+                    let outcome = execute_single_dev_item(
+                        item,
+                        &plan.plan_id,
+                        catalog,
+                        runner,
+                        running_ref,
+                        sandbox_guard,
+                    );
+                    if let Ok(mut g) = slots.lock() {
+                        g[idx] = Some(outcome);
+                    }
+                });
+            }
+        });
+    }
+
+    // Execute direct path deletions (each already uses parallel workers or batched IFileOperation)
+    for idx in path_indices {
+        let item = &plan.items[idx];
+        let outcome = execute_single_dev_item(
+            item,
+            &plan.plan_id,
+            catalog,
+            runner,
+            &running,
+            sandbox_guard,
+        );
+        if let Ok(mut g) = outcomes_slots.lock() {
+            g[idx] = Some(outcome);
+        }
+    }
+
+    let outcomes: Vec<DevExecutionOutcome> = outcomes_slots
+        .lock()
+        .map(|g| g.iter().flatten().cloned().collect())
+        .unwrap_or_default();
 
     let mut total_freed_bytes = 0u64;
     let mut succeeded_count = 0usize;
     let mut failed_count = 0usize;
     let mut skipped_count = 0usize;
-    let mut outcomes = Vec::with_capacity(plan.items.len());
 
-    for item in &plan.items {
-        let method_label = format_method_label(item);
+    for o in &outcomes {
+        match o.status.as_str() {
+            "deleted_permanent" | "recycled" | "command_ok" => {
+                succeeded_count += 1;
+                total_freed_bytes = total_freed_bytes.saturating_add(o.freed_bytes);
+            }
+            "skipped" | "blocked" => skipped_count += 1,
+            _ => failed_count += 1,
+        }
+    }
 
-        // 1. Re-check blocking processes immediately before executing — never force-kill
-        let active_procs = matching_blocking_processes(&item.blocking_processes_spec, &running);
-        if !active_procs.is_empty() {
-            skipped_count += 1;
-            let detail = format!(
-                "Omitido: proceso bloqueante en ejecución ({}).",
-                active_procs.join(", ")
-            );
-            log_dev_outcome(
-                &log_dir,
-                &plan.plan_id,
-                item,
-                &method_label,
-                0,
-                "skipped",
-                Some(&detail),
-            );
-            outcomes.push(DevExecutionOutcome {
+    // Real freed space delta across affected volumes
+    let mut total_real_freed = 0u64;
+    let mut discrepancy = None;
+    for (vol, free_before) in &free_before_by_vol {
+        let m = measure_real_freed_space(
+            vol,
+            *free_before,
+            total_freed_bytes,
+            &space_provider,
+            false,
+            touched_docker,
+            failed_count > 0,
+        );
+        total_real_freed = total_real_freed.saturating_add(m.real_freed_bytes);
+        if discrepancy.is_none() {
+            discrepancy = m.discrepancy_explanation;
+        }
+    }
+
+    for (item, outcome) in plan.items.iter().zip(outcomes.iter()) {
+        log_dev_outcome(
+            &log_dir,
+            &plan.plan_id,
+            item,
+            &outcome.method_label,
+            outcome.freed_bytes,
+            Some(total_real_freed),
+            &outcome.status,
+            outcome.detail.as_deref(),
+        );
+    }
+
+    affected_paths.sort();
+    affected_paths.dedup();
+
+    DevCleanupResult {
+        plan_id: plan.plan_id.clone(),
+        total_estimated_bytes: plan.total_estimated_bytes,
+        total_freed_bytes,
+        real_freed_bytes: Some(total_real_freed),
+        discrepancy_explanation: discrepancy,
+        affected_paths_for_reconcile: affected_paths,
+        succeeded_count,
+        failed_count,
+        skipped_count,
+        outcomes,
+    }
+}
+
+fn execute_single_dev_item(
+    item: &DevPlannedItem,
+    plan_id: &str,
+    catalog: &DevRulesCatalog,
+    runner: &dyn CommandRunner,
+    running: &std::collections::HashSet<String>,
+    sandbox_guard: Option<&SandboxGuard>,
+) -> DevExecutionOutcome {
+    let method_label = format_method_label(item);
+
+    // 1. Re-check blocking processes immediately before executing
+    let active_procs = matching_blocking_processes(&item.blocking_processes_spec, running);
+    if !active_procs.is_empty() {
+        let detail = format!(
+            "Omitido: proceso bloqueante en ejecución ({}).",
+            active_procs.join(", ")
+        );
+        return DevExecutionOutcome {
+            id: item.id.clone(),
+            rule_id: item.rule_id.clone(),
+            nombre: item.nombre.clone(),
+            path: item.path.clone(),
+            method_label,
+            estimated_bytes: item.estimated_bytes,
+            freed_bytes: 0,
+            status: "skipped".to_string(),
+            detail: Some(detail),
+        };
+    }
+
+    // 2. Re-validate rule & command against blacklist
+    if let Some(rule) = catalog.rules.iter().find(|r| r.id == item.rule_id) {
+        if let Err(reason) =
+            validate_dev_rule_and_command(rule, item.command.as_deref(), &catalog.blacklist_never)
+        {
+            return DevExecutionOutcome {
                 id: item.id.clone(),
                 rule_id: item.rule_id.clone(),
                 nombre: item.nombre.clone(),
@@ -214,107 +392,45 @@ pub fn execute_dev_cleanup_plan(
                 method_label,
                 estimated_bytes: item.estimated_bytes,
                 freed_bytes: 0,
-                status: "skipped".to_string(),
-                detail: Some(detail),
-            });
-            continue;
+                status: "blocked".to_string(),
+                detail: Some(reason),
+            };
         }
-
-        // 2. Re-validate rule & command against blacklist
-        if let Some(rule) = catalog.rules.iter().find(|r| r.id == item.rule_id) {
-            if let Err(reason) = validate_dev_rule_and_command(
-                rule,
-                item.command.as_deref(),
-                &catalog.blacklist_never,
-            ) {
-                skipped_count += 1;
-                log_dev_outcome(
-                    &log_dir,
-                    &plan.plan_id,
-                    item,
-                    &method_label,
-                    0,
-                    "blocked",
-                    Some(&reason),
-                );
-                outcomes.push(DevExecutionOutcome {
-                    id: item.id.clone(),
-                    rule_id: item.rule_id.clone(),
-                    nombre: item.nombre.clone(),
-                    path: item.path.clone(),
-                    method_label,
-                    estimated_bytes: item.estimated_bytes,
-                    freed_bytes: 0,
-                    status: "blocked".to_string(),
-                    detail: Some(reason),
-                });
-                continue;
-            }
-        }
-
-        // 3. Execute pre-commands (e.g. `gradle --stop`), best-effort
-        for pre in &item.pre_commands {
-            if let Some((prog, args)) = pre.split_first() {
-                let arg_refs: Vec<&str> = args.iter().map(String::as_str).collect();
-                let _ = runner.run(prog, &arg_refs, None, PRE_CMD_TIMEOUT);
-            }
-        }
-
-        // 4. Execute according to effective_method
-        let (status, freed, detail) = match item.effective_method {
-            CleanMethodKind::ComandoOficial => execute_official_command(item, runner),
-            CleanMethodKind::BorradoPermanente => {
-                execute_path_deletion(item, false, &catalog.blacklist_never, sandbox_guard)
-            }
-            CleanMethodKind::Papelera => {
-                execute_path_deletion(item, true, &catalog.blacklist_never, sandbox_guard)
-            }
-        };
-
-        match status.as_str() {
-            "deleted_permanent" | "recycled" | "command_ok" => {
-                succeeded_count += 1;
-                total_freed_bytes = total_freed_bytes.saturating_add(freed);
-            }
-            "skipped" | "blocked" => {
-                skipped_count += 1;
-            }
-            _ => {
-                failed_count += 1;
-            }
-        }
-
-        log_dev_outcome(
-            &log_dir,
-            &plan.plan_id,
-            item,
-            &method_label,
-            freed,
-            &status,
-            detail.as_deref(),
-        );
-
-        outcomes.push(DevExecutionOutcome {
-            id: item.id.clone(),
-            rule_id: item.rule_id.clone(),
-            nombre: item.nombre.clone(),
-            path: item.path.clone(),
-            method_label,
-            estimated_bytes: item.estimated_bytes,
-            freed_bytes: freed,
-            status,
-            detail,
-        });
     }
 
-    DevCleanupResult {
-        plan_id: plan.plan_id.clone(),
-        total_estimated_bytes: plan.total_estimated_bytes,
-        total_freed_bytes,
-        succeeded_count,
-        failed_count,
-        skipped_count,
-        outcomes,
+    // 3. Pre-commands
+    for pre in &item.pre_commands {
+        if let Some((prog, args)) = pre.split_first() {
+            let arg_refs: Vec<&str> = args.iter().map(String::as_str).collect();
+            let _ = runner.run(prog, &arg_refs, None, PRE_CMD_TIMEOUT);
+        }
+    }
+
+    // 4. Execute
+    let (status, freed, detail) = match item.effective_method {
+        CleanMethodKind::ComandoOficial => execute_official_command(item, runner),
+        CleanMethodKind::BorradoPermanente => execute_path_deletion(
+            item,
+            plan_id,
+            false,
+            &catalog.blacklist_never,
+            sandbox_guard,
+        ),
+        CleanMethodKind::Papelera => {
+            execute_path_deletion(item, plan_id, true, &catalog.blacklist_never, sandbox_guard)
+        }
+    };
+
+    DevExecutionOutcome {
+        id: item.id.clone(),
+        rule_id: item.rule_id.clone(),
+        nombre: item.nombre.clone(),
+        path: item.path.clone(),
+        method_label,
+        estimated_bytes: item.estimated_bytes,
+        freed_bytes: freed,
+        status,
+        detail,
     }
 }
 
@@ -420,7 +536,13 @@ fn execute_official_command(
         item.estimated_bytes
     };
 
-    ("command_ok".to_string(), freed, None)
+    let detail = if prog.eq_ignore_ascii_case("docker") {
+        Some("Nota: si el archivo .vhdx de Docker/WSL no redujo su tamaño físico, compacta el VHDX con las instrucciones de la tarjeta Docker.".to_string())
+    } else {
+        None
+    };
+
+    ("command_ok".to_string(), freed, detail)
 }
 
 fn parse_docker_reclaimed_bytes(stdout: &str) -> Option<u64> {
@@ -436,6 +558,7 @@ fn parse_docker_reclaimed_bytes(stdout: &str) -> Option<u64> {
 
 fn execute_path_deletion(
     item: &DevPlannedItem,
+    plan_id: &str,
     use_recycle_bin: bool,
     blacklist: &super::schema::BlacklistNeverSpec,
     sandbox_guard: Option<&SandboxGuard>,
@@ -520,7 +643,14 @@ fn execute_path_deletion(
         (status.to_string(), freed, detail)
     } else {
         for (p, before) in valid_targets {
-            match remove_permanently_safe(&p) {
+            let del_res =
+                if let Ok(staged) = stage_to_same_volume_trash(&p, plan_id, sandbox_guard, None) {
+                    delete_tree_parallel_fast(&staged, None, None, false).map(|_| ())
+                } else {
+                    remove_permanently_safe(&p)
+                };
+
+            match del_res {
                 Ok(()) => {
                     any_ok = true;
                     freed = freed.saturating_add(before);
@@ -554,12 +684,14 @@ fn execute_path_deletion(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn log_dev_outcome(
     log_dir: &Path,
     plan_id: &str,
     item: &DevPlannedItem,
     method_label: &str,
     freed_bytes: u64,
+    real_freed_bytes: Option<u64>,
     status: &str,
     detail: Option<&str>,
 ) {
@@ -576,6 +708,7 @@ fn log_dev_outcome(
             detail: detail.map(ToString::to_string),
             rule_id: Some(item.rule_id.clone()),
             estimated_bytes: Some(item.estimated_bytes),
+            real_freed_bytes,
             command: item.command.as_ref().map(|c| c.join(" ")),
         },
     );

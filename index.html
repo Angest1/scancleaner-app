@@ -3,8 +3,23 @@
   <head>
     <meta charset="UTF-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-    <meta name="theme-color" content="#090b0f" />
+    <meta name="theme-color" content="#f4f3fb" />
     <title>ScanCleaner — Analizador y Limpiador de Discos</title>
+    <script>
+      (function () {
+        try {
+          var pref = localStorage.getItem("scancleaner-theme-pref");
+          var dark =
+            pref === "dark" ||
+            (pref !== "light" && window.matchMedia("(prefers-color-scheme: dark)").matches);
+          var theme = dark ? "dark" : "light";
+          document.documentElement.setAttribute("data-theme", theme);
+          document.documentElement.style.backgroundColor = dark ? "#0a0c13" : "#f4f3fb";
+          var meta = document.querySelector('meta[name="theme-color"]');
+          if (meta) meta.setAttribute("content", dark ? "#0a0c13" : "#f4f3fb");
+        } catch (e) {}
+      })();
+    </script>
   </head>
   <body>
     <div id="root"></div>

@@ -1,6 +1,6 @@
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use windows::core::PWSTR;
 use windows::Win32::System::Com::CoTaskMemFree;
 use windows::Win32::UI::Shell::{
@@ -8,7 +8,7 @@ use windows::Win32::UI::Shell::{
     SHGetKnownFolderPath, KF_FLAG_DEFAULT,
 };
 
-use crate::scanner::model::{NodeFlags, NodeId, NodeKind, OriginCategory, ScanTree, TypeCategory};
+use crate::scanner::model::{OriginCategory, ScanTree, TypeCategory};
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -231,111 +231,16 @@ pub struct CategoryBreakdown {
 }
 
 pub fn classify_tree(tree: &mut ScanTree, rules: &RulesConfig) -> CategoryBreakdown {
-    let mut type_alloc = [0u64; 8];
-    let mut type_logical = [0u64; 8];
-    let mut type_count = [0u64; 8];
-
-    let mut origin_alloc = [0u64; 8];
-    let mut origin_logical = [0u64; 8];
-    let mut origin_count = [0u64; 8];
-
-    let len = tree.nodes.len();
-    let mut path_cache: Vec<String> = vec![String::new(); len];
-    path_cache[0] = tree
-        .root_path
-        .to_string_lossy()
-        .trim_end_matches('\\')
-        .to_ascii_lowercase();
-
-    for idx in 0..len {
-        let node_id = idx as NodeId;
-        let name_lower = tree.node_name(node_id).to_ascii_lowercase();
-        let parent_opt = tree.nodes[idx].parent;
-        let full_lower = if let Some(pid) = parent_opt {
-            let parent_path = &path_cache[pid as usize];
-            if parent_path.is_empty() {
-                name_lower.clone()
-            } else {
-                format!(r"{parent_path}\{name_lower}")
-            }
-        } else {
-            path_cache[0].clone()
-        };
-
-        if tree.nodes[idx].kind == NodeKind::Dir {
-            path_cache[idx] = full_lower.clone();
-        }
-
-        let origin = classify_origin_path(&full_lower, &name_lower, rules);
-        tree.nodes[idx].origin_cat = origin;
-
-        if matches!(origin, OriginCategory::System) {
-            tree.nodes[idx].flags |= NodeFlags::PROTECTED;
-        }
-
-        let is_file = matches!(
-            tree.nodes[idx].kind,
-            NodeKind::File | NodeKind::CloudPlaceholder
-        );
-        if is_file {
-            let ext = Path::new(&name_lower)
-                .extension()
-                .and_then(|e| e.to_str())
-                .unwrap_or("");
-            let tcat = classify_extension(ext, &rules.custom);
-            tree.nodes[idx].type_cat = tcat;
-
-            let alloc = tree.nodes[idx].allocated_size;
-            let logical = tree.nodes[idx].logical_size;
-
-            type_alloc[tcat as usize] += alloc;
-            type_logical[tcat as usize] += logical;
-            type_count[tcat as usize] += 1;
-
-            origin_alloc[origin as usize] += alloc;
-            origin_logical[origin as usize] += logical;
-            origin_count[origin as usize] += 1;
-        }
-    }
-
-    let total_alloc = tree.stats.total_allocated_bytes.max(1);
-    let mut by_type: Vec<CategoryBucket> = TypeCategory::ALL
-        .iter()
-        .map(|&cat| {
-            let i = cat as usize;
-            CategoryBucket {
-                key: format!("{cat:?}").to_ascii_lowercase(),
-                label: cat.label().to_string(),
-                allocated_bytes: type_alloc[i],
-                logical_bytes: type_logical[i],
-                file_count: type_count[i],
-                percentage: (type_alloc[i] as f64 / total_alloc as f64) * 100.0,
-            }
-        })
-        .collect();
-    by_type.sort_by_key(|a| std::cmp::Reverse(a.allocated_bytes));
-
-    let mut by_origin: Vec<CategoryBucket> = OriginCategory::ALL
-        .iter()
-        .map(|&cat| {
-            let i = cat as usize;
-            CategoryBucket {
-                key: format!("{cat:?}").to_ascii_lowercase(),
-                label: cat.label().to_string(),
-                allocated_bytes: origin_alloc[i],
-                logical_bytes: origin_logical[i],
-                file_count: origin_count[i],
-                percentage: (origin_alloc[i] as f64 / total_alloc as f64) * 100.0,
-            }
-        })
-        .collect();
-    by_origin.sort_by_key(|a| std::cmp::Reverse(a.allocated_bytes));
-
-    CategoryBreakdown {
-        total_allocated_bytes: tree.stats.total_allocated_bytes,
-        by_type,
-        by_origin,
-    }
+    let ctx = crate::scanner::derived::DerivedBuildContext::new(
+        rules.clone(),
+        crate::protection::ProtectionEngine::load_default(),
+        crate::dev_cleaner::schema::DevRulesCatalog::load_embedded()
+            .ok()
+            .as_ref(),
+    );
+    crate::scanner::derived::finalize_tree_and_derived(tree, &ctx);
+    tree.derived
+        .to_category_breakdown(tree.stats.total_allocated_bytes)
 }
 
 #[cfg(test)]

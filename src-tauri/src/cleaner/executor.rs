@@ -1,5 +1,6 @@
 use chrono::Utc;
 use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use uuid::Uuid;
 use windows::core::PCWSTR;
@@ -12,7 +13,14 @@ use windows::Win32::UI::Shell::{
     FOF_SILENT, SHERB_NOCONFIRMATION, SHERB_NOPROGRESSUI, SHERB_NOSOUND,
 };
 
-use super::guardrails::{is_reparse_point, validate_target_path, SandboxGuard};
+use super::guardrails::{validate_target_path, SandboxGuard};
+use crate::deletion::fast_delete::{
+    delete_tree_parallel_fast, has_pending_trash_on_volume, stage_to_same_volume_trash,
+};
+use crate::reconcile::triggers::{
+    measure_real_freed_space, DiskSpaceProvider, WinDiskSpaceProvider,
+};
+use crate::scanner::derived::volume_root_of_path;
 use crate::storage::{append_cleanup_log, logs_dir, CleanupLogEntry};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -79,6 +87,14 @@ pub struct CleanupResult {
     pub plan_id: String,
     pub mode: CleanupMode,
     pub freed_bytes: u64,
+    #[serde(default)]
+    pub estimated_bytes: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub real_freed_bytes: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub discrepancy_explanation: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub background_job_id: Option<String>,
     pub succeeded_count: usize,
     pub failed_count: usize,
     pub skipped_count: usize,
@@ -150,7 +166,6 @@ pub fn build_cleanup_plan(req: PreviewCleanupRequest) -> CleanupPlan {
     for target in req.targets {
         let p = PathBuf::from(&target.path);
         if target.is_temp_dir_contents {
-            // Expand direct children inside Temp directory rather than deleting Temp directory itself
             if let Ok(rd) = std::fs::read_dir(&p) {
                 for entry in rd.flatten() {
                     let child = entry.path();
@@ -202,37 +217,19 @@ pub fn build_cleanup_plan(req: PreviewCleanupRequest) -> CleanupPlan {
     }
 }
 
+/// Sends a batch of items to the Windows Recycle Bin using a SINGLE batched `IFileOperation`
+/// (`DeleteItem` for every valid item followed by a single `PerformOperations()` call).
+/// Falls back to per-item recycling only if the batch fails (e.g., one locked file).
 pub(crate) fn delete_to_recycle_bin_sta(paths: &[PathBuf]) -> Vec<Result<(), String>> {
+    if paths.is_empty() {
+        return Vec::new();
+    }
     let paths_owned = paths.to_vec();
     std::thread::spawn(move || {
         let init_hr = unsafe { CoInitializeEx(None, COINIT_APARTMENTTHREADED) };
         let com_initialized = init_hr.is_ok();
 
-        let mut results = Vec::with_capacity(paths_owned.len());
-        let file_op_res: windows::core::Result<IFileOperation> =
-            unsafe { CoCreateInstance(&FileOperation, None, CLSCTX_ALL) };
-
-        match file_op_res {
-            Ok(file_op) => {
-                let flags = FOF_ALLOWUNDO
-                    | FOFX_RECYCLEONDELETE
-                    | FOF_SILENT
-                    | FOF_NOCONFIRMATION
-                    | FOF_NOERRORUI
-                    | FOFX_EARLYFAILURE;
-                let _ = unsafe { file_op.SetOperationFlags(flags) };
-
-                for p in &paths_owned {
-                    let res = recycle_single_item(&file_op, p);
-                    results.push(res);
-                }
-            }
-            Err(e) => {
-                for _ in &paths_owned {
-                    results.push(Err(format!("Error inicializando IFileOperation: {e}")));
-                }
-            }
-        }
+        let results = recycle_batch_com(&paths_owned);
 
         if com_initialized {
             unsafe {
@@ -249,81 +246,187 @@ pub(crate) fn delete_to_recycle_bin_sta(paths: &[PathBuf]) -> Vec<Result<(), Str
     })
 }
 
-fn recycle_single_item(file_op: &IFileOperation, path: &Path) -> Result<(), String> {
-    if !path.exists() {
-        return Err("El archivo ya no existe.".to_string());
+fn recycle_batch_com(paths: &[PathBuf]) -> Vec<Result<(), String>> {
+    let flags = FOF_ALLOWUNDO
+        | FOFX_RECYCLEONDELETE
+        | FOF_SILENT
+        | FOF_NOCONFIRMATION
+        | FOF_NOERRORUI
+        | FOFX_EARLYFAILURE;
+
+    let file_op: IFileOperation =
+        match unsafe { CoCreateInstance(&FileOperation, None, CLSCTX_ALL) } {
+            Ok(op) => op,
+            Err(e) => {
+                return paths
+                    .iter()
+                    .map(|_| Err(format!("Error inicializando IFileOperation: {e}")))
+                    .collect();
+            }
+        };
+    let _ = unsafe { file_op.SetOperationFlags(flags) };
+
+    let mut queued_indices = Vec::with_capacity(paths.len());
+    let mut results: Vec<Result<(), String>> = vec![Ok(()); paths.len()];
+
+    for (idx, p) in paths.iter().enumerate() {
+        if !p.exists() {
+            results[idx] = Err("El archivo ya no existe.".to_string());
+            continue;
+        }
+        let wide: Vec<u16> = p
+            .as_os_str()
+            .to_string_lossy()
+            .encode_utf16()
+            .chain(std::iter::once(0))
+            .collect();
+        match unsafe {
+            SHCreateItemFromParsingName::<_, _, IShellItem>(PCWSTR(wide.as_ptr()), None)
+        } {
+            Ok(shell_item) => {
+                if let Err(e) = unsafe { file_op.DeleteItem(&shell_item, None) } {
+                    results[idx] = Err(format!("DeleteItem falló: {e}"));
+                } else {
+                    queued_indices.push(idx);
+                }
+            }
+            Err(e) => {
+                results[idx] = Err(format!("No se pudo crear IShellItem: {e}"));
+            }
+        }
     }
+
+    if queued_indices.is_empty() {
+        return results;
+    }
+
+    // Single PerformOperations() call for the entire batch!
+    let batch_ok = unsafe { file_op.PerformOperations() }.is_ok()
+        && !unsafe { file_op.GetAnyOperationsAborted() }
+            .unwrap_or(true.into())
+            .as_bool();
+
+    if batch_ok {
+        let mut any_leftover = false;
+        for &idx in &queued_indices {
+            if paths[idx].exists() {
+                results[idx] =
+                    Err("El elemento sigue en disco tras solicitar Papelera.".to_string());
+                any_leftover = true;
+            }
+        }
+        if !any_leftover {
+            return results;
+        }
+    }
+
+    // Fallback: isolate failing items one-by-one so valid siblings still succeed
+    for &idx in &queued_indices {
+        if !paths[idx].exists() {
+            results[idx] = Ok(());
+            continue;
+        }
+        results[idx] = recycle_single_item_fresh(&paths[idx], flags);
+    }
+
+    results
+}
+
+fn recycle_single_item_fresh(
+    path: &Path,
+    flags: windows::Win32::UI::Shell::FILEOPERATION_FLAGS,
+) -> Result<(), String> {
+    if !path.exists() {
+        return Ok(());
+    }
+    let file_op: IFileOperation = unsafe { CoCreateInstance(&FileOperation, None, CLSCTX_ALL) }
+        .map_err(|e| format!("IFileOperation fallback error: {e}"))?;
+    let _ = unsafe { file_op.SetOperationFlags(flags) };
     let wide: Vec<u16> = path
         .as_os_str()
         .to_string_lossy()
         .encode_utf16()
         .chain(std::iter::once(0))
         .collect();
-
     let shell_item: IShellItem =
         unsafe { SHCreateItemFromParsingName(PCWSTR(wide.as_ptr()), None) }
             .map_err(|e| format!("No se pudo crear IShellItem: {e}"))?;
-
     unsafe {
         file_op
             .DeleteItem(&shell_item, None)
             .map_err(|e| format!("DeleteItem falló: {e}"))?;
         file_op
             .PerformOperations()
-            .map_err(|e| format!("La Papelera rechazó el elemento (no se borró): {e}"))?;
-
+            .map_err(|e| format!("La Papelera rechazó el elemento: {e}"))?;
         let aborted = file_op.GetAnyOperationsAborted().unwrap_or(true.into());
         if aborted.as_bool() {
-            return Err("Operación abortada por Windows; el archivo no fue eliminado.".to_string());
+            return Err("Operación abortada por Windows.".to_string());
         }
     }
-
-    // Verify it actually moved/disappeared rather than silently failing
     if path.exists() {
         return Err("El elemento sigue en disco tras solicitar Papelera.".to_string());
     }
     Ok(())
 }
 
+/// Fast permanent deletion using parallel workers + POSIX `FileDispositionInfoEx` with fallback,
+/// never following reparse points and always enforcing `is_protected()`.
 pub(crate) fn remove_permanently_safe(path: &Path) -> Result<(), String> {
-    if !path.exists() {
-        return Ok(());
-    }
-    if is_reparse_point(path) {
-        return Err("Reparse point bloqueado durante borrado permanente.".to_string());
-    }
-    let meta = std::fs::symlink_metadata(path).map_err(|e| e.to_string())?;
-    if meta.is_file() {
-        std::fs::remove_file(path).map_err(|e| e.to_string())
-    } else if meta.is_dir() {
-        // Recursive traversal checking every subdirectory for reparse points
-        let rd = std::fs::read_dir(path).map_err(|e| e.to_string())?;
-        for entry in rd.flatten() {
-            let child = entry.path();
-            if is_reparse_point(&child) {
-                continue;
-            }
-            remove_permanently_safe(&child)?;
-        }
-        std::fs::remove_dir(path).map_err(|e| e.to_string())
-    } else {
-        Ok(())
-    }
+    delete_tree_parallel_fast(path, None, None, true).map(|_| ())
 }
 
+/// Executes a cleanup plan with optional fast staging (`stage_only_for_background = true`)
+/// where permanent targets are instantly renamed to `<vol>:\.scancleaner-trash\<job>` and returned
+/// for parallel background draining!
 pub fn execute_cleanup_plan(
     plan: &CleanupPlan,
     confirmed_permanent: bool,
     log_dir_override: Option<&Path>,
     sandbox_guard: Option<&SandboxGuard>,
 ) -> Result<CleanupResult, String> {
+    execute_cleanup_plan_with_options(
+        plan,
+        confirmed_permanent,
+        log_dir_override,
+        sandbox_guard,
+        None,
+        false,
+    )
+    .map(|(res, _)| res)
+}
+
+pub fn execute_cleanup_plan_with_options(
+    plan: &CleanupPlan,
+    confirmed_permanent: bool,
+    log_dir_override: Option<&Path>,
+    sandbox_guard: Option<&SandboxGuard>,
+    sandbox_root: Option<&Path>,
+    defer_trash_drain: bool,
+) -> Result<(CleanupResult, Vec<PathBuf>), String> {
     if plan.mode == CleanupMode::Permanent && !confirmed_permanent {
         return Err("El borrado permanente requiere confirmación explícita.".to_string());
     }
 
     let log_dir = log_dir_override.map(PathBuf::from).unwrap_or_else(logs_dir);
+    let space_provider = WinDiskSpaceProvider;
+
+    // Capture free space BEFORE cleanup per involved volume
+    let mut free_before_by_vol: HashMap<String, u64> = HashMap::new();
+    for item in &plan.items {
+        if let Some(vol) = volume_root_of_path(Path::new(&item.path)) {
+            free_before_by_vol
+                .entry(vol.clone())
+                .or_insert_with(|| space_provider.query_space(&vol).map_or(0, |(_, f)| f));
+        }
+    }
 
     if plan.mode == CleanupMode::EmptyRecycleBin {
+        let sys_drive = format!(
+            "{}\\",
+            std::env::var("SystemDrive").unwrap_or_else(|_| "C:".to_string())
+        );
+        let free_before = space_provider.query_space(&sys_drive).map_or(0, |(_, f)| f);
+
         let hr = unsafe {
             SHEmptyRecycleBinW(
                 None,
@@ -340,6 +443,16 @@ pub fn execute_cleanup_plan(
                 0,
             )
         };
+        let meas = measure_real_freed_space(
+            &sys_drive,
+            free_before,
+            plan.total_bytes,
+            &space_provider,
+            false,
+            false,
+            status == "failed",
+        );
+
         let _ = append_cleanup_log(
             &log_dir,
             &CleanupLogEntry {
@@ -352,27 +465,35 @@ pub fn execute_cleanup_plan(
                 status: status.to_string(),
                 detail: detail.clone(),
                 rule_id: None,
-                estimated_bytes: None,
+                estimated_bytes: Some(plan.total_bytes),
+                real_freed_bytes: Some(meas.real_freed_bytes),
                 command: None,
             },
         );
-        return Ok(CleanupResult {
-            plan_id: plan.plan_id.clone(),
-            mode: plan.mode,
-            freed_bytes: freed,
-            succeeded_count: usize::from(status == "deleted"),
-            failed_count: usize::from(status == "failed"),
-            skipped_count: 0,
-            outcomes: vec![CleanupItemOutcome {
-                path: "$Recycle.Bin".to_string(),
-                bytes: freed,
-                status: status.to_string(),
-                detail,
-            }],
-        });
+        return Ok((
+            CleanupResult {
+                plan_id: plan.plan_id.clone(),
+                mode: plan.mode,
+                freed_bytes: freed,
+                estimated_bytes: plan.total_bytes,
+                real_freed_bytes: Some(meas.real_freed_bytes),
+                discrepancy_explanation: meas.discrepancy_explanation,
+                background_job_id: None,
+                succeeded_count: usize::from(status == "deleted"),
+                failed_count: usize::from(status == "failed"),
+                skipped_count: 0,
+                outcomes: vec![CleanupItemOutcome {
+                    path: "$Recycle.Bin".to_string(),
+                    bytes: freed,
+                    status: status.to_string(),
+                    detail,
+                }],
+            },
+            Vec::new(),
+        ));
     }
 
-    // Re-validate every item immediately prior to deletion
+    // Re-validate every item immediately prior to rename/deletion
     let mut valid_items: Vec<&PlannedItem> = Vec::new();
     let mut outcomes: Vec<CleanupItemOutcome> = Vec::new();
     let mut skipped_count = 0usize;
@@ -399,6 +520,7 @@ pub fn execute_cleanup_plan(
                     detail: Some(v.reason.clone()),
                     rule_id: None,
                     estimated_bytes: Some(item.bytes),
+                    real_freed_bytes: Some(0),
                     command: None,
                 },
             );
@@ -416,6 +538,7 @@ pub fn execute_cleanup_plan(
     let mut freed_bytes = 0u64;
     let mut succeeded_count = 0usize;
     let mut failed_count = 0usize;
+    let mut staged_paths_to_drain: Vec<PathBuf> = Vec::new();
 
     if plan.mode == CleanupMode::RecycleBin {
         let paths: Vec<PathBuf> = valid_items.iter().map(|i| PathBuf::from(&i.path)).collect();
@@ -433,22 +556,6 @@ pub fn execute_cleanup_plan(
                     ("failed", Some(msg), 0)
                 }
             };
-            let _ = append_cleanup_log(
-                &log_dir,
-                &CleanupLogEntry {
-                    timestamp: Utc::now().to_rfc3339(),
-                    plan_id: plan.plan_id.clone(),
-                    path: item.path.clone(),
-                    category: item.category.clone(),
-                    bytes,
-                    mode: "recycle_bin".to_string(),
-                    status: status.to_string(),
-                    detail: detail.clone(),
-                    rule_id: None,
-                    estimated_bytes: None,
-                    command: None,
-                },
-            );
             outcomes.push(CleanupItemOutcome {
                 path: item.path.clone(),
                 bytes,
@@ -459,7 +566,21 @@ pub fn execute_cleanup_plan(
     } else {
         for item in valid_items {
             let p = PathBuf::from(&item.path);
-            let (status, detail, bytes) = match remove_permanently_safe(&p) {
+            let res = if let Ok(staged) =
+                stage_to_same_volume_trash(&p, &plan.plan_id, sandbox_guard, sandbox_root)
+            {
+                if defer_trash_drain {
+                    staged_paths_to_drain.push(staged);
+                    Ok(())
+                } else {
+                    delete_tree_parallel_fast(&staged, None, None, false).map(|_| ())
+                }
+            } else {
+                // Direct parallel delete fallback (e.g. if staging dir couldn't be created)
+                delete_tree_parallel_fast(&p, None, None, true).map(|_| ())
+            };
+
+            let (status, detail, bytes) = match res {
                 Ok(()) => {
                     succeeded_count += 1;
                     freed_bytes = freed_bytes.saturating_add(item.bytes);
@@ -470,22 +591,6 @@ pub fn execute_cleanup_plan(
                     ("failed", Some(msg), 0)
                 }
             };
-            let _ = append_cleanup_log(
-                &log_dir,
-                &CleanupLogEntry {
-                    timestamp: Utc::now().to_rfc3339(),
-                    plan_id: plan.plan_id.clone(),
-                    path: item.path.clone(),
-                    category: item.category.clone(),
-                    bytes,
-                    mode: "permanent".to_string(),
-                    status: status.to_string(),
-                    detail: detail.clone(),
-                    rule_id: None,
-                    estimated_bytes: None,
-                    command: None,
-                },
-            );
             outcomes.push(CleanupItemOutcome {
                 path: item.path.clone(),
                 bytes,
@@ -495,13 +600,68 @@ pub fn execute_cleanup_plan(
         }
     }
 
-    Ok(CleanupResult {
-        plan_id: plan.plan_id.clone(),
-        mode: plan.mode,
-        freed_bytes,
-        succeeded_count,
-        failed_count,
-        skipped_count,
-        outcomes,
-    })
+    // Measure real freed space delta across affected volumes
+    let mut total_real_freed = 0u64;
+    let mut discrepancy: Option<String> = None;
+    for (vol, free_before) in &free_before_by_vol {
+        let pending = defer_trash_drain || has_pending_trash_on_volume(vol);
+        let m = measure_real_freed_space(
+            vol,
+            *free_before,
+            freed_bytes,
+            &space_provider,
+            pending,
+            false,
+            failed_count > 0,
+        );
+        total_real_freed = total_real_freed.saturating_add(m.real_freed_bytes);
+        if discrepancy.is_none() {
+            discrepancy = m.discrepancy_explanation;
+        }
+    }
+
+    // Persist audit logs including BOTH estimated and real freed bytes
+    for outcome in &outcomes {
+        if outcome.status == "blocked" {
+            continue;
+        }
+        let _ = append_cleanup_log(
+            &log_dir,
+            &CleanupLogEntry {
+                timestamp: Utc::now().to_rfc3339(),
+                plan_id: plan.plan_id.clone(),
+                path: outcome.path.clone(),
+                category: "cleanup".to_string(),
+                bytes: outcome.bytes,
+                mode: format!("{:?}", plan.mode).to_ascii_lowercase(),
+                status: outcome.status.clone(),
+                detail: outcome.detail.clone(),
+                rule_id: None,
+                estimated_bytes: Some(outcome.bytes),
+                real_freed_bytes: Some(total_real_freed),
+                command: None,
+            },
+        );
+    }
+
+    Ok((
+        CleanupResult {
+            plan_id: plan.plan_id.clone(),
+            mode: plan.mode,
+            freed_bytes,
+            estimated_bytes: plan.total_bytes,
+            real_freed_bytes: Some(total_real_freed),
+            discrepancy_explanation: discrepancy,
+            background_job_id: if staged_paths_to_drain.is_empty() {
+                None
+            } else {
+                Some(plan.plan_id.clone())
+            },
+            succeeded_count,
+            failed_count,
+            skipped_count,
+            outcomes,
+        },
+        staged_paths_to_drain,
+    ))
 }

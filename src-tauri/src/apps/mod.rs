@@ -293,7 +293,7 @@ fn measure_app_dir(path_str: &str, scan_tree: Option<&ScanTree>) -> Option<u64> 
     }
     if let Some(tree) = scan_tree {
         if let Some(nid) = tree.find_node_by_path(&path) {
-            return Some(tree.nodes[nid as usize].allocated_size);
+            return Some(tree.allocated_size[nid as usize]);
         }
     }
     bounded_dir_size(&path, 25_000)

@@ -2,12 +2,14 @@ import { FolderOpen, Lock, ShieldPlus, Trash2 } from "lucide-react";
 import { useEffect, useMemo, useRef, useState } from "react";
 import { createPortal } from "react-dom";
 import { colorForCategory, formatBytes } from "../lib/format";
-import type { TreemapNodeDto } from "../lib/ipc";
+import type { TreemapLayoutRectDto, TreemapNodeDto } from "../lib/ipc";
 import { type TreemapRect, layoutSquarifiedTreemap } from "../lib/treemapLayout";
 
 interface TreemapCanvasProps {
-  nodes: TreemapNodeDto[];
+  nodes?: TreemapNodeDto[];
+  nativeRects?: TreemapLayoutRectDto[];
   colorBy: "type" | "origin";
+  onViewportChange?: (width: number, height: number) => void;
   onDrillDown: (nodeId: number) => void;
   onOpenExplorer: (path: string) => void;
   onSendToCleanup: (node: TreemapNodeDto) => void;
@@ -17,6 +19,8 @@ interface TreemapCanvasProps {
 interface PositionedNode extends TreemapNodeDto {
   id: string;
   value: number;
+  isCloudOnly?: boolean;
+  isPendingTrash?: boolean;
 }
 
 const TOOLTIP_MAX_W = 264;
@@ -26,8 +30,10 @@ const MENU_EST_W = 220;
 const MENU_EST_H = 132;
 
 export function TreemapCanvas({
-  nodes,
+  nodes = [],
+  nativeRects,
   colorBy,
+  onViewportChange,
   onDrillDown,
   onOpenExplorer,
   onSendToCleanup,
@@ -56,11 +62,12 @@ export function TreemapCanvas({
         const w = Math.max(240, Math.floor(entry.contentRect.width));
         const h = Math.max(260, Math.floor(entry.contentRect.height));
         setSize({ width: w, height: h });
+        onViewportChange?.(w, h);
       }
     });
     obs.observe(el);
     return () => obs.disconnect();
-  }, []);
+  }, [onViewportChange]);
 
   // Re-render canvas when user toggles light/dark theme
   useEffect(() => {
@@ -82,7 +89,19 @@ export function TreemapCanvas({
     };
   }, []);
 
-  const rects = useMemo(() => {
+  const rects = useMemo<TreemapRect<PositionedNode>[]>(() => {
+    if (nativeRects && nativeRects.length > 0) {
+      return nativeRects.map((r) => ({
+        item: {
+          ...r,
+          value: r.allocatedBytes,
+        },
+        x: r.x,
+        y: r.y,
+        w: r.w,
+        h: r.h,
+      }));
+    }
     const input: PositionedNode[] = nodes
       .filter((n) => n.allocatedBytes > 0)
       .map((n, i) => ({
@@ -91,7 +110,7 @@ export function TreemapCanvas({
         value: n.allocatedBytes,
       }));
     return layoutSquarifiedTreemap(input, size.width, size.height);
-  }, [nodes, size.width, size.height]);
+  }, [nativeRects, nodes, size.width, size.height]);
 
   useEffect(() => {
     void themeTick;

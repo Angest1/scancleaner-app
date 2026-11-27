@@ -57,12 +57,23 @@ export function CleanupModal({
         <>
           <AlertBanner tone="success">
             <div className="font-semibold text-fg-primary">
-              Espacio liberado: <span className="mono">{formatBytes(result.freedBytes)}</span>
+              Espacio liberado real:{" "}
+              <span className="mono">
+                {formatBytes(result.realFreedBytes ?? result.freedBytes)}
+              </span>{" "}
+              <span className="text-[12px] font-normal text-fg-secondary">
+                (estimado: {formatBytes(result.estimatedBytes ?? result.freedBytes)})
+              </span>
             </div>
             <div className="text-[12px] text-fg-secondary mt-0.5 tabular">
               Completados: {result.succeededCount} · Fallidos: {result.failedCount} · Bloqueados:{" "}
               {result.skippedCount}
             </div>
+            {result.discrepancyExplanation && (
+              <div className="text-[11.5px] text-warning-text mt-1">
+                {result.discrepancyExplanation}
+              </div>
+            )}
           </AlertBanner>
 
           <div className="max-h-[280px] overflow-auto flex flex-col gap-1.5">

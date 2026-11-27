@@ -1,5 +1,6 @@
 @import "tailwindcss";
 @import "./styles/tokens.css";
+@import "./styles/startup.css";
 
 @theme {
   --font-sans: "Geist Sans", "Segoe UI Variable", "Segoe UI", system-ui, -apple-system, sans-serif;
